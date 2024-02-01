@@ -6,3 +6,4 @@ agdoc-env/
 
 
 *.pyc
+.env
