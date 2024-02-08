@@ -1,8 +1,0 @@
-name: agdoc
-services:
-- environment_slug: python
-  github:
-    branch: main
-    deploy_on_push: true
-    repo: williammw/agdoc
-  name: agdoc
