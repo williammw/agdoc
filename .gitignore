@@ -7,3 +7,14 @@ agdoc-env/
 
 *.pyc
 .env
+# Ignore Python cache directories
+__pycache__/
+
+# Ignore agdoc-env folder
+agdoc-env/
+
+# Ignore .DS_Store files
+.DS_Store
+
+*.pyc
+.env
