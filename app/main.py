@@ -18,7 +18,7 @@ app.include_router(dev_router.router, prefix="/api/v1/dev")
 
 @app.get("/")
 async def greeting():
-    return {"message": "Hello from MAIN API!"}
+    return {"message": "Hello from  MEE API!"}
 
 
 
