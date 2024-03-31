@@ -5,3 +5,9 @@
 
 #### local test run caommand
 ```uvicorn app.main:app --reload```
+
+
+### ngrok for test
+```
+ngrok http port
+```

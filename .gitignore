@@ -21,3 +21,50 @@ agdoc-env/
 
 materials/
 win/
+
+# Ignore virtual environment
+venv/
+
+# Ignore IDE files
+.vscode/
+.idea/
+
+# Ignore compiled Python files
+*.pyc
+
+# Ignore environment variables file
+.env
+
+# Ignore cache directories
+__pycache__/
+
+# Ignore system-specific files
+.DS_Store
+
+# Ignore log files
+*.log
+
+# Ignore package build directories
+dist/
+build/
+
+# Ignore egg-info directories
+*.egg-info/
+
+# Ignore distribution files
+*.tar.gz
+*.whl
+
+# Ignore database files
+*.db
+
+# Ignore compiled binary files
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Ignore backup files
+*.bak
+*.swp
+*.swo
