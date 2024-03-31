@@ -18,3 +18,5 @@ agdoc-env/
 
 *.pyc
 .env
+
+materials/
