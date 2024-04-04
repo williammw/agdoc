@@ -2,7 +2,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Request
 from databases import Database
 from app.dependencies import get_database
-from app.redis_config import get_redis
+# from app.redis_config import get_redis
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -31,18 +31,18 @@ async def greeting():
     return {"message": "Hello from tradingView and IBKR API!"}
 
 
-@router.post("/notify")
-async def send_notification(message: str, redis=Depends(get_redis)):
-    # Example operation: Store message in Redis
-    await redis.set("latest_notification", message)
-    return {"message": "Notification sent", "data": message}
+# @router.post("/notify")
+# async def send_notification(message: str, redis=Depends(get_redis)):
+#     # Example operation: Store message in Redis
+#     await redis.set("latest_notification", message)
+#     return {"message": "Notification sent", "data": message}
 
 
-@router.get("/notify")
-async def get_notification(redis=Depends(get_redis)):
-    # Example operation: Retrieve message from Redis
-    message = await redis.get("latest_notification")
-    return {"message": "Latest notification", "data": message}
+# @router.get("/notify")
+# async def get_notification(redis=Depends(get_redis)):
+#     # Example operation: Retrieve message from Redis
+#     message = await redis.get("latest_notification")
+#     return {"message": "Latest notification", "data": message}
 
 
 # https://cd75-171-22-104-187.ngrok-free.app/api/v1/tvibkr/trade_signal
