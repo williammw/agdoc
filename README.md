@@ -1,4 +1,9 @@
-# API using FastAPI,
+# API using FastAPI, 
+- this is my dev / uat for any API development and testing platform; hosted at DG, 
+
+### features
+* API integration with FAST API
+* 
 
 ### view docs using endpoint/docs
 ```gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app```
@@ -15,3 +20,4 @@ ngrok http port
 ```
 pip freeze > requirements.txt
 ```
+
