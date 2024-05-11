@@ -1,13 +1,26 @@
 
 from fastapi import FastAPI
 # Your database and router imports remain the same
+from fastapi.middleware.cors import CORSMiddleware
 from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router
 from .lifespan import app_lifespan
 
 app = FastAPI(lifespan=app_lifespan)
 
 
+# CORS configuration
+origins = [
+    "http://localhost:5173",
+    "http://localhost:8000",
+]
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 app.include_router(umami_router.router, prefix="/api/v1/umami")
