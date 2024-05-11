@@ -13,6 +13,31 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=func.now())
     is_active = Column(Boolean, default=True)
+    chats = relationship("Chat", back_populates="user")
+
+
+class Chat(Base):
+    __tablename__ = 'chats'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    modified_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'))
+    user = relationship("User", back_populates="chats")
+    messages = relationship("Message", back_populates="chat")
+
+
+class Message(Base):
+    __tablename__ = 'messages'
+    id = Column(Integer, primary_key=True)
+    username = Column(String(255), nullable=False)
+    text = Column(String, nullable=False)
+    role = Column(String(50), nullable=False)
+    avatar = Column(String(255), nullable=False)
+    audio_url = Column(String(255))
+    created_at = Column(DateTime, default=func.now())
+    chat_id = Column(Integer, ForeignKey('chats.id', ondelete='CASCADE'))
+    chat = relationship("Chat", back_populates="messages")
 
 
 class ImageMetadata(Base):

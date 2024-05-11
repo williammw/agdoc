@@ -5,7 +5,7 @@ from app.dependencies import get_database  # Adjust the import path as necessary
 import httpx
 import os
 # Assuming this is your model for image metadata
-from .models import ImageMetadata
+# from app.models.models import ImageMetadata
 
 
 router = APIRouter()

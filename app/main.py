@@ -1,7 +1,7 @@
 
 from fastapi import FastAPI
 # Your database and router imports remain the same
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router
+from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router
 from .lifespan import app_lifespan
 
 app = FastAPI(lifespan=app_lifespan)
@@ -16,7 +16,8 @@ app.include_router(cdn_router.router, prefix="/api/v1/cdn")
 app.include_router(dev_router.router, prefix="/api/v1/dev")
 app.include_router(tvibkr_router.router, prefix="/api/v1/tvibkr")
 app.include_router(agents_router.router, prefix="/api/v1/agents")
-
+app.include_router(auth_router.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(chat_router.router, prefix="/api/v1", tags=["chats"])
 
 @app.get("/")
 async def greeting():
