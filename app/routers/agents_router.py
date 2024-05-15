@@ -71,7 +71,7 @@ async def text_to_speech_pipeline(request: Request):
     try:
         # Generate response text using OpenAI GPT
         gpt_response = client.chat.completions.create(
-            model="gpt-4-turbo-preview",
+            model="gpt-3.5-turbo-0301",
             messages=[{"role": "user", "content": text}]
         )
         response_text = gpt_response.choices[0].message.content.strip()
@@ -79,7 +79,7 @@ async def text_to_speech_pipeline(request: Request):
         # Convert text to speech
         tts_response = client.audio.speech.create(
             model="tts-1",
-            voice="alloy",
+            voice="nova",
             input=response_text
         )
         audio_data = tts_response.content
