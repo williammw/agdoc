@@ -1,4 +1,4 @@
-
+# main.py
 from fastapi import FastAPI
 # Your database and router imports remain the same
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,8 @@ app = FastAPI(lifespan=app_lifespan)
 origins = [
     "http://localhost:5173",
     "http://localhost:8000",
+    "http://192.168.1.2:5173",
+    "http://192.168.1.2:8000"
 ]
 
 app.add_middleware(
@@ -30,14 +32,21 @@ app.add_middleware(
 app.add_middleware(SessionMiddleware, secret_key=os.getenv(
     'SESSION_SECRET_KEY', 'your_session_secret_key'))
 
-app.include_router(umami_router.router, prefix="/api/v1/umami", tags=["umami"])
-app.include_router(agi_router.router, prefix="/api/v1/agi", tags=["agi"])
-app.include_router(cdn_router.router, prefix="/api/v1/cdn", tags=["cdn"])
-app.include_router(dev_router.router, prefix="/api/v1/dev", tags=["dev"])
-app.include_router(tvibkr_router.router, prefix="/api/v1/tvibkr", )
-app.include_router(agents_router.router, prefix="/api/v1/agents")
-# app.include_router(auth_router.router, prefix="/api/v1/auth", tags=["auth"])
-app.include_router(chat_router.router, prefix="/api/v1", tags=["chats"])
+
+router_list = [
+    (umami_router, "/api/v1/umami", ["umami"]),
+    (agi_router, "/api/v1/agi", ["agi"]),
+    (cdn_router, "/api/v1/cdn", ["cdn"]),
+    (dev_router, "/api/v1/dev", ["dev"]),
+    (tvibkr_router, "/api/v1/tvibkr", []),
+    (agents_router, "/api/v1/agents", []),
+    # Uncomment once auth is properly configured
+    # (auth_router, "/api/v1/auth", ["auth"]),
+    (chat_router, "/api/v1", ["chats"]),
+]
+
+for router, prefix, tags in router_list:
+    app.include_router(router.router, prefix=prefix, tags=tags)
 
 @app.get("/")
 async def greeting():

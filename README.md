@@ -10,6 +10,7 @@
 
 #### local test run caommand
 ```uvicorn app.main:app --reload```
+```uvicorn --host 0.0.0.0  app.main:app --reload```
 
 
 ### ngrok for test

@@ -1,3 +1,4 @@
+# dependencies.py
 from .database import database
 from typing import Optional
 from fastapi import Depends, HTTPException
@@ -6,8 +7,9 @@ from jose import JWTError, jwt
 from pydantic import BaseModel
 from app.models.models import User
 from datetime import datetime, timedelta
+import os
 
-SECRET_KEY = "your_secret_key"
+SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
