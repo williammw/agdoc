@@ -22,7 +22,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Update this to your frontend's URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,7 +53,8 @@ async def greeting():
     return {"message": "Hello from  MEE API!"}
 
 
-
-
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 

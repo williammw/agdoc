@@ -1,10 +1,13 @@
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request, FastAPI, UploadFile, File, WebSocket
+from fastapi.responses import StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
 import base64
 import io
+from pydub import AudioSegment
+from pydantic import BaseModel
+from typing import List
 import asyncio
 
 router = APIRouter()
@@ -79,3 +82,28 @@ async def text_to_speech_pipeline_stream(text: str):
             yield f"data: Error: {str(e)}\n\n"
 
     return StreamingResponse(event_generator(text), media_type="text/event-stream")
+
+
+class Transcript(BaseModel):
+    timestamp: str
+    text: str
+
+
+@router.websocket("/transcribe/")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    while True:
+        data = await websocket.receive_bytes()
+        response = client.audio.transcriptions.create(
+            audio_content=data,
+            model="whisper-1",
+            language="en"
+        )
+
+        transcripts = []
+        for segment in response["segments"]:
+            transcript = Transcript(
+                timestamp=segment["timestamp"], text=segment["text"])
+            transcripts.append(transcript)
+
+        await websocket.send_json([transcript.dict() for transcript in transcripts])
