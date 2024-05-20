@@ -69,3 +69,5 @@ build/
 *.swp
 *.swo
 mypp.txt
+received_audio.wav
+transcript_output.txt

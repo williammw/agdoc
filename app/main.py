@@ -38,8 +38,8 @@ router_list = [
     (agi_router, "/api/v1/agi", ["agi"]),
     (cdn_router, "/api/v1/cdn", ["cdn"]),
     (dev_router, "/api/v1/dev", ["dev"]),
-    (tvibkr_router, "/api/v1/tvibkr", []),
-    (agents_router, "/api/v1/agents", []),
+    # (tvibkr_router, "/api/v1/tvibkr", []),
+    (agents_router, "/api/v1/agents", ["agents"]),
     # Uncomment once auth is properly configured
     # (auth_router, "/api/v1/auth", ["auth"]),
     (chat_router, "/api/v1", ["chats"]),
