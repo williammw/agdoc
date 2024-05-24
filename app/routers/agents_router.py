@@ -1,5 +1,8 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi import APIRouter, HTTPException, Request, FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+#agents_router.py
+import uuid
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends, UploadFile, File, Query
+from fastapi import APIRouter, Request, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from fastapi.responses import StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -12,6 +15,9 @@ from pydantic import BaseModel
 from typing import List
 import asyncio
 import shutil
+from typing import Dict
+from app.dependencies import get_current_user, verify_token
+import json
 
 router = APIRouter()
 load_dotenv()
@@ -25,7 +31,7 @@ async def greeting():
 
 
 @router.post("/text_to_speech_pipeline/")
-async def text_to_speech_pipeline(request: Request):
+async def text_to_speech_pipeline(request: Request, user = Depends(get_current_user)):
     data = await request.json()
     text = data.get("text")
     if not text:
@@ -55,40 +61,99 @@ async def text_to_speech_pipeline(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Endpoint for text to speech pipeline stream
 
-@router.get("/text_to_speech_pipeline_stream/")
-async def text_to_speech_pipeline_stream(text: str):
+
+class StreamRequest(BaseModel):
+    text: str
+    token: str
+
+
+@router.post("/generate_stream_url/")
+async def generate_stream_url(data: StreamRequest):
+    user = verify_token(data.token)  # Verifying the token
+    text = data.text
+    if not text:
+        raise HTTPException(status_code=400, detail="No input text provided")
+
+    # Generate the stream URL
+    # Replace with your logic to generate the stream ID
+    stream_id = "generated_stream_id"
+    stream_url = f"/api/v1/agents/text_to_speech_pipeline_stream/{stream_id}"
+
+    return {"stream_url": stream_url}
+
+# Function to generate audio (to be called after receiving the complete text)
+
+
+def generate_audio(complete_text: str):
+    tts_response = client.audio.speech.create(
+        model="tts-1",
+        input=complete_text,
+        voice="nova",
+        response_format="mp3"
+    )
+    audio_data = tts_response.content
+    audio_base64 = base64.b64encode(audio_data).decode("utf-8")
+    return audio_base64
+
+
+@router.get("/text_to_speech_pipeline_stream/{stream_id}")
+async def text_to_speech_pipeline_stream(stream_id: str, token: str = Query(...), text: str = Query(...)):
+    user = verify_token(token)
+
+    if not user:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
     async def event_generator(text):
         try:
-            gpt_response = client.chat.completions.create(
+            completion = client.chat.completions.create(
                 model="gpt-3.5-turbo-0301",
-                messages=[{"role": "user", "content": text}]
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant, you are going to respond in markdown format."},
+                    {"role": "user", "content": text}
+                ],
+                stream=True
             )
-            response_text = gpt_response.choices[0].message.content.strip()
 
-            # Simulate streaming response
-            for i in range(0, len(response_text), 20):
-                chunk = response_text[i:i + 20]
-                yield f"data: {chunk}\n\n"
-                await asyncio.sleep(0.1)  # Simulate delay
+            complete_text = ""
+            chat_id = stream_id
+            for chunk in completion:
+                delta = chunk.choices[0].delta
+                if delta.content is not None:
+                    complete_text += delta.content
+                    response_json = {
+                        "message": {
+                            "id": str(chunk.id),  # Ensure chunk.id is a string
+                            "created": str(chunk.created), # Ensure created is a string
+                            "role": delta.role if delta.role else "assistant",
+                            "finish_reason": chunk.choices[0].finish_reason if chunk.choices[0].finish_reason else "incomplete",
+                            "content": delta.content,
+                        },
+                        "chat_id": chat_id,
+                        "model": chunk.model,
+                        "object": chunk.object,
+                    }
+                    # Convert dictionary to a JSON string
+                    response_str = json.dumps(response_json)
+                    yield f"data: {response_str}\n\n"
+                    await asyncio.sleep(0.05)
 
-            tts_response = client.audio.speech.create(
-                model="tts-1",
-                voice="nova",
-                input=response_text
-            )
-            audio_data = tts_response.content
-            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            if chunk.choices[0].finish_reason == 'stop':
+                audio_base64 = generate_audio(complete_text)
+                yield f"data: [AUDIO]{audio_base64}\n\n"
 
-            yield f"data: [AUDIO]{audio_base64}\n\n"
         except Exception as e:
             yield f"data: Error: {str(e)}\n\n"
 
     return StreamingResponse(event_generator(text), media_type="text/event-stream")
 
 
+
+# Other endpoints and functions here...
+
 @router.post("/upload-audio/")
-async def create_upload_file(audio_file: UploadFile = File(...)):
+async def create_upload_file(audio_file: UploadFile = File(...), user=Depends(get_current_user)):
     temp_file_path = f"temp_{audio_file.filename}"
     with open(temp_file_path, "wb") as buffer:
         shutil.copyfileobj(audio_file.file, buffer)

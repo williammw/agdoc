@@ -47,6 +47,7 @@ __pycache__/
 # Ignore package build directories
 dist/
 build/
+config/
 
 # Ignore egg-info directories
 *.egg-info/
@@ -71,3 +72,4 @@ build/
 mypp.txt
 received_audio.wav
 transcript_output.txt
+umami-423322-firebase-adminsdk-t27sm-40e0472f73.json

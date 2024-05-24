@@ -1,8 +1,9 @@
 # dependencies.py
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer
+from .firebase_admin_config import verify_token
 from .database import database
 from typing import Optional
-from fastapi import Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from app.models.models import User
@@ -12,8 +13,13 @@ import os
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
+security = HTTPBearer()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
+
+
+
+
+
 
 class TokenData(BaseModel):
     username: Optional[str] = None
@@ -21,6 +27,15 @@ class TokenData(BaseModel):
 
 async def get_database():
     return database
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+    token = credentials.credentials
+    decoded_token = verify_token(token)
+    if decoded_token is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return decoded_token
+
 
 
 async def get_user(username: str):

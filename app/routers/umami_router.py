@@ -1,3 +1,4 @@
+# umami_router.py is a FastAPI router that defines the routes for the Umami service.
 from fastapi import APIRouter
 
 router = APIRouter()
