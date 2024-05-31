@@ -3,7 +3,7 @@ from fastapi import FastAPI
 # Your database and router imports remain the same
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router
+from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router
 from .lifespan import app_lifespan
 from dotenv import load_dotenv
 import os
@@ -17,7 +17,8 @@ origins = [
     "http://localhost:5173",
     "http://localhost:8000",
     "http://192.168.1.2:5173",
-    "http://192.168.1.2:8000"
+    "http://192.168.1.2:8000",
+    "https://235534.netlify.app"
 ]
 
 app.add_middleware(
@@ -43,6 +44,7 @@ router_list = [
     # Uncomment once auth is properly configured
     # (auth_router, "/api/v1/auth", ["auth"]),
     (chat_router, "/api/v1", ["chats"]),
+    (cv_router, "/api/v1/cv", ["cv"]),
 ]
 
 for router, prefix, tags in router_list:
