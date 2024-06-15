@@ -1,1 +1,0 @@
-Program still has some issues. The recording icons keep showing on the Chrome and I don't know how to stop it 
