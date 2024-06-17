@@ -52,7 +52,7 @@ for router, prefix, tags in router_list:
 
 @app.get("/")
 async def greeting():
-    return {"message": "Hello from  MEE API!"}
+    return {"message": "Nothing to see here."}
 
 
 if __name__ == "__main__":
