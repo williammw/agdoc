@@ -42,7 +42,7 @@ router_list = [
     # (tvibkr_router, "/api/v1/tvibkr", []),
     (agents_router, "/api/v1/agents", ["agents"]),
     # Uncomment once auth is properly configured
-    # (auth_router, "/api/v1/auth", ["auth"]),
+    (auth_router, "/api/v1/auth", ["auth"]),
     (chat_router, "/api/v1", ["chats"]),
     (cv_router, "/api/v1/cv", ["cv"]),
 ]
