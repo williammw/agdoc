@@ -69,6 +69,7 @@ matplotlib-inline==0.1.7
 msgpack==1.0.8
 multidict==6.0.5
 nest-asyncio==1.6.0
+oauthlib==3.2.2
 openai==1.17.0
 orjson==3.10.3
 packaging==23.2
