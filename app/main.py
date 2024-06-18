@@ -3,7 +3,7 @@ from fastapi import FastAPI
 # Your database and router imports remain the same
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router
+from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router,rag_router
 from .lifespan import app_lifespan
 from dotenv import load_dotenv
 import os
@@ -45,6 +45,7 @@ router_list = [
     (auth_router, "/api/v1/auth", ["auth"]),
     (chat_router, "/api/v1", ["chats"]),
     (cv_router, "/api/v1/cv", ["cv"]),
+    (rag_router, "/api/v1/rag", ["rag"])
 ]
 
 for router, prefix, tags in router_list:
