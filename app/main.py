@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, textdetect_router
+from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
@@ -46,8 +46,6 @@ router_list = [
     (chat_router, "/api/v1", ["chats"]),
     (cv_router, "/api/v1/cv", ["cv"]),
     (rag_router, "/api/v1/rag", ["rag"]),
-    # Ensure prefix starts with '/'
-    (textdetect_router, "/api/v1/textdetect", ["textdetect"])
 ]
 
 for router, prefix, tags in router_list:
