@@ -31,7 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Add SessionMiddleware
 app.add_middleware(SessionMiddleware, secret_key=os.getenv(
     'SESSION_SECRET_KEY', 'your_session_secret_key'))
