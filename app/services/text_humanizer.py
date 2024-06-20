@@ -1,14 +1,17 @@
 import nltk
-from nltk.tokenize import word_tokenize
+from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.corpus import wordnet
 from transformers import T5Tokenizer, T5ForConditionalGeneration
+from sentence_transformers import SentenceTransformer, util
 import sentencepiece
-
+import os
 nltk.download('punkt')
 nltk.download('wordnet')
+model_path = os.path.join(os.path.dirname(__file__), 'fine_tuned_model')
 
-tokenizer = T5Tokenizer.from_pretrained('t5-small')
-model = T5ForConditionalGeneration.from_pretrained('t5-small')
+tokenizer = T5Tokenizer.from_pretrained(model_path)
+model = T5ForConditionalGeneration.from_pretrained(model_path)
+sentence_bert_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
 
 def preprocess_text(text):
@@ -30,8 +33,8 @@ def replace_with_synonyms(tokens):
 
 
 def adjust_sentence_structure(tokens):
-    # Placeholder function to adjust sentence structure
-    return tokens
+    sentences = sent_tokenize(" ".join(tokens))
+    return sentences
 
 
 def rephrase_with_model(text):
@@ -43,10 +46,21 @@ def rephrase_with_model(text):
     return paraphrased_text
 
 
+def rephrase_with_sentence_bert(text):
+    sentences = sent_tokenize(text)
+    paraphrased_sentences = []
+    for sentence in sentences:
+        paraphrases = sentence_bert_model.encode([sentence])
+        paraphrased_sentence = util.paraphrase_mining(
+            paraphrases, corpus=[sentence])
+        paraphrased_sentences.append(paraphrased_sentence[0][0])
+    return " ".join(paraphrased_sentences)
+
+
 def humanize_text(text):
     tokens = preprocess_text(text)
     tokens = replace_with_synonyms(tokens)
-    tokens = adjust_sentence_structure(tokens)
-    intermediate_text = " ".join(tokens)
+    sentences = adjust_sentence_structure(tokens)
+    intermediate_text = " ".join(sentences)
     humanized_text = rephrase_with_model(intermediate_text)
     return humanized_text

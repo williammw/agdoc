@@ -133,3 +133,4 @@ received_audio.wav
 transcript_output.txt
 gpt-2-output-dataset
 app/ML/data
+app/services/fine_tuned_model
