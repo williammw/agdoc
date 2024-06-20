@@ -1,19 +1,23 @@
 # %%
-# train_classifier.py
-from sklearn.datasets import make_classification
-from sklearn.ensemble import RandomForestClassifier
 import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, GridSearchCV
 from transformers import BertTokenizer, BertModel
 import torch
 
-# Load models and tokenizer
-bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-bert_model = BertModel.from_pretrained('bert-base-uncased')
+# Load your dataset
+# Assume you have a CSV file with columns 'text' and 'label' (0 for human-written, 1 for AI-generated)
+data = pd.read_csv('path_to_your_dataset.csv')
 
-# Function to extract features using BERT
+# Preprocess the text data
 
 
-def extract_features(text, tokenizer, model):
+def preprocess_text(text):
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased')
     inputs = tokenizer(text, return_tensors='pt',
                        padding=True, truncation=True, max_length=512)
     with torch.no_grad():
@@ -21,25 +25,25 @@ def extract_features(text, tokenizer, model):
     return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
 
-# Generate some example texts for training
-texts = [
-    "This is a sample text for training.",
-    "Another example of text for training the classifier.",
-    "Machine learning models can be tricky.",
-    "Artificial intelligence is the future.",
-    "Random forests are a type of ensemble learning method."
-]
+data['features'] = data['text'].apply(preprocess_text)
 
-# Extract features for each text
-X_train = [extract_features(text, bert_tokenizer, bert_model)
-           for text in texts]
-y_train = [0, 0, 1, 1, 1]  # Example labels
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(
+    data['features'].tolist(), data['label'], test_size=0.2, random_state=42)
 
 # Train the classifier
-classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-classifier.fit(X_train, y_train)
+classifier = RandomForestClassifier()
+
+# Hyperparameter tuning
+param_grid = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [10, 20, 30],
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 2, 4]
+}
+grid_search = GridSearchCV(
+    estimator=classifier, param_grid=param_grid, cv=3, n_jobs=-1, verbose=2)
+grid_search.fit(X_train, y_train)
 
 # Save the trained model
-joblib.dump(classifier, 'classifier.pkl')
-
-# %%
+joblib.dump(grid_search.best_estimator_, 'classifier.pkl')
