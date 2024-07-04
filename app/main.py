@@ -21,7 +21,8 @@ origins = [
     "http://localhost:8000",
     "http://192.168.1.2:5173",
     "http://192.168.1.2:8000",
-    "https://235534.netlify.app"
+    "https://235534.netlify.app",
+    "https://umamiverse.netlify.app"
 ]
 
 app.add_middleware(
