@@ -2,10 +2,13 @@ from .lifespan import app_lifespan
 from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
+from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import os
+import traceback
+import logging
 os.environ["KMP_INIT_AT_FORK"] = "FALSE"
 
 
@@ -14,6 +17,7 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=app_lifespan)
+logger = logging.getLogger(__name__)
 
 # CORS configuration
 origins = [
@@ -51,6 +55,17 @@ router_list = [
 
 for router, prefix, tags in router_list:
     app.include_router(router.router, prefix=prefix, tags=tags)
+
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    logger.error(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Please try again later."}
+    )
 
 
 @app.get("/")

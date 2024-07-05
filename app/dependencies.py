@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.models.models import User
 from datetime import datetime, timedelta
 import os
+import logging
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
 ALGORITHM = "HS256"
@@ -16,7 +17,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 security = HTTPBearer()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
 
-
+logger = logging.getLogger(__name__)
 
 
 
@@ -29,38 +30,20 @@ async def get_database():
     return database
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
     token = credentials.credentials
-    decoded_token = verify_token(token)
-    if decoded_token is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    return decoded_token
-
-
-
-async def get_user(username: str):
-    query = "SELECT * FROM users WHERE username = :username"
-    user = await database.fetch_one(query, {"username": username})
-    return user
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=401,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+    logger.info("Verifying token")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    user = await get_user(username=token_data.username)
-    if user is None:
-        raise credentials_exception
-    return user
+        decoded_token = verify_token(token)
+        logger.info(f"Token verified for user: {decoded_token['uid']}")
+        return decoded_token
+    except Exception as e:
+        logger.error(f"Token verification failed: {str(e)}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid or expired token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
