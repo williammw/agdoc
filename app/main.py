@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 
 # CORS configuration
 origins = [
-    "http://localhost:5173",
-    "http://localhost:8000",
-    "http://192.168.1.2:5173",
-    "http://192.168.1.2:8000",
+    # "http://localhost:5173",
+    # "http://localhost:8000",
+    # "http://192.168.1.2:5173",
+    # "http://192.168.1.2:8000",
     "https://235534.netlify.app",
     "https://umamiverse.netlify.app"
 ]
