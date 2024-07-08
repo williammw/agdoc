@@ -11,7 +11,7 @@ from starlette.responses import Response
 from openai import OpenAI
 import os
 import requests
-from pydub import AudioSegment
+# from pydub import AudioSegment
 
 
 

@@ -1,11 +1,12 @@
 from .lifespan import app_lifespan
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router
+from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+
 import os
 import traceback
 import logging
@@ -21,12 +22,13 @@ logger = logging.getLogger(__name__)
 
 # CORS configuration
 origins = [
-    # "http://localhost:5173",
-    # "http://localhost:8000",
-    # "http://192.168.1.2:5173",
-    # "http://192.168.1.2:8000",
+    "http://localhost:5173",
+    "http://localhost:8000",
+    "http://192.168.1.2:5173",
+    "http://192.168.1.2:8000",
     "https://235534.netlify.app",
-    "https://umamiverse.netlify.app"
+    "https://umamiverse.netlify.app",
+    "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
 ]
 
 app.add_middleware(
@@ -51,6 +53,7 @@ router_list = [
     (chat_router, "/api/v1", ["chats"]),
     (cv_router, "/api/v1/cv", ["cv"]),
     (rag_router, "/api/v1/rag", ["rag"]),
+    (live_stream_router, "/api/v1/live-stream", ["live-stream"]),
 ]
 
 for router, prefix, tags in router_list:
@@ -67,6 +70,25 @@ for router, prefix, tags in router_list:
 #         content={"detail": "An unexpected error occurred. Please try again later."}
 #     )
 
+
+
+
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred."},
+    )
 
 @app.get("/")
 async def greeting():

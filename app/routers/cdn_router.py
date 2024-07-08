@@ -1,4 +1,8 @@
 # cdn_router.py
+from fastapi import APIRouter, Depends, HTTPException, Header
+import uuid
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, Header, Request
 from databases import Database
 from app.dependencies import get_database, get_current_user, verify_token
@@ -211,3 +215,149 @@ async def upload_avatar(file: UploadFile = File(...), current_user: dict = Depen
         return {"message": "Avatar uploaded successfully", "url": file_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/create-livestream")
+async def create_livestream(
+    database: Database = Depends(get_database),
+    authorization: str = Header(...)
+):
+    try:
+        token = authorization.split(" ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')}",
+        "Content-Type": "application/json"
+    }
+    url = f"https://api.cloudflare.com/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/stream/live_inputs"
+
+    payload = {
+        "meta": {"name": f"Livestream for user {user_id}"},
+        "recording": {"mode": "automatic"}
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=exc.response.status_code,
+                            detail="Failed to create livestream with Cloudflare")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"An error occurred while creating the livestream: {str(exc)}")
+
+    try:
+        stream_data = response.json()
+        # print("Cloudflare API Response:", stream_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500, detail="Invalid JSON response from Cloudflare")
+
+    result = stream_data.get('result', {})
+    print("!!!   ********  Cloudflare API Result:", result)
+    cloudflare_id = result.get('uid', '')
+    rtmps_url = result.get('rtmps', {}).get('url', '')
+    stream_key = result.get('rtmps', {}).get('streamKey', '')
+    webrtc_url = result.get('webRTC', {}).get('url', '')
+
+    if not all([cloudflare_id, rtmps_url, stream_key, webrtc_url]):
+        raise HTTPException(
+            status_code=500, detail="Missing required fields in Cloudflare response")
+
+    query = """
+    INSERT INTO livestreams (id, user_id, stream_key, rtmps_url, cloudflare_id, status, webrtc_url)
+    VALUES (:id, :user_id, :stream_key, :rtmps_url, :cloudflare_id, :status, :webrtc_url)
+    """
+    values = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "stream_key": stream_key,
+        "rtmps_url": rtmps_url,
+        "cloudflare_id": cloudflare_id,
+        "status": "created",
+        "webrtc_url": webrtc_url
+    }
+
+    try:
+        await database.execute(query=query, values=values)
+    except Exception as e:
+        print(f"Database error: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail="Failed to save livestream data to database")
+
+    return {
+        "streamKey": stream_key,
+        "rtmpsUrl": rtmps_url,
+        "webrtcUrl": webrtc_url,
+        "cloudflareId": cloudflare_id
+    }
+
+
+@router.get("/livestream-playback/{cloudflare_id}")
+async def get_livestream_playback(
+    cloudflare_id: str,
+    authorization: str = Header(...)
+):
+    token = authorization.split(" ")[1]
+    decoded_token = verify_token(token)
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')}",
+    }
+    url = f"https://api.cloudflare.com/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/stream/live_inputs/{cloudflare_id}"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+
+    data = response.json()
+    playback_url = data['result']['playback']['hls']
+    return {"playback_url": playback_url}
+
+
+@router.get("/stream-status/{stream_id}")
+async def get_stream_status(stream_id: str, authorization: str = Header(...)):
+    try:
+        token = authorization.split(" ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+
+        account_id = os.getenv('CLOUDFLARE_ACCOUNT_ID')
+        api_token = os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')
+
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream/live_inputs/{stream_id}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+            # Add this line
+            print(f"Cloudflare API response for stream {stream_id}: {data}")
+            is_live = data.get('result', {}).get('status') == 'live'
+
+            # Add more detailed logging
+            print(
+                f"Stream {stream_id} status: {data.get('result', {}).get('status')}")
+            print(f"Is live: {is_live}")
+
+        return {"isLive": is_live}
+    except httpx.HTTPError as exc:
+        # Add this line
+        print(f"HTTP Exception for stream {stream_id}: {str(exc)}")
+        raise HTTPException(status_code=exc.response.status_code,
+                            detail=f"HTTP Exception: {str(exc)}")
+    except Exception as exc:
+        # Add this line
+        print(f"General Exception for stream {stream_id}: {str(exc)}")
+        raise HTTPException(
+            status_code=500, detail=f"An error occurred: {str(exc)}")
