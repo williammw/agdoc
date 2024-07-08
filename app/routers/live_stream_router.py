@@ -92,7 +92,6 @@ async def start_stream(
             status_code=401, detail="Invalid authorization token")
 
     try:
-        # Fetch stream info from the database
         query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
         values = {"stream_id": stream_id, "user_id": user_id}
         result = await database.fetch_one(query=query, values=values)
@@ -113,14 +112,19 @@ async def start_stream(
             '-framerate', '30',
             '-i', '0:0',
             '-c:v', 'libx264',
-            '-preset', 'veryfast',
+            '-preset', 'medium',  # 'medium' provides a better balance between quality and speed
             '-tune', 'zerolatency',
-            '-b:v', '1500k',
-            '-maxrate', '1500k',
-            '-bufsize', '2000k',
+            '-b:v', '3500k',  # Increased bitrate for better quality
+            '-maxrate', '3500k',  # Matching the bitrate
+            '-bufsize', '7000k',  # Increased buffer size
+            '-vf', 'scale=640:360',  # Scaling to 720p
             '-pix_fmt', 'yuv420p',
+            '-crf', '18',  # Constant rate factor for better quality control
+            '-g', '60',
+            '-keyint_min', '60',
+            '-sc_threshold', '0',
             '-c:a', 'aac',
-            '-b:a', '128k',
+            '-b:a', '192k',  # Increased audio bitrate for better audio quality
             '-ar', '44100',
             '-f', 'flv',
             full_rtmps_url
@@ -136,7 +140,6 @@ async def start_stream(
 
         logger.info(f"FFmpeg process started with PID: {process.pid}")
 
-        # Update the database with the process ID
         try:
             update_query = """
             UPDATE livestreams
@@ -149,11 +152,10 @@ async def start_stream(
         except Exception as db_error:
             logger.warning(
                 f"Failed to update process_id in database: {str(db_error)}")
-            # Continue even if we couldn't update the process_id
 
         asyncio.create_task(log_ffmpeg_output(process))
 
-        return {"message": "Stream started", "process_id": process.pid}
+        return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
     except Exception as e:
         logger.error(f"Failed to start stream: {str(e)}", exc_info=True)
         raise HTTPException(
