@@ -112,7 +112,7 @@ async def start_stream(
             raise FileNotFoundError(f"FFmpeg not found at {ffmpeg_path}")
 
         ffmpeg_command = [
-            'ffmpeg',
+            ffmpeg_path,
             '-f', 'avfoundation',
             '-framerate', '30',
             '-i', '0:0',
