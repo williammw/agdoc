@@ -105,11 +105,48 @@ async def start_stream(
         stream_key = result['stream_key']
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
+        logger.info(f"Full RTMPS URL: {full_rtmps_url}")
 
         # Use the custom FFmpeg path
         ffmpeg_path = "/app/ffmpeg/ffmpeg"
+        logger.info(f"Checking for FFmpeg at: {ffmpeg_path}")
+
         if not os.path.exists(ffmpeg_path):
+            logger.error(f"FFmpeg not found at {ffmpeg_path}")
+
+            # Check the contents of /app directory
+            try:
+                dir_contents = subprocess.check_output(
+                    ["ls", "-R", "/app"]).decode()
+                logger.info(f"Contents of /app directory: {dir_contents}")
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    f"Error while listing directory contents: {str(e)}")
+
+            # Check the PATH
+            logger.info(
+                f"Current PATH: {os.environ.get('PATH', 'PATH not set')}")
+
+            # Try to find FFmpeg using 'which'
+            try:
+                which_ffmpeg = subprocess.check_output(
+                    ["which", "ffmpeg"]).decode().strip()
+                logger.info(
+                    f"FFmpeg found by 'which' command at: {which_ffmpeg}")
+            except subprocess.CalledProcessError:
+                logger.error("FFmpeg not found in PATH")
+
             raise FileNotFoundError(f"FFmpeg not found at {ffmpeg_path}")
+
+        logger.info(f"FFmpeg found at: {ffmpeg_path}")
+
+        # Check if we can run FFmpeg
+        try:
+            version_output = subprocess.check_output(
+                [ffmpeg_path, "-version"]).decode()
+            logger.info(f"FFmpeg version: {version_output}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error while checking FFmpeg version: {str(e)}")
 
         ffmpeg_command = [
             ffmpeg_path,
@@ -157,7 +194,11 @@ async def start_stream(
 
         asyncio.create_task(log_ffmpeg_output(process))
 
-        return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
+        return {"message": "Stream started successfully", "process_id": process.pid}
+    except FileNotFoundError as e:
+        logger.error(f"FFmpeg not found: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"FFmpeg not found: {str(e)}")
     except Exception as e:
         logger.error(f"Failed to start stream: {str(e)}", exc_info=True)
         raise HTTPException(
