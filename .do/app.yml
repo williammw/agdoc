@@ -1,0 +1,20 @@
+name: king-prawn-app
+services:
+- name: agdoc
+  github:
+    repo: williammanwai/agdoc
+    branch: master
+    deploy_on_push: true
+  source_dir: /
+  environment_slug: python
+  buildpacks:
+    - name: apt
+    - name: python
+  envs:
+    - key: DEBIAN_FRONTEND
+      value: noninteractive
+  build_command: |
+    apt-get update && apt-get install -y ffmpeg libsm6 libxext6 libxrender-dev libglib2.0-0
+    pip install -r requirements.txt
+  run_command: gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app
+  http_port: 8080
