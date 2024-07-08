@@ -106,26 +106,28 @@ async def start_stream(
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
+        # Use the custom FFmpeg path
+        ffmpeg_path = "/app/ffmpeg/ffmpeg"
+        if not os.path.exists(ffmpeg_path):
+            raise FileNotFoundError(f"FFmpeg not found at {ffmpeg_path}")
+
         ffmpeg_command = [
-            'ffmpeg',
-            '-f', 'avfoundation',
-            '-framerate', '30',
-            '-i', '0:0',
+            ffmpeg_path,
+            '-f', 'lavfi',
+            '-i', 'testsrc=size=640:360:rate=30',
+            '-f', 'lavfi',
+            '-i', 'anullsrc',
             '-c:v', 'libx264',
-            '-preset', 'medium',  # 'medium' provides a better balance between quality and speed
+            '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-b:v', '3500k',  # Increased bitrate for better quality
-            '-maxrate', '3500k',  # Matching the bitrate
-            '-bufsize', '7000k',  # Increased buffer size
-            '-vf', 'scale=640:360',  # Scaling to 720p
+            '-b:v', '900k',
+            '-maxrate', '900k',
+            '-bufsize', '1800k',
             '-pix_fmt', 'yuv420p',
-            '-crf', '18',  # Constant rate factor for better quality control
             '-g', '60',
             '-keyint_min', '60',
-            '-sc_threshold', '0',
             '-c:a', 'aac',
-            '-b:a', '192k',  # Increased audio bitrate for better audio quality
-            '-ar', '44100',
+            '-b:a', '128k',
             '-f', 'flv',
             full_rtmps_url
         ]
