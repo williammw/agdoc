@@ -107,12 +107,12 @@ async def start_stream(
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
         # Use the custom FFmpeg path
-        ffmpeg_path = "/app/ffmpeg/ffmpeg"
-        if not os.path.exists(ffmpeg_path):
-            raise FileNotFoundError(f"FFmpeg not found at {ffmpeg_path}")
+        # ffmpeg_path = "/app/ffmpeg/ffmpeg"
+        # if not os.path.exists(ffmpeg_path):
+        #     raise FileNotFoundError(f"FFmpeg not found at {ffmpeg_path}")
 
         ffmpeg_command = [
-            ffmpeg_path,
+            'ffmpeg',
             '-f', 'avfoundation',
             '-framerate', '30',
             '-i', '0:0',
