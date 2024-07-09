@@ -5,8 +5,10 @@ echo "FFmpeg location:"
 ls -l $(which ffmpeg)
 echo "FFmpeg libraries:"
 ldd $(which ffmpeg)
+echo "Searching for libpulsecommon:"
+find / -name "libpulsecommon*.so" 2>/dev/null
 echo "Attempting to run FFmpeg:"
-ffmpeg -version
+LD_DEBUG=libs ffmpeg -version
 echo "FFmpeg check complete."
 echo "PATH:"
 echo $PATH

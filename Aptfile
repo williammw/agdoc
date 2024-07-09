@@ -1,2 +1,6 @@
 ffmpeg
 libpulse0
+libavcodec-extra
+libavformat-extra
+libswscale-extra
+libavutil-extra
