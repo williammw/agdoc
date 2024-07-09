@@ -1,3 +1,3 @@
 #!/bin/bash
-export PATH="/usr/bin:/usr/local/bin:/app/vendor/ffmpeg/bin:$PATH"
+export PATH="/usr/bin:/usr/local/bin:/app/.apt/usr/bin:$PATH"
 echo "PATH has been updated: $PATH"

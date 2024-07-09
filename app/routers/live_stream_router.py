@@ -151,11 +151,15 @@ async def start_stream(
 
         logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
 
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        try:
+          process = await asyncio.create_subprocess_exec(
+              *ffmpeg_command,
+              stdout=asyncio.subprocess.PIPE,
+              stderr=asyncio.subprocess.PIPE
+          )
+        except Exception as e:
+          print(f"Error creating subprocess: {str(e)}")
+          raise HTTPException(status_code=500, detail=f"Failed to start FFmpeg process: {str(e)}")
 
         logger.info(f"FFmpeg process started with PID: {process.pid}")
 
