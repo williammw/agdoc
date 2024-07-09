@@ -11,7 +11,9 @@ import os
 import asyncio
 import subprocess
 import logging
-
+import shutil
+import urllib.request
+import tarfile
 router = APIRouter()
 
 # Set up logging
@@ -82,25 +84,15 @@ async def start_stream(
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
-    
-    # Add these diagnostic prints
     print(f"Current working directory: {os.getcwd()}")
     print(f"PATH: {os.environ.get('PATH')}")
 
-    ffmpeg_path = "/app/bin/ffmpeg"
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        print("FFmpeg not found. Installing...")
+        ffmpeg_path = await install_ffmpeg()
 
     print(f"FFmpeg path: {ffmpeg_path}")
-
-
-    try:
-        # Simple command to test FFmpeg
-        result = subprocess.run(
-            [ffmpeg_path, '-version'], capture_output=True, text=True)
-        print(f"FFmpeg version: {result.stdout}")
-    except Exception as e:
-        print(f"Error running FFmpeg: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
 
     try:
         # Simple command to test FFmpeg
@@ -115,89 +107,35 @@ async def start_stream(
     # For now, let's just return success if FFmpeg runs without error
     return {"message": "FFmpeg test successful"}
 
-    try:
-        query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
-        values = {"stream_id": stream_id, "user_id": user_id}
-        result = await database.fetch_one(query=query, values=values)
 
-        if not result:
-            logger.error(
-                f"Stream not found for ID: {stream_id} and user ID: {user_id}")
-            raise HTTPException(status_code=404, detail="Stream not found")
+async def install_ffmpeg():
+    ffmpeg_url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+    ffmpeg_tar = "ffmpeg-release-amd64-static.tar.xz"
 
-        rtmps_url = result['rtmps_url']
-        stream_key = result['stream_key']
+    # Download FFmpeg
+    urllib.request.urlretrieve(ffmpeg_url, ffmpeg_tar)
 
-        full_rtmps_url = f"{rtmps_url}{stream_key}"
+    # Extract FFmpeg
+    with tarfile.open(ffmpeg_tar, "r:xz") as tar:
+        tar.extractall()
 
-        ffmpeg_path = shutil.which('ffmpeg')
-        if not ffmpeg_path:
-            ffmpeg_path = "/layers/digitalocean_apt/apt/usr/bin/ffmpeg"
+    # Find the extracted directory
+    ffmpeg_dir = next(d for d in os.listdir() if d.startswith(
+        "ffmpeg-") and d.endswith("-amd64-static"))
 
-        print(f"FFmpeg path: {ffmpeg_path}")
+    # Move FFmpeg to a permanent location
+    os.makedirs(os.path.expanduser("~/bin"), exist_ok=True)
+    shutil.move(os.path.join(ffmpeg_dir, "ffmpeg"),
+                os.path.expanduser("~/bin/ffmpeg"))
 
-        return {"message": "FFmpeg test successful"}
+    # Clean up
+    os.remove(ffmpeg_tar)
+    shutil.rmtree(ffmpeg_dir)
 
+    # Update PATH
+    os.environ["PATH"] = f"{os.path.expanduser('~/bin')}:{os.environ['PATH']}"
 
-        ffmpeg_command = [
-            ffmpeg_path,
-            '-f', 'lavfi',
-            '-i', 'anullsrc',
-            '-f', 'lavfi',
-            '-i', 'testsrc=size=640x360:rate=30',
-            '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-tune', 'zerolatency',
-            '-b:v', '3500k',
-            '-maxrate', '3500k',
-            '-bufsize', '7000k',
-            '-pix_fmt', 'yuv420p',
-            '-crf', '18',
-            '-g', '60',
-            '-keyint_min', '60',
-            '-sc_threshold', '0',
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-ar', '44100',
-            '-f', 'flv',
-            full_rtmps_url
-        ]
-
-        logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
-
-        try:
-          process = await asyncio.create_subprocess_exec(
-              *ffmpeg_command,
-              stdout=asyncio.subprocess.PIPE,
-              stderr=asyncio.subprocess.PIPE
-          )
-        except Exception as e:
-          print(f"Error creating subprocess: {str(e)}")
-          raise HTTPException(status_code=500, detail=f"Failed to start FFmpeg process: {str(e)}")
-
-        logger.info(f"FFmpeg process started with PID: {process.pid}")
-
-        try:
-            update_query = """
-            UPDATE livestreams
-            SET process_id = :process_id, status = 'live'
-            WHERE cloudflare_id = :stream_id AND user_id = :user_id
-            """
-            update_values = {"process_id": process.pid,
-                             "stream_id": stream_id, "user_id": user_id}
-            await database.execute(query=update_query, values=update_values)
-        except Exception as db_error:
-            logger.warning(
-                f"Failed to update process_id in database: {str(db_error)}")
-
-        asyncio.create_task(log_ffmpeg_output(process))
-
-        return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
-    except Exception as e:
-        logger.error(f"Failed to start stream: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to start stream: {str(e)}")
-
+    return os.path.expanduser("~/bin/ffmpeg")
 
 async def log_ffmpeg_output(process):
     while True:
