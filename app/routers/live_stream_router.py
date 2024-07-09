@@ -83,19 +83,6 @@ async def start_stream(
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
-    try:
-        token = authorization.split(" ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        logger.error(f"Authentication error: {str(e)}")
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-    
-    print(f"Current working directory: {os.getcwd()}")
-    print(f"PATH: {os.environ.get('PATH')}")
-    print(f"Contents of /usr/bin: {os.listdir('/usr/bin')}")
-
 
 
     try:
@@ -113,21 +100,23 @@ async def start_stream(
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
-        ffmpeg_path = shutil.which('ffmpeg')
+        print("Current working directory:", os.getcwd())
+        print("Environment PATH:", os.environ['PATH'])
+
+        ffmpeg_path = '/usr/bin/ffmpeg'
         print(f"FFmpeg path: {ffmpeg_path}")
 
-        if ffmpeg_path:
-          try:
-              result = subprocess.run(
-                  [ffmpeg_path, '-version'], capture_output=True, text=True)
-              print(f"FFmpeg version: {result.stdout}")
-          except Exception as e:
-              print(f"Error running FFmpeg: {str(e)}")
-        else:
-            print("FFmpeg not found in PATH")
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, '-version'], capture_output=True, text=True)
+            print(f"FFmpeg version: {result.stdout}")
+        except Exception as e:
+            print(f"Error running FFmpeg: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
 
         ffmpeg_command = [
-            'ffmpeg',  # Use the system-installed FFmpeg
+            ffmpeg_path,  # Use the system-installed FFmpeg
             '-f', 'lavfi',  # Use lavfi input instead of avfoundation
             '-i', 'anullsrc',  # Generate silent audio input
             '-f', 'lavfi',
@@ -150,8 +139,6 @@ async def start_stream(
             full_rtmps_url
         ]
 
-        logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
-
         try:
           process = await asyncio.create_subprocess_exec(
               *ffmpeg_command,
@@ -162,6 +149,7 @@ async def start_stream(
             print(f"Error creating subprocess: {str(e)}")
             raise HTTPException(
                 status_code=500, detail=f"Failed to start FFmpeg process: {str(e)}")
+
 
         try:
             update_query = """
@@ -252,12 +240,21 @@ async def stop_stream(
 
 @router.get("/check-ffmpeg")
 async def check_ffmpeg():
-    ffmpeg_path = shutil.which('ffmpeg')
-    if ffmpeg_path:
-        try:
-            result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, text=True)
-            return {"status": "FFmpeg found", "path": ffmpeg_path, "version": result.stdout}
-        except Exception as e:
-            return {"status": "FFmpeg found but execution failed", "path": ffmpeg_path, "error": str(e)}
-    else:
-        return {"status": "FFmpeg not found"}
+    ffmpeg_path = '/usr/bin/ffmpeg'
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, '-version'], capture_output=True, text=True)
+        return {
+            "status": "FFmpeg found",
+            "path": ffmpeg_path,
+            "version": result.stdout,
+            "current_dir": os.getcwd(),
+            "path_env": os.environ['PATH']
+        }
+    except Exception as e:
+        return {
+            "status": "FFmpeg check failed",
+            "error": str(e),
+            "current_dir": os.getcwd(),
+            "path_env": os.environ['PATH']
+        }
