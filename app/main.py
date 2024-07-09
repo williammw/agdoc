@@ -98,3 +98,8 @@ if __name__ == "__main__":
     with threadpool_limits(limits=1, user_api='openmp'):
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+@app.get("/check-ffmpeg")
+async def check_ffmpeg():
+    return await live_stream_router.check_ffmpeg()

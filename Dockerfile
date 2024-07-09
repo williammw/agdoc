@@ -14,7 +14,7 @@ COPY . /app
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Make port 80 available to the world outside this container
-EXPOSE 80
+EXPOSE 8080
 
 # Define environment variable and ensure FFmpeg is in PATH
 ENV PATH="/usr/bin:${PATH}"
@@ -22,5 +22,5 @@ ENV PATH="/usr/bin:${PATH}"
 # Ensure FFmpeg is executable
 RUN chmod +x /usr/bin/ffmpeg
 
-# Run app.py when the container launches
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80"]
+# Run app when the container launches
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
