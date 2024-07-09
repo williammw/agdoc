@@ -6,7 +6,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Request, HTTPException
-
+import shutil
+import subprocess
 import os
 import traceback
 import logging
@@ -94,12 +95,30 @@ async def general_exception_handler(request: Request, exc: Exception):
 async def greeting():
     return {"message": "Nothing to see here."}
 
+
+@app.get("/check-ffmpeg")
+async def check_ffmpeg():
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        return {"status": "FFmpeg not found in PATH"}
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, '-version'], capture_output=True, text=True)
+        return {
+            "status": "FFmpeg found",
+            "path": ffmpeg_path,
+            "version": result.stdout
+        }
+    except Exception as e:
+        return {
+            "status": "FFmpeg found but execution failed",
+            "error": str(e)
+        }
+
 if __name__ == "__main__":
     with threadpool_limits(limits=1, user_api='openmp'):
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
-@app.get("/check-ffmpeg")
-async def check_ffmpeg():
-    return await live_stream_router.check_ffmpeg()
