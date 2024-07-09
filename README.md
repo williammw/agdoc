@@ -7,10 +7,11 @@
 
 ### view docs using endpoint/docs
 ```gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app```
-
+```gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app```
 #### local test run caommand
 ```uvicorn app.main:app --reload```
 ```uvicorn --host 0.0.0.0  app.main:app --reload```
+
 
 
 ### ngrok for test

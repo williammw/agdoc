@@ -107,11 +107,11 @@ async def start_stream(
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
         ffmpeg_command = [
-            'ffmpeg',  # Use the system-installed FFmpeg
-            '-f', 'lavfi',  # Use lavfi input instead of avfoundation
-            '-i', 'anullsrc',  # Generate silent audio input
+            'ffmpeg',
             '-f', 'lavfi',
-            '-i', 'testsrc=size=640x360:rate=30',  # Generate test video input
+            '-i', 'anullsrc',
+            '-f', 'lavfi',
+            '-i', 'testsrc=size=640x360:rate=30',
             '-c:v', 'libx264',
             '-preset', 'medium',
             '-tune', 'zerolatency',
