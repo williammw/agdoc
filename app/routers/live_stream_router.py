@@ -2,7 +2,7 @@
 from fastapi import HTTPException
 from fastapi import APIRouter, HTTPException, Depends, Header
 import psutil
-
+import shutil
 from app.dependencies import get_current_user, get_database, verify_token
 from databases import Database
 from pydantic import BaseModel
@@ -82,6 +82,20 @@ async def start_stream(
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
+    
+    # Add these diagnostic prints
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"PATH: {os.environ.get('PATH')}")
+    print(f"FFmpeg location: {shutil.which('ffmpeg')}")
+
+    try:
+        result = subprocess.run(['ffmpeg', '-version'],
+                                capture_output=True, text=True)
+        print(f"FFmpeg version: {result.stdout}")
+    except Exception as e:
+        print(f"Error running FFmpeg: {str(e)}")
+
+
     try:
         token = authorization.split(" ")[1]
         decoded_token = verify_token(token)
@@ -106,8 +120,13 @@ async def start_stream(
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
+        ffmpeg_path = shutil.which('ffmpeg')
+        if not ffmpeg_path:
+            raise HTTPException(
+                status_code=500, detail="FFmpeg not found in system path")
+
         ffmpeg_command = [
-            'ffmpeg',
+            ffmpeg_path,
             '-f', 'lavfi',
             '-i', 'anullsrc',
             '-f', 'lavfi',

@@ -12,6 +12,9 @@
 ```uvicorn app.main:app --reload```
 ```uvicorn --host 0.0.0.0  app.main:app --reload```
 
+## 9Jul2024##
+`uvicorn app.main:app --host 0.0.0.0 --port 8080`
+
 
 
 ### ngrok for test
