@@ -1,3 +1,3 @@
 #!/bin/bash
-export PATH="/app/bin:$PATH"
+export PATH="$HOME/bin:$PATH"
 echo "PATH has been updated: $PATH"
