@@ -10,7 +10,6 @@ import httpx
 import os
 import asyncio
 import subprocess
-import shutil
 import logging
 
 router = APIRouter()
@@ -83,7 +82,14 @@ async def start_stream(
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
-
+    try:
+        token = authorization.split(" ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+    except Exception as e:
+        logger.error(f"Authentication error: {str(e)}")
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
 
     try:
         query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
@@ -100,56 +106,41 @@ async def start_stream(
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
 
-        print("Current working directory:", os.getcwd())
-        print("Environment PATH:", os.environ['PATH'])
-
-        ffmpeg_path = '/usr/bin/ffmpeg'
-        print(f"FFmpeg path: {ffmpeg_path}")
-
-        try:
-            result = subprocess.run(
-                [ffmpeg_path, '-version'], capture_output=True, text=True)
-            print(f"FFmpeg version: {result.stdout}")
-        except Exception as e:
-            print(f"Error running FFmpeg: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
+        
 
         ffmpeg_command = [
-            ffmpeg_path,  # Use the system-installed FFmpeg
-            '-f', 'lavfi',  # Use lavfi input instead of avfoundation
-            '-i', 'anullsrc',  # Generate silent audio input
-            '-f', 'lavfi',
-            '-i', 'testsrc=size=640x360:rate=30',  # Generate test video input
+            'ffmpeg',
+            '-f', 'avfoundation',
+            '-framerate', '30',
+            '-i', '0:0',
             '-c:v', 'libx264',
-            '-preset', 'medium',
+            '-preset', 'medium',  # 'medium' provides a better balance between quality and speed
             '-tune', 'zerolatency',
-            '-b:v', '3500k',
-            '-maxrate', '3500k',
-            '-bufsize', '7000k',
+            '-b:v', '3500k',  # Increased bitrate for better quality
+            '-maxrate', '3500k',  # Matching the bitrate
+            '-bufsize', '7000k',  # Increased buffer size
+            '-vf', 'scale=640:360',  # Scaling to 720p
             '-pix_fmt', 'yuv420p',
-            '-crf', '18',
+            '-crf', '18',  # Constant rate factor for better quality control
             '-g', '60',
             '-keyint_min', '60',
             '-sc_threshold', '0',
             '-c:a', 'aac',
-            '-b:a', '192k',
+            '-b:a', '192k',  # Increased audio bitrate for better audio quality
             '-ar', '44100',
             '-f', 'flv',
             full_rtmps_url
         ]
 
-        try:
-          process = await asyncio.create_subprocess_exec(
-              *ffmpeg_command,
-              stdout=asyncio.subprocess.PIPE,
-              stderr=asyncio.subprocess.PIPE
-          )
-        except Exception as e:
-            print(f"Error creating subprocess: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail=f"Failed to start FFmpeg process: {str(e)}")
+        logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
 
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        logger.info(f"FFmpeg process started with PID: {process.pid}")
 
         try:
             update_query = """
@@ -236,25 +227,3 @@ async def stop_stream(
         logger.error(f"Failed to stop stream: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"Failed to stop stream: {str(e)}")
-
-
-@router.get("/check-ffmpeg")
-async def check_ffmpeg():
-    ffmpeg_path = '/usr/bin/ffmpeg'
-    try:
-        result = subprocess.run(
-            [ffmpeg_path, '-version'], capture_output=True, text=True)
-        return {
-            "status": "FFmpeg found",
-            "path": ffmpeg_path,
-            "version": result.stdout,
-            "current_dir": os.getcwd(),
-            "path_env": os.environ['PATH']
-        }
-    except Exception as e:
-        return {
-            "status": "FFmpeg check failed",
-            "error": str(e),
-            "current_dir": os.getcwd(),
-            "path_env": os.environ['PATH']
-        }
