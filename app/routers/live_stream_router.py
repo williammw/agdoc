@@ -86,8 +86,9 @@ async def start_stream(
     # Add these diagnostic prints
     print(f"Current working directory: {os.getcwd()}")
     print(f"PATH: {os.environ.get('PATH')}")
-    print(f"FFmpeg location: {shutil.which('ffmpeg')}")
-    ffmpeg_path = "/layers/digitalocean_apt/apt/usr/bin/ffmpeg"
+
+    ffmpeg_path = "/app/bin/ffmpeg"
+
     print(f"FFmpeg path: {ffmpeg_path}")
 
 
@@ -101,15 +102,18 @@ async def start_stream(
         raise HTTPException(
             status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
 
-
     try:
-        token = authorization.split(" ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
+        # Simple command to test FFmpeg
+        result = subprocess.run(
+            [ffmpeg_path, '-version'], capture_output=True, text=True)
+        print(f"FFmpeg version: {result.stdout}")
     except Exception as e:
-        logger.error(f"Authentication error: {str(e)}")
+        print(f"Error running FFmpeg: {str(e)}")
         raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
+            status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
+
+    # For now, let's just return success if FFmpeg runs without error
+    return {"message": "FFmpeg test successful"}
 
     try:
         query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
