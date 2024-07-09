@@ -122,8 +122,19 @@ async def start_stream(
 
         ffmpeg_path = shutil.which('ffmpeg')
         if not ffmpeg_path:
+            ffmpeg_path = "/layers/digitalocean_apt/apt/usr/bin/ffmpeg"
+
+        print(f"FFmpeg path: {ffmpeg_path}")
+
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, '-version'], capture_output=True, text=True)
+            print(f"FFmpeg version: {result.stdout}")
+        except Exception as e:
+            print(f"Error running FFmpeg: {str(e)}")
             raise HTTPException(
-                status_code=500, detail="FFmpeg not found in system path")
+                status_code=500, detail=f"Failed to run FFmpeg: {str(e)}")
+
 
         ffmpeg_command = [
             ffmpeg_path,
