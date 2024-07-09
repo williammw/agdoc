@@ -116,6 +116,12 @@ async def check_ffmpeg():
             "error": str(e)
         }
 
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
 if __name__ == "__main__":
     with threadpool_limits(limits=1, user_api='openmp'):
         import uvicorn
