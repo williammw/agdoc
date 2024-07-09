@@ -93,6 +93,7 @@ async def start_stream(
         ffmpeg_path = await install_ffmpeg()
 
     print(f"FFmpeg path: {ffmpeg_path}")
+    print('nothing working')
 
     try:
         # Simple command to test FFmpeg
