@@ -10,6 +10,7 @@ import httpx
 import os
 import asyncio
 import subprocess
+import shutil
 import logging
 
 router = APIRouter()
@@ -90,6 +91,12 @@ async def start_stream(
         logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
+    
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"PATH: {os.environ.get('PATH')}")
+    print(f"Contents of /usr/bin: {os.listdir('/usr/bin')}")
+
+
 
     try:
         query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
@@ -105,6 +112,19 @@ async def start_stream(
         stream_key = result['stream_key']
 
         full_rtmps_url = f"{rtmps_url}{stream_key}"
+
+        ffmpeg_path = shutil.which('ffmpeg')
+        print(f"FFmpeg path: {ffmpeg_path}")
+
+        if ffmpeg_path:
+          try:
+              result = subprocess.run(
+                  [ffmpeg_path, '-version'], capture_output=True, text=True)
+              print(f"FFmpeg version: {result.stdout}")
+          except Exception as e:
+              print(f"Error running FFmpeg: {str(e)}")
+        else:
+            print("FFmpeg not found in PATH")
 
         ffmpeg_command = [
             'ffmpeg',  # Use the system-installed FFmpeg
@@ -132,13 +152,16 @@ async def start_stream(
 
         logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
 
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        logger.info(f"FFmpeg process started with PID: {process.pid}")
+        try:
+          process = await asyncio.create_subprocess_exec(
+              *ffmpeg_command,
+              stdout=asyncio.subprocess.PIPE,
+              stderr=asyncio.subprocess.PIPE
+          )
+        except Exception as e:
+            print(f"Error creating subprocess: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to start FFmpeg process: {str(e)}")
 
         try:
             update_query = """
@@ -225,3 +248,16 @@ async def stop_stream(
         logger.error(f"Failed to stop stream: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"Failed to stop stream: {str(e)}")
+
+
+@router.get("/check-ffmpeg")
+async def check_ffmpeg():
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        try:
+            result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, text=True)
+            return {"status": "FFmpeg found", "path": ffmpeg_path, "version": result.stdout}
+        except Exception as e:
+            return {"status": "FFmpeg found but execution failed", "path": ffmpeg_path, "error": str(e)}
+    else:
+        return {"status": "FFmpeg not found"}
