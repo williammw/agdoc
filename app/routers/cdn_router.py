@@ -190,7 +190,9 @@ async def toggle_public_status(request: Request, database: Database = Depends(ge
 
 @router.post("/upload-avatar/")
 async def upload_avatar(file: UploadFile = File(...), current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    print("Current user: entry", current_user)
     try:
+        print("Current user: try", current_user)
         # Generate a unique file name
         file_extension = os.path.splitext(file.filename)[1]
         # file_key = f"{user_id}/images/{file.filename}"
@@ -361,3 +363,6 @@ async def get_stream_status(stream_id: str, authorization: str = Header(...)):
         print(f"General Exception for stream {stream_id}: {str(exc)}")
         raise HTTPException(
             status_code=500, detail=f"An error occurred: {str(exc)}")
+
+
+
