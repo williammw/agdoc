@@ -741,7 +741,7 @@ async def create_temp_user(user: TempUserCreate, database: Database = Depends(ge
     values = {
         "id": temp_user_id,
         "email": user.email,
-        "password": user.password,
+        "password": hashed_password,
         "created_at": datetime.now()
     }
 
@@ -775,33 +775,47 @@ async def get_temp_user(temp_user_id: str, database: Database = Depends(get_data
     return {"email": user['email'], "password": user['password'], "tempUserId": str(user['id'])}
 
 
+async def get_temp_user(temp_user_id: str, database: Database):
+    query = "SELECT * FROM temp_users WHERE id = :temp_user_id"
+    return await database.fetch_one(query=query, values={"temp_user_id": temp_user_id})
+
 @router.post("/verify-user")
-async def verify_user(data: dict, database: Database = Depends(get_database)):
-    logger.info(f"Verifying user with ID: {data['tempUserId']}")
-
-    # First, check if the user exists
-    check_query = """
-    SELECT id FROM users WHERE id = :user_id
-    """
-    check_values = {"user_id": data['tempUserId']}
-
+async def verify_user(request: Request, database: Database = Depends(get_database)):
     try:
-        user = await database.fetch_one(check_query, values=check_values)
-        if not user:
-            logger.error(f"User with ID {data['tempUserId']} not found")
-            raise HTTPException(status_code=404, detail="User not found")
+        data = await request.json()
+        temp_user_id = data.get('tempUserId')
 
-        # If user exists, proceed with update
+        # Verify the Firebase token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise HTTPException(
+                status_code=401, detail="Invalid authorization header")
+
+        id_token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(id_token)
+            uid = decoded_token['uid']
+        except Exception as e:
+            raise HTTPException(
+                status_code=401, detail=f"Invalid token: {str(e)}")
+
+        # Fetch the temporary user from your database
+        temp_user = await get_temp_user(temp_user_id, database)
+        if not temp_user:
+            raise HTTPException(
+                status_code=404, detail="Temporary user not found")
+
+        # Update the user record with the Firebase UID
         update_query = """
-        UPDATE users SET is_verified = TRUE WHERE id = :user_id
+        UPDATE users 
+        SET firebase_uid = :firebase_uid, is_verified = TRUE 
+        WHERE id = :temp_user_id
         """
-        update_values = {"user_id": data['tempUserId']}
+        await database.execute(update_query, {"firebase_uid": uid, "temp_user_id": temp_user_id})
 
-        await database.execute(update_query, values=update_values)
-        logger.info(f"User {data['tempUserId']} verified successfully")
         return {"message": "User verified successfully"}
     except Exception as e:
-        logger.error(f"Failed to verify user: {str(e)}")
+        logger.error(f"Error verifying user: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Failed to verify user: {str(e)}")
     
@@ -1005,3 +1019,40 @@ async def complete_registration(
             status_code=500, detail=f"Failed to complete registration: {str(e)}")
 
 
+
+
+@router.get("/test-my-ball")
+async def test_my_ball():
+    user = auth.create_user(
+        uid='some-uid', email='user@example.com', phone_number='+15555550100', disabled=True)
+    print('Sucessfully created new user: {0}'.format(user.uid))
+
+# https://firebase.google.com/docs/auth/admin/manage-users#python_5
+    
+
+@router.get("/hit-my-ball")
+async def hit_my_ball():
+    user = auth.update_user(
+        'some-uid',
+        email='user@example.com',
+        phone_number='+15555550100',
+        email_verified=True,
+        password='newPassword',
+        display_name='John Doe',
+        photo_url='http://www.example.com/12345678/photo.png',
+        disabled=False)
+    
+    print('Sucessfully updated user: {0}'.format(user.uid))
+
+
+# @router.get("/999")
+# def verify_token(token):
+#     try:
+#         decoded_token = auth.verify_id_token(token)
+#         return decoded_token
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=401,
+#             detail="Invalid authentication credentials",
+#             headers={"WWW-Authenticate": "Bearer"},
+#         )

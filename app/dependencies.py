@@ -1,7 +1,9 @@
 # dependencies.py
-from fastapi import Depends, HTTPException, Security
+from firebase_admin import auth as firebase_auth
+from databases import Database
+from fastapi import Depends, HTTPException, Header, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer
-from .firebase_admin_config import verify_token
+from .firebase_admin_config import verify_token, auth
 from .database import database
 from typing import Optional
 from jose import JWTError, jwt
@@ -53,18 +55,41 @@ async def get_database():
 #v2
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def get_current_user(authorization: str = Header(...), db: Database = Depends(get_database)):
     try:
-        token = credentials.credentials
-        decoded_token = verify_token(token)
-        return {"uid": decoded_token['uid']}
-    except Exception as e:
-        print(f"Error verifying token: {str(e)}")
+        token = authorization.split("Bearer ")[1]
+        decoded_token = firebase_auth.verify_id_token(
+            token, check_revoked=True)
+        uid = decoded_token['uid']
+
+        # Check if the user is disabled in Firebase
+        firebase_user = firebase_auth.get_user(uid)
+        if firebase_user.disabled:
+            raise HTTPException(
+                status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
+
+        query = """
+        SELECT id, username, email, auth_provider, created_at, is_active, full_name, 
+               bio, avatar_url, phone_number, dob
+        FROM users 
+        WHERE id = :uid
+        """
+        user = await db.fetch_one(query=query, values={"uid": uid})
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_dict = dict(user)
+        user_dict['uid'] = uid
+        print("User data from get_current_user:", user_dict)
+        return user_dict
+    except firebase_auth.UserDisabledError:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+            status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
+    except Exception as e:
+        print(f"Error in get_current_user: {str(e)}")
+        raise HTTPException(
+            status_code=401, detail="Invalid authentication credentials")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()

@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router
+from app.routers import auth2_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -51,6 +51,7 @@ router_list = [
     (dev_router, "/api/v1/dev", ["dev"]),
     (agents_router, "/api/v1/agents", ["agents"]),
     (auth_router, "/api/v1/auth", ["auth"]),
+    (auth2_router, "/api/v2/auth", ["auth"]),
     (chat_router, "/api/v1", ["chats"]),
     (cv_router, "/api/v1/cv", ["cv"]),
     (rag_router, "/api/v1/rag", ["rag"]),
