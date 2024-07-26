@@ -1,6 +1,8 @@
 # cdn_router.py
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Header
 import uuid
+from fastapi.responses import JSONResponse
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, Header, Request
@@ -21,8 +23,7 @@ r2_client = boto3.client(
 )
 
 bucket_name = 'umami'
-allowed_mime_types = ['image/jpeg', 'image/png',
-                      'image/gif', 'video/mp4', 'video/mpeg']
+allowed_mime_types = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml', 'image/bmp', 'image/tiff', 'image/x-icon', 'image/vnd.microsoft.icon', 'image/vnd.wap.wbmp', 'image/apng', 'image/gif', 'video/mp4', 'video/mpeg']
 
 
 @router.get("/list-objects/")
@@ -90,7 +91,12 @@ async def upload_to_cloudflare(file: UploadFile = File(...), database: Database 
 
 
 @router.post("/upload-image-r2/")
-async def upload_to_r2(file: UploadFile = File(...), database: Database = Depends(get_database), authorization: str = Header(...)):
+async def upload_to_r2(
+    file: UploadFile = File(...),
+    database: Database = Depends(get_database),
+    authorization: str = Header(...),
+    image_type: str = None  # New parameter for 'avatar' or 'cover'
+):
     token = authorization.split(" ")[1]
     decoded_token = verify_token(token)
     user_id = decoded_token['uid']
@@ -100,8 +106,19 @@ async def upload_to_r2(file: UploadFile = File(...), database: Database = Depend
     if mime_type not in allowed_mime_types:
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    # Generate a unique file name to avoid conflicts
-    file_key = f"{user_id}/images/{file.filename}"
+    # Generate a unique filename
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    file_extension = os.path.splitext(file.filename)[1]
+    unique_filename = f"{timestamp}_{unique_id}{file_extension}"
+
+    # Determine the folder based on image_type
+    if image_type in ['avatar', 'cover']:
+        folder = f"{user_id}/{image_type}"
+    else:
+        folder = f"{user_id}/images"
+
+    file_key = f"{folder}/{unique_filename}"
 
     try:
         # Upload file to R2
@@ -120,13 +137,21 @@ async def upload_to_r2(file: UploadFile = File(...), database: Database = Depend
     # Construct the file URL
     file_url = f"https://{os.getenv('R2_DEV_URL')}/{file_key.replace('/', '%2F')}"
 
-    # Proceed with database insertion
+    # Insert new record or update existing one
     query = """
     INSERT INTO cloudflare_r2_data (filename, url, content_type, r2_object_key, user_id, is_public)
     VALUES (:filename, :url, :content_type, :r2_object_key, :user_id, :is_public)
+    ON CONFLICT (r2_object_key) 
+    DO UPDATE SET 
+        filename = EXCLUDED.filename,
+        url = EXCLUDED.url,
+        content_type = EXCLUDED.content_type,
+        user_id = EXCLUDED.user_id,
+        is_public = EXCLUDED.is_public
+    RETURNING id
     """
     values = {
-        "filename": file.filename,
+        "filename": unique_filename,
         "url": file_url,
         "content_type": file.content_type,
         "r2_object_key": file_key,
@@ -135,14 +160,17 @@ async def upload_to_r2(file: UploadFile = File(...), database: Database = Depend
     }
 
     try:
-        await database.execute(query=query, values=values)
+        result = await database.fetch_one(query=query, values=values)
+        if result:
+            return {"message": "Image uploaded to Cloudflare R2 and metadata saved successfully", "url": file_url, "id": result['id']}
+        else:
+            raise HTTPException(
+                status_code=500, detail="Failed to insert or update metadata in the database")
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to insert metadata into the database: {str(exc)}"
+            detail=f"Failed to insert or update metadata in the database: {str(exc)}"
         )
-
-    return {"message": "Image uploaded to Cloudflare R2 and metadata saved successfully", "url": file_url}
 
 
 @router.post("/toggle-public-status/")
@@ -365,4 +393,17 @@ async def get_stream_status(stream_id: str, authorization: str = Header(...)):
             status_code=500, detail=f"An error occurred: {str(exc)}")
 
 
+@router.get("/list/{user_id}")
+async def list_files(user_id: str):
+    try:
+        prefix = f"{user_id}/"
+        response = r2_client.list_objects_v2(
+            Bucket=bucket_name, Prefix=prefix)
 
+        if 'Contents' not in response:
+            return JSONResponse(status_code=200, content={"files": []})
+
+        files = [obj['Key'] for obj in response['Contents']]
+        return JSONResponse(status_code=200, content={"files": files})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

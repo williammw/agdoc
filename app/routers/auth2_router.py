@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, Header
+from fastapi import Depends, File, Form, HTTPException, Header, UploadFile
 import logging
 from fastapi import APIRouter, HTTPException, Depends, Response, Header, logger
 from firebase_admin import auth as firebase_auth
@@ -12,6 +12,10 @@ from email.message import EmailMessage
 import smtplib
 import os
 import secrets
+import io
+from PIL import Image
+
+from app.routers.cdn_router import upload_to_r2
 
 
 router = APIRouter()
@@ -43,16 +47,17 @@ class UserUpdate(BaseModel):
 
 class UserResponse(BaseModel):
     id: str
-    username: Optional[str]
-    email: str
-    auth_provider: str
+    username: Optional[str] = None
+    email: Optional[str] = None
+    auth_provider: str = None
     created_at: datetime
-    is_active: bool
-    full_name: Optional[str]
+    is_active: bool 
+    full_name: Optional[str] = None
     bio: Optional[str]
-    avatar_url: Optional[str]
-    phone_number: Optional[str]
-    dob: Optional[date]
+    avatar_url: Optional[str] = None
+    phone_number: Optional[str] = None
+    dob: Optional[date] = None
+    cover_image: Optional[str] = None
 
 
     class Config:
@@ -315,6 +320,7 @@ async def google_login(authorization: str = Header(...), db: Database = Depends(
                 "full_name": firebase_user.display_name or "",
                 "created_at": datetime.now(),
                 "avatar_url": firebase_user.photo_url or ""
+                
             }
             user = await db.fetch_one(query=insert_query, values=values)
         else:
@@ -332,7 +338,9 @@ async def google_login(authorization: str = Header(...), db: Database = Depends(
             "username": user['username'],
             "full_name": user['full_name'],
             "avatar_url": user['avatar_url'],
-            "auth_provider": user['auth_provider']
+            "auth_provider": user['auth_provider'],
+            "cover_image": user['cover_image'],
+            "status": user['status']
         }
 
     except Exception as e:
@@ -469,33 +477,111 @@ async def test_email():
 
 
 class UserCreate(BaseModel):
-    firebaseUid: str
-    phoneNumber: str
-    username: str
-    fullName: str
+    firebaseUid: Optional[str] = None
+    phoneNumber: Optional[str] = None
+    username: Optional[str] = None
+    fullName: Optional[str] = None
+
+
+# async def create_user(user_data: UserCreate, current_user: dict = Depends(get_current_user),  db: Database = Depends(get_database)):
 
 
 @router.post("/create-user")
-async def create_user(user_data: UserCreate, current_user: dict = Depends(get_current_user),  db: Database = Depends(get_database)):
-    # Ensure the Firebase UID matches the authenticated user
-    if current_user['uid'] != user_data.firebaseUid:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    query = """
-    INSERT INTO users (firebase_uid, phone_number, username, full_name)
-    VALUES (:firebase_uid, :phone_number, :username, :full_name)
-    RETURNING id
-    """
-    values = {
-        "firebase_uid": user_data.firebaseUid,
-        "phone_number": user_data.phoneNumber,
-        "username": user_data.username,
-        "full_name": user_data.fullName
-    }
-
+async def create_user(user_data: UserCreate, authorization: str = Header(...), db: Database = Depends(get_database)):
     try:
+        # Verify the Firebase token
+        token = authorization.split("Bearer ")[1]
+        decoded_token = firebase_auth.verify_id_token(
+            token, check_revoked=True)
+        firebase_uid = decoded_token['uid']
+
+        # Ensure the Firebase UID matches the one in the request
+        if firebase_uid != user_data.firebaseUid:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+
+        query = """
+        INSERT INTO users (id, phone_number, username, full_name)
+        VALUES (:firebase_uid, :phone_number, :username, :full_name)
+        RETURNING id
+        """
+        values = {
+            "firebase_uid": firebase_uid,
+            "phone_number": user_data.phoneNumber,
+            "username": user_data.username,
+            "full_name": user_data.fullName
+        }
+
         user_id = await db.fetch_val(query=query, values=values)
         return {"id": user_id, "message": "User created successfully"}
+    except firebase_auth.InvalidIdTokenError:
+        raise HTTPException(status_code=401, detail="Invalid Firebase token")
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Database error: {str(e)}")
+
+
+# https://pub-f807f542a88040d7a549c087eff40e12.r2.dev/EzrLXFNlmDO3izsWmavFt2hPQpe2/avatar/.jpg
+# https://cdn.ohmeowkase.com/EzrLXFNlmDO3izsWmavFt2hPQpe2/avatar/.jpg
+
+
+@router.post("/update-profile/{user_id}")
+async def update_profile(
+    user_id: str,
+    username: str = Form(None),
+    full_name: str = Form(None),
+    bio: str = Form(None),
+    status: str = Form(None),
+    avatar_url: UploadFile = File(None),
+    cover_image: UploadFile = File(None),
+    current_user: dict = Depends(get_current_user),
+    database: Database = Depends(get_database),
+    authorization: str = Header(...)
+):
+    if current_user['uid'] != user_id:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to update this profile")
+
+    # Fetch current user data
+    query = "SELECT * FROM users WHERE id = :user_id"
+    current_user_data = await database.fetch_one(query=query, values={"user_id": user_id})
+
+    update_data = {}
+    if username is not None and username != current_user_data['username']:
+        update_data['username'] = username
+    if full_name is not None and full_name != current_user_data['full_name']:
+        update_data['full_name'] = full_name
+    if bio is not None and bio != current_user_data['bio']:
+        update_data['bio'] = bio
+    if status is not None and status != current_user_data['status']:
+        if status not in ['available', 'busy', 'at_restaurant', 'cooking', 'food_coma']:
+            raise HTTPException(status_code=400, detail="Invalid status")
+        update_data['status'] = status
+
+    if avatar_url:
+        avatar_result = await upload_to_r2(avatar_url, database, authorization,'avatar')
+        if avatar_result['url'] != current_user_data['avatar_url']:
+            update_data['avatar_url'] = avatar_result['url']
+
+    if cover_image:
+        cover_result = await upload_to_r2(cover_image, database, authorization, 'cover')
+        if cover_result['url'] != current_user_data['cover_image']:
+            update_data['cover_image'] = cover_result['url']
+
+    if not update_data:
+        return {"message": "No changes detected", "user": current_user_data}
+
+    set_clause = ", ".join([f"{key} = :{key}" for key in update_data.keys()])
+    query = f"""
+    UPDATE users
+    SET {set_clause}
+    WHERE id = :user_id
+    RETURNING *
+    """
+
+    values = {**update_data, 'user_id': user_id}
+    updated_user = await database.fetch_one(query=query, values=values)
+
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "Profile updated successfully", "user": updated_user}

@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, BigInteger, Text, Enum
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, BigInteger, Text, Enum, CheckConstraint
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 from sqlalchemy.sql import func
@@ -20,18 +20,28 @@ Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
-    id = Column(String(28), primary_key=True)
-    username = Column(String(255), unique=True)
-    email = Column(String(255), unique=True, nullable=False)
-    auth_provider = Column(String(50), nullable=False, default='firebase')
-    created_at = Column(DateTime, default=func.now())
-    is_active = Column(Boolean, default=True)
-    full_name = Column(String(255))
-    bio = Column(Text)
-    avatar_url = Column(String(255))
 
-    chats = relationship("Chat", back_populates="user")
-    images = relationship("ImageMetadata", back_populates="user")
+    id = Column(String, primary_key=True)
+    username = Column(String, unique=True, nullable=False)
+    email = Column(String, unique=True, nullable=False)
+    auth_provider = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    is_active = Column(Boolean, default=True)
+    full_name = Column(String)
+    bio = Column(String)
+    avatar_url = Column(String)
+    phone_number = Column(String)
+    dob = Column(String)
+    status = Column(String, default='available')
+    cover_image = Column(String)
+
+    __table_args__ = (
+        CheckConstraint(
+            status.in_(['available', 'busy', 'at_restaurant',
+                       'cooking', 'food_coma']),
+            name='check_status'
+        ),
+    )
 
 
 class Chat(Base):
@@ -45,6 +55,8 @@ class Chat(Base):
 
     user = relationship("User", back_populates="chats")
     messages = relationship("Message", back_populates="chat")
+
+
 
 
 class Message(Base):

@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router
+from app.routers import auth2_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -25,11 +25,12 @@ logger = logging.getLogger(__name__)
 origins = [
     "http://localhost:5173",
     # "http://localhost:8000",
-    "http://192.168.1.2:5173",
-    # "http://192.168.1.2:8000",
+    "http://192.168.1.3:5173",
+    "http://192.168.1.2:8000",
     "https://235534.netlify.app",
     "https://umamiverse.netlify.app",
     "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
+    "https://422c-185-245-239-143.ngrok-free.app",
 ]
 
 app.add_middleware(
@@ -56,6 +57,7 @@ router_list = [
     (cv_router, "/api/v1/cv", ["cv"]),
     (rag_router, "/api/v1/rag", ["rag"]),
     (live_stream_router, "/api/v1/live-stream", ["live-stream"]),
+    (users_router, "/api/v1/users", ["users"]),
 ]
 
 for router, prefix, tags in router_list:

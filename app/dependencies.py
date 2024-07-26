@@ -70,7 +70,7 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
 
         query = """
         SELECT id, username, email, auth_provider, created_at, is_active, full_name, 
-               bio, avatar_url, phone_number, dob
+               bio, avatar_url, phone_number, dob, status, cover_image
         FROM users 
         WHERE id = :uid
         """
@@ -81,7 +81,7 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
 
         user_dict = dict(user)
         user_dict['uid'] = uid
-        print("User data from get_current_user:", user_dict)
+        # print("User data from get_current_user:", user_dict)
         return user_dict
     except firebase_auth.UserDisabledError:
         raise HTTPException(
