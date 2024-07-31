@@ -10,7 +10,7 @@ router = APIRouter()
 @router.get("/profile")
 async def get_user_profile(current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
     query = """
-    SELECT id, username, full_name, bio, avatar_url, cover_image
+    SELECT id, username, full_name, bio, avatar_url, cover_image, status
     FROM users
     WHERE id = :id
     """
@@ -24,6 +24,7 @@ async def get_user_profile(current_user: dict = Depends(get_current_user), db: D
             "bio": user["bio"],
             "avatar_url": user["avatar_url"],
             "cover_image": user["cover_image"],
+            "status": user["status"]
         }
     else:
         raise HTTPException(status_code=404, detail="User profile not found")
@@ -32,7 +33,7 @@ async def get_user_profile(current_user: dict = Depends(get_current_user), db: D
 @router.get("/me/{username}")
 async def get_public_user_profile(username: str, db: Database = Depends(get_database)):
     query = """
-    SELECT id, username, full_name, bio, avatar_url, cover_image
+    SELECT id, username, full_name, bio, avatar_url, cover_image, status
     FROM users
     WHERE username = :username
     """
@@ -46,6 +47,7 @@ async def get_public_user_profile(username: str, db: Database = Depends(get_data
             "bio": user["bio"],
             "avatar_url": user["avatar_url"],
             "cover_image": user["cover_image"],
+            "status":user["status"]
         }
     else:
         raise HTTPException(status_code=404, detail="User not found")

@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router
+from app.routers import auth2_router, posts_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -58,6 +58,7 @@ router_list = [
     (rag_router, "/api/v1/rag", ["rag"]),
     (live_stream_router, "/api/v1/live-stream", ["live-stream"]),
     (users_router, "/api/v1/users", ["users"]),
+    (posts_router, "/api/v1/post", ["post"])
 ]
 
 for router, prefix, tags in router_list:

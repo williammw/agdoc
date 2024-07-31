@@ -14,9 +14,14 @@ import os
 import secrets
 import io
 from PIL import Image
-
+import re
 from app.routers.cdn_router import upload_to_r2
 
+
+def clean_username(username):
+    # Use regular expression to find all characters that are letters, numbers, or underscores
+    cleaned_username = re.sub(r'[^a-zA-Z0-9_]', '', username)
+    return cleaned_username
 
 router = APIRouter()
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +63,7 @@ class UserResponse(BaseModel):
     phone_number: Optional[str] = None
     dob: Optional[date] = None
     cover_image: Optional[str] = None
+    status: Optional[str] = None
 
 
     class Config:
@@ -158,6 +164,7 @@ async def update_user(user_data: UserUpdate, current_user: dict = Depends(get_cu
             full_name = :full_name, avatar_url = :avatar_url, is_active = :is_active
         WHERE id = :id
         """
+        # logger("update_user", firebase_user.uid)
         values = {
             "id": firebase_user.uid,
             "email": firebase_user.email,
@@ -313,13 +320,15 @@ async def google_login(authorization: str = Header(...), db: Database = Depends(
             VALUES (:id, :email, :username, :full_name, 'google', :created_at, true, :avatar_url)
             RETURNING *
             """
+            print('google login',firebase_user.display_name)
             values = {
                 "id": uid,
                 "email": firebase_user.email,
-                "username": firebase_user.display_name or "",
+                "username": "",
                 "full_name": firebase_user.display_name or "",
                 "created_at": datetime.now(),
                 "avatar_url": firebase_user.photo_url or ""
+                
                 
             }
             user = await db.fetch_one(query=insert_query, values=values)
@@ -340,7 +349,8 @@ async def google_login(authorization: str = Header(...), db: Database = Depends(
             "avatar_url": user['avatar_url'],
             "auth_provider": user['auth_provider'],
             "cover_image": user['cover_image'],
-            "status": user['status']
+            "status": user['status'],
+            "bio": user['bio']
         }
 
     except Exception as e:
@@ -547,7 +557,7 @@ async def update_profile(
 
     update_data = {}
     if username is not None and username != current_user_data['username']:
-        update_data['username'] = username
+        update_data['username'] = clean_username(username)
     if full_name is not None and full_name != current_user_data['full_name']:
         update_data['full_name'] = full_name
     if bio is not None and bio != current_user_data['bio']:
