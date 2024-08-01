@@ -1,3 +1,9 @@
+from asyncpg.exceptions import UndefinedColumnError
+import traceback
+import asyncpg
+from fastapi.logger import logger
+from fastapi import Form, HTTPException
+from fastapi import Form
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Header, Query, BackgroundTasks
 from app.dependencies import get_database, verify_token
 from databases import Database
@@ -28,7 +34,8 @@ s3 = boto3.client(
     's3',
     endpoint_url=os.getenv('R2_ENDPOINT_URL'),
     aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY')
+    aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+    region_name='weur'
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -630,9 +637,12 @@ class PostResponseWithMedia(BaseModel):
     image_url: Optional[str]
     created_at: datetime
     updated_at: datetime
-    likes_count: int
-    comments_count: int
-    rich_media: Optional[RichMedia]
+    likes_count: Optional[int] = 0
+    comments_count: Optional[int] = 0
+    rich_media: Optional[dict] = None  # Changed from RichMedia to dict
+
+    class Config:
+        from_attributes = True
 
 # ... (keep existing functions)
 
@@ -674,7 +684,7 @@ def extract_rich_media(content: str) -> Optional[RichMedia]:
 @router.post("/", response_model=PostResponseWithMedia)
 async def create_post(
     background_tasks: BackgroundTasks,
-    post: PostCreate = Form(...),
+    content: str = Form(...),
     image: Optional[UploadFile] = File(None),
     authorization: str = Header(...),
     db: Database = Depends(get_database),
@@ -686,57 +696,100 @@ async def create_post(
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
     except Exception as e:
+        logger.error(f"Authorization error: {str(e)}")
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
-    post_id = str(uuid.uuid4())[:28]
-    image_url = None
-
-    if image:
-        validate_image(image)
-        # Upload image to Cloudflare R2
-        bucket_name = os.getenv('R2_BUCKET_NAME')
-        object_name = f"posts/{post_id}/{image.filename}"
-        try:
-            s3.upload_fileobj(image.file, bucket_name, object_name)
-            image_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to upload image: {str(e)}")
-
-    # Sanitize content
-    sanitized_content = bleach.clean(post.content)
-
-    # Extract rich media
-    rich_media = extract_rich_media(sanitized_content)
-
-    query = """
-    INSERT INTO posts (id, user_id, content, image_url, created_at, updated_at, likes_count, comments_count, rich_media)
-    VALUES (:id, :user_id, :content, :image_url, :created_at, :updated_at, 0, 0, :rich_media)
-    RETURNING *
-    """
-    values = {
-        "id": post_id,
-        "user_id": user_id,
-        "content": sanitized_content,
-        "image_url": image_url,
-        "created_at": datetime.now(),
-        "updated_at": datetime.now(),
-        "rich_media": rich_media.model_dump_json() if rich_media else None
-    }
-
     try:
-        result = await db.fetch_one(query=query, values=values)
+        post_id = str(uuid.uuid4())[:28]
+        image_url = None
 
-        # Extract and save hashtags
-        background_tasks.add_task(
-            extract_and_save_hashtags, db, post_id, sanitized_content)
+        if image:
+            try:
+                validate_image(image)
+                # Upload image to Cloudflare R2
+                bucket_name = os.getenv('R2_BUCKET_NAME')
+                object_name = f"posts/{post_id}/{image.filename}"
+                s3.upload_fileobj(image.file, bucket_name, object_name)
+                image_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
+            except Exception as e:
+                logger.error(f"Image upload error: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to upload image: {str(e)}")
 
-        # Initialize post analytics
-        background_tasks.add_task(update_post_analytics, db, post_id)
+        # Sanitize content
+        sanitized_content = bleach.clean(content)
 
-        return PostResponseWithMedia(**result)
+        # Extract rich media
+        rich_media = extract_rich_media(sanitized_content)
+
+        # Dynamically build the query based on existing columns
+        columns = ["id", "user_id", "content",
+                   "image_url", "created_at", "updated_at"]
+        values = {
+            "id": post_id,
+            "user_id": user_id,
+            "content": sanitized_content,
+            "image_url": image_url,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+
+        # Check for additional columns
+        try:
+            await db.fetch_one("SELECT likes_count FROM posts LIMIT 1")
+            columns.append("likes_count")
+            values["likes_count"] = 0
+        except UndefinedColumnError:
+            pass
+
+        try:
+            await db.fetch_one("SELECT comments_count FROM posts LIMIT 1")
+            columns.append("comments_count")
+            values["comments_count"] = 0
+        except UndefinedColumnError:
+            pass
+
+        try:
+            await db.fetch_one("SELECT rich_media FROM posts LIMIT 1")
+            columns.append("rich_media")
+            values["rich_media"] = rich_media.model_dump_json(
+            ) if rich_media else None
+        except UndefinedColumnError:
+            pass
+
+        # Construct the query
+        query = f"""
+        INSERT INTO posts ({', '.join(columns)})
+        VALUES ({', '.join([f':{col}' for col in columns])})
+        RETURNING *
+        """
+    
+        try:
+            result = await db.fetch_one(query=query, values=values)
+
+            # Extract and save hashtags
+            background_tasks.add_task(
+                extract_and_save_hashtags, db, post_id, sanitized_content)
+
+            # Initialize post analytics
+            background_tasks.add_task(update_post_analytics, db, post_id)
+
+            return PostResponseWithMedia(**result)
+        except Exception as e:
+            logger.error(f"Error creating post: {str(e)}")
+            logger.error(traceback.format_exc())
+            # If the post was created but background tasks failed, we still want to return the post
+            if 'result' in locals():
+                logger.warning(
+                    "Post created but background tasks may have failed.")
+                return PostResponseWithMedia(**result)
+            raise HTTPException(
+                status_code=500, detail=f"Failed to create post: {str(e)}")
+        
     except Exception as e:
+        logger.error(f"Error creating post: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500, detail=f"Failed to create post: {str(e)}")
 
@@ -953,17 +1006,44 @@ async def extract_and_save_hashtags(db: Database, post_id: str, content: str):
 
 
 async def update_post_analytics(db: Database, post_id: str, view_increment: int = 0, share_increment: int = 0):
-    query = """
-    INSERT INTO post_analytics (post_id, view_count, share_count, engagement_rate)
-    VALUES (:post_id, :view_increment, :share_increment, 0)
-    ON CONFLICT (post_id) DO UPDATE
-    SET view_count = post_analytics.view_count + :view_increment,
-        share_count = post_analytics.share_count + :share_increment,
-        engagement_rate = (post_analytics.view_count + post_analytics.share_count + EXCLUDED.view_count + EXCLUDED.share_increment)::float / 
-                          (SELECT followers_count FROM users WHERE id = (SELECT user_id FROM posts WHERE id = :post_id))
-    """
-    await db.execute(query, {"post_id": post_id, "view_increment": view_increment, "share_increment": share_increment})
+    try:
+        # Check which columns exist
+        columns = []
+        values = {"post_id": post_id}
 
+        try:
+            await db.fetch_one("SELECT view_count FROM post_analytics LIMIT 1")
+            columns.append(
+                "view_count = COALESCE(post_analytics.view_count, 0) + :view_increment")
+            values["view_increment"] = view_increment
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+
+        try:
+            await db.fetch_one("SELECT share_count FROM post_analytics LIMIT 1")
+            columns.append(
+                "share_count = COALESCE(post_analytics.share_count, 0) + :share_increment")
+            values["share_increment"] = share_increment
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+
+        if not columns:
+            logger.warning("No analytics columns found. Skipping update.")
+            return
+
+        # Construct the query
+        query = f"""
+        INSERT INTO post_analytics (post_id, {', '.join(col.split('=')[0].strip() for col in columns)})
+        VALUES (:post_id, {', '.join([f':view_increment' if 'view_count' in col else f':share_increment' for col in columns])})
+        ON CONFLICT (post_id) DO UPDATE
+        SET {', '.join(columns)}
+        """
+
+        await db.execute(query, values)
+
+    except Exception as e:
+        logger.error(f"Error updating post analytics: {str(e)}")
+        logger.error(traceback.format_exc())
 
 
 
