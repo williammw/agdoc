@@ -58,7 +58,7 @@ router_list = [
     (rag_router, "/api/v1/rag", ["rag"]),
     (live_stream_router, "/api/v1/live-stream", ["live-stream"]),
     (users_router, "/api/v1/users", ["users"]),
-    (posts_router, "/api/v1/post", ["post"])
+    (posts_router, "/api/v1/post", ["posts"])
 ]
 
 for router, prefix, tags in router_list:
