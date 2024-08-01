@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Header, Query, BackgroundTasks
 from app.dependencies import get_database, verify_token
 from databases import Database
 from pydantic import BaseModel, constr, HttpUrl
@@ -35,7 +35,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
 class PostCreate(BaseModel):
-    content: constr(max_length=5000)  # Limit content length
+    content: constr(max_length=5000)  # type: ignore # Limit content length
 
 
 class PostResponse(BaseModel):
@@ -45,6 +45,9 @@ class PostResponse(BaseModel):
     image_url: Optional[str]
     created_at: datetime
     updated_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 
@@ -74,61 +77,6 @@ def validate_image(file: UploadFile) -> bool:
 
     return True
 
-
-@router.post("/", response_model=PostResponse)
-async def create_post(
-    post: PostCreate,
-    image: Optional[UploadFile] = File(None),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        # Verify token
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    post_id = str(uuid.uuid4())[:28]
-    image_url = None
-
-    if image:
-        validate_image(image)
-        # Upload image to Cloudflare R2
-        bucket_name = os.getenv('R2_BUCKET_NAME')
-        object_name = f"posts/{post_id}/{image.filename}"
-        try:
-            s3.upload_fileobj(image.file, bucket_name, object_name)
-            image_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to upload image: {str(e)}")
-
-    # Sanitize content
-    sanitized_content = bleach.clean(post.content)
-
-    query = """
-    INSERT INTO posts (id, user_id, content, image_url, created_at, updated_at)
-    VALUES (:id, :user_id, :content, :image_url, :created_at, :updated_at)
-    RETURNING *
-    """
-    values = {
-        "id": post_id,
-        "user_id": user_id,
-        "content": sanitized_content,
-        "image_url": image_url,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
-    }
-
-    try:
-        result = await db.fetch_one(query=query, values=values)
-        return PostResponse(**result)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create post: {str(e)}")
 
 
 @router.get("/{post_id}", response_model=PostResponse)
@@ -675,7 +623,15 @@ class PostCreateWithMedia(PostCreate):
     rich_media: Optional[RichMedia]
 
 
-class PostResponseWithMedia(PostResponse):
+class PostResponseWithMedia(BaseModel):
+    id: str
+    user_id: str
+    content: str
+    image_url: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    likes_count: int
+    comments_count: int
     rich_media: Optional[RichMedia]
 
 # ... (keep existing functions)
@@ -717,27 +673,73 @@ def extract_rich_media(content: str) -> Optional[RichMedia]:
 
 @router.post("/", response_model=PostResponseWithMedia)
 async def create_post(
-    post: PostCreateWithMedia,
+    background_tasks: BackgroundTasks,
+    post: PostCreate = Form(...),
     image: Optional[UploadFile] = File(None),
     authorization: str = Header(...),
-    db: Database = Depends(get_database)
+    db: Database = Depends(get_database),
 ):
-    # ... (keep existing create_post logic)
+    print("Creating post")
+    try:
+        # Verify token
+        token = authorization.split("Bearer ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
 
-    # Extract rich media if not provided
-    rich_media = post.rich_media
-    if not rich_media:
-        rich_media = extract_rich_media(post.content)
+    post_id = str(uuid.uuid4())[:28]
+    image_url = None
 
-    # Add rich_media to the insert query
+    if image:
+        validate_image(image)
+        # Upload image to Cloudflare R2
+        bucket_name = os.getenv('R2_BUCKET_NAME')
+        object_name = f"posts/{post_id}/{image.filename}"
+        try:
+            s3.upload_fileobj(image.file, bucket_name, object_name)
+            image_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to upload image: {str(e)}")
+
+    # Sanitize content
+    sanitized_content = bleach.clean(post.content)
+
+    # Extract rich media
+    rich_media = extract_rich_media(sanitized_content)
+
     query = """
     INSERT INTO posts (id, user_id, content, image_url, created_at, updated_at, likes_count, comments_count, rich_media)
     VALUES (:id, :user_id, :content, :image_url, :created_at, :updated_at, 0, 0, :rich_media)
     RETURNING *
     """
-    values["rich_media"] = rich_media.json() if rich_media else None
+    values = {
+        "id": post_id,
+        "user_id": user_id,
+        "content": sanitized_content,
+        "image_url": image_url,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "rich_media": rich_media.model_dump_json() if rich_media else None
+    }
 
-    # ... (rest of the function remains the same)
+    try:
+        result = await db.fetch_one(query=query, values=values)
+
+        # Extract and save hashtags
+        background_tasks.add_task(
+            extract_and_save_hashtags, db, post_id, sanitized_content)
+
+        # Initialize post analytics
+        background_tasks.add_task(update_post_analytics, db, post_id)
+
+        return PostResponseWithMedia(**result)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create post: {str(e)}")
+
 
 
 @router.post("/share", response_model=SharedPostResponse)
