@@ -1,3 +1,4 @@
+from itertools import groupby
 from asyncpg.exceptions import UndefinedColumnError
 import traceback
 import asyncpg
@@ -21,13 +22,15 @@ from urllib.parse import urlparse
 import requests
 import sys
 from bs4 import BeautifulSoup
-
-
+import logging
+from PIL import Image
 
 from app.routers.auth2_router import UserResponse
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
 
 # Initialize S3 client
 s3 = boto3.client(
@@ -41,24 +44,56 @@ s3 = boto3.client(
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
+async def upload_media(file: UploadFile, post_id: str, index: int):
+    print('upload_media')
+    try:
+        bucket_name = os.getenv('R2_BUCKET_NAME')
+        file_extension = os.path.splitext(file.filename)[1]
+        object_name = f"posts/{post_id}/{index}{file_extension}"
+
+        file.file.seek(0)
+        s3.upload_fileobj(
+            file.file,
+            bucket_name,
+            object_name,
+            ExtraArgs={'ContentType': file.content_type}
+        )
+
+        media_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
+        logger.info(f"Media uploaded successfully: {media_url}")
+        return media_url
+    except Exception as e:
+        logger.error(f"Failed to upload media: {str(e)}")
+        raise
+
+
 class PostCreate(BaseModel):
     content: constr(max_length=5000)  # type: ignore # Limit content length
+
+
+class MediaItem(BaseModel):
+    media_url: str
+    media_type: str
+    order_index: int
 
 
 class PostResponse(BaseModel):
     id: str
     user_id: str
     content: str
-    image_url: Optional[str]
+    # image_url: Optional[str]
     created_at: datetime
     updated_at: datetime
+    likes_count: int = 0
+    comments_count: int = 0
+    media: List[MediaItem] = []
 
     class Config:
         from_attributes = True
 
 
 
-ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif'}
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'} # Allowed image file extensions
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
@@ -75,32 +110,37 @@ def validate_image(file: UploadFile) -> bool:
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File size too large")
 
-    # Check file content
-    file_content = file.file.read(11)  # Read first 11 bytes
-    file.file.seek(0)
-    file_type = imghdr.what(None, file_content)
-    if file_type not in ['jpeg', 'png', 'gif']:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+    # Check file content using Pillow
+    try:
+        file.file.seek(0)
+        image = Image.open(file.file)
+        image.verify()  # Verify that it is an image
+        if image.format.lower() not in ['jpeg', 'png', 'gif', 'webp']:
+            raise HTTPException(
+                status_code=400, detail="Invalid image file format")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid image file: {str(e)}")
+    finally:
+        file.file.seek(0)  # Reset file pointer after verification
 
     return True
 
 
-
-@router.get("/{post_id}", response_model=PostResponse)
+@router.get("/{post_id}", response_model=PostResponse, operation_id="get_single_post")
 async def get_post(
     post_id: str,
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
     try:
-        # Verify token
         token = authorization.split("Bearer ")[1]
         verify_token(token)
     except Exception as e:
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
-    query = "SELECT * FROM posts WHERE id = :post_id"
+    query = "SELECT * FROM posts WHERE user_id = :post_id"
     result = await db.fetch_one(query=query, values={"post_id": post_id})
 
     if result is None:
@@ -134,7 +174,7 @@ class PostUpdate(BaseModel):
     content: constr(max_length=5000)
 
 
-@router.put("/{post_id}", response_model=PostResponse)
+@router.put("/{post_id}", response_model=PostResponse, operation_id="update_post")
 async def update_post(
     post_id: str,
     post_update: PostUpdate,
@@ -142,7 +182,6 @@ async def update_post(
     db: Database = Depends(get_database)
 ):
     try:
-        # Verify token
         token = authorization.split("Bearer ")[1]
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
@@ -150,7 +189,6 @@ async def update_post(
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
-    # Sanitize content
     sanitized_content = bleach.clean(post_update.content)
 
     query = """
@@ -175,14 +213,13 @@ async def update_post(
     return PostResponse(**result)
 
 
-@router.delete("/{post_id}", status_code=204)
+@router.delete("/{post_id}", status_code=204, operation_id="delete_post")
 async def delete_post(
     post_id: str,
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
     try:
-        # Verify token
         token = authorization.split("Bearer ")[1]
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
@@ -197,14 +234,9 @@ async def delete_post(
         raise HTTPException(
             status_code=404, detail="Post not found or you don't have permission to delete it")
 
-    # If the post had an image, you might want to delete it from R2 here
-    # This would require keeping track of which posts have images, or attempting to delete for all posts
+    return None
 
-    return None  # 204 No Content
 
-    from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header, Query
-
-router = APIRouter()
 
 # ... (keep existing imports and configurations)
 
@@ -222,19 +254,11 @@ class CommentResponse(BaseModel):
     updated_at: datetime
 
 
-class PostResponse(BaseModel):
-    id: str
-    user_id: str
-    content: str
-    image_url: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-    likes_count: int
-    comments_count: int
+
 
 # ... (keep existing functions like validate_image)
 
-@router.post("/{post_id}/like", response_model=PostResponse)
+@router.post("/{post_id}/like", response_model=PostResponse, operation_id="like_post")
 async def like_post(
     post_id: str,
     authorization: str = Header(...),
@@ -359,7 +383,7 @@ async def get_post_comments(
     return [CommentResponse(**comment) for comment in comments]
 
 
-@router.get("/user/{user_id}", response_model=List[PostResponse])
+@router.get("/user/{user_id}", response_model=List[PostResponse], operation_id="get_user_posts")
 async def get_user_posts(
     user_id: str,
     skip: int = Query(0, ge=0),
@@ -374,15 +398,42 @@ async def get_user_posts(
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
+    # Fetch posts with media in a single query
     query = """
-    SELECT * FROM posts 
-    WHERE user_id = :user_id 
-    ORDER BY created_at DESC 
+    SELECT p.id, p.user_id, p.content, p.created_at, p.updated_at, 
+           p.likes_count, p.comments_count,
+           pm.media_url, pm.media_type, pm.order_index
+    FROM posts p
+    LEFT JOIN post_media pm ON p.id = pm.post_id
+    WHERE p.user_id = :user_id 
+    ORDER BY p.created_at DESC, pm.order_index ASC
     LIMIT :limit OFFSET :skip
     """
-    posts = await db.fetch_all(query, values={"user_id": user_id, "limit": limit, "skip": skip})
+    rows = await db.fetch_all(query, values={"user_id": user_id, "limit": limit, "skip": skip})
 
-    return [PostResponse(**post) for post in posts]
+    # Group the results by post
+    result = []
+    for post_id, group in groupby(rows, key=lambda x: x['id']):
+        group_list = list(group)
+        post = group_list[0]
+        post_dict = {
+            'id': post['id'],
+            'user_id': post['user_id'],
+            'content': post['content'],
+            'created_at': post['created_at'],
+            'updated_at': post['updated_at'],
+            'likes_count': post['likes_count'],
+            'comments_count': post['comments_count'],
+            'media': [
+                MediaItem(
+                    media_url=row['media_url'], media_type=row['media_type'], order_index=row['order_index'])
+                for row in group_list
+                if row['media_url'] is not None
+            ]
+        }
+        result.append(PostResponse(**post_dict))
+
+    return result
 
 
 class NotificationResponse(BaseModel):
@@ -408,7 +459,7 @@ async def create_notification(db: Database, user_id: str, type: str, content: st
         "type": type,
         "content": content,
         "related_id": related_id,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now()
     }
     await db.execute(query, values=values)
 
@@ -518,7 +569,7 @@ async def delete_comment(
     return None  # 204 No Content
 
 
-@router.get("/feed", response_model=List[PostResponse])
+@router.get("/feed", response_model=List[PostResponse], operation_id="get_feed")
 async def get_feed(
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
@@ -681,20 +732,20 @@ def extract_rich_media(content: str) -> Optional[RichMedia]:
         return None
 
 
-@router.post("/", response_model=PostResponseWithMedia)
+@router.post("/", response_model=dict)
 async def create_post(
     background_tasks: BackgroundTasks,
     content: str = Form(...),
-    image: Optional[UploadFile] = File(None),
+    media: List[UploadFile] = File(None),
     authorization: str = Header(...),
     db: Database = Depends(get_database),
 ):
-    print("Creating post")
     try:
         # Verify token
         token = authorization.split("Bearer ")[1]
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
+        logger.info(f"User authenticated: {user_id}")
     except Exception as e:
         logger.error(f"Authorization error: {str(e)}")
         raise HTTPException(
@@ -702,97 +753,75 @@ async def create_post(
 
     try:
         post_id = str(uuid.uuid4())[:28]
-        image_url = None
-
-        if image:
-            try:
-                validate_image(image)
-                # Upload image to Cloudflare R2
-                bucket_name = os.getenv('R2_BUCKET_NAME')
-                object_name = f"posts/{post_id}/{image.filename}"
-                s3.upload_fileobj(image.file, bucket_name, object_name)
-                image_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
-            except Exception as e:
-                logger.error(f"Image upload error: {str(e)}")
-                raise HTTPException(
-                    status_code=500, detail=f"Failed to upload image: {str(e)}")
-
-        # Sanitize content
         sanitized_content = bleach.clean(content)
+        logger.info(f"Creating post: {post_id}")
 
-        # Extract rich media
-        rich_media = extract_rich_media(sanitized_content)
+        media_urls = []
+        if media:
+            logger.info(f"Received {len(media)} media files")
+            for index, file in enumerate(media):
+                try:
+                    media_url = await upload_media(file, post_id, index)
+                    media_urls.append(media_url)
+                except Exception as e:
+                    logger.error(
+                        f"Media upload error for file {index}: {str(e)}")
+        else:
+            logger.info("No media files received")
 
-        # Dynamically build the query based on existing columns
-        columns = ["id", "user_id", "content",
-                   "image_url", "created_at", "updated_at"]
-        values = {
+        # Insert post
+        post_query = """
+        INSERT INTO posts (id, user_id, content, created_at, updated_at)
+        VALUES (:id, :user_id, :content, :created_at, :updated_at)
+        RETURNING *
+        """
+        post_values = {
             "id": post_id,
             "user_id": user_id,
             "content": sanitized_content,
-            "image_url": image_url,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
         }
+        post_result = await db.fetch_one(query=post_query, values=post_values)
+        logger.info(f"Post inserted: {post_id}")
 
-        # Check for additional columns
-        try:
-            await db.fetch_one("SELECT likes_count FROM posts LIMIT 1")
-            columns.append("likes_count")
-            values["likes_count"] = 0
-        except UndefinedColumnError:
-            pass
+        # Insert media
+        if media_urls:
+            media_query = """
+            INSERT INTO post_media (post_id, media_url, media_type, order_index)
+            VALUES (:post_id, :media_url, :media_type, :order_index)
+            """
+            for index, url in enumerate(media_urls):
+                media_values = {
+                    "post_id": post_id,
+                    "media_url": url,
+                    "media_type": "image",  # You'd need logic to determine if it's a video
+                    "order_index": index
+                }
+                await db.execute(query=media_query, values=media_values)
+            logger.info(
+                f"Inserted {len(media_urls)} media entries for post {post_id}")
+        else:
+            logger.info(f"No media entries to insert for post {post_id}")
 
-        try:
-            await db.fetch_one("SELECT comments_count FROM posts LIMIT 1")
-            columns.append("comments_count")
-            values["comments_count"] = 0
-        except UndefinedColumnError:
-            pass
+        # Fetch media for response
+        media_result = await db.fetch_all(
+            "SELECT media_url, media_type FROM post_media WHERE post_id = :post_id ORDER BY order_index",
+            values={"post_id": post_id}
+        )
+        logger.info(f"Fetched {len(media_result)} media entries for response")
 
-        try:
-            await db.fetch_one("SELECT rich_media FROM posts LIMIT 1")
-            columns.append("rich_media")
-            values["rich_media"] = rich_media.model_dump_json(
-            ) if rich_media else None
-        except UndefinedColumnError:
-            pass
+        # Combine post and media data
+        response_data = dict(post_result)
+        response_data['media'] = [dict(m) for m in media_result]
 
-        # Construct the query
-        query = f"""
-        INSERT INTO posts ({', '.join(columns)})
-        VALUES ({', '.join([f':{col}' for col in columns])})
-        RETURNING *
-        """
-    
-        try:
-            result = await db.fetch_one(query=query, values=values)
+        logger.info(f"Returning response for post {post_id}")
+        return response_data
 
-            # Extract and save hashtags
-            background_tasks.add_task(
-                extract_and_save_hashtags, db, post_id, sanitized_content)
-
-            # Initialize post analytics
-            background_tasks.add_task(update_post_analytics, db, post_id)
-
-            return PostResponseWithMedia(**result)
-        except Exception as e:
-            logger.error(f"Error creating post: {str(e)}")
-            logger.error(traceback.format_exc())
-            # If the post was created but background tasks failed, we still want to return the post
-            if 'result' in locals():
-                logger.warning(
-                    "Post created but background tasks may have failed.")
-                return PostResponseWithMedia(**result)
-            raise HTTPException(
-                status_code=500, detail=f"Failed to create post: {str(e)}")
-        
     except Exception as e:
         logger.error(f"Error creating post: {str(e)}")
-        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500, detail=f"Failed to create post: {str(e)}")
-
 
 
 @router.post("/share", response_model=SharedPostResponse)
@@ -823,7 +852,7 @@ async def share_post(
             "user_id": user_id,
             "original_post_id": shared_post.original_post_id,
             "content": shared_post.content,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.now()
         }
         new_share = await db.fetch_one(insert_query, values=values)
 
@@ -1163,7 +1192,4 @@ async def get_posts_by_hashtag(
     return [PostResponseWithMedia(**result) for result in results]
 
 # ... (keep existing endpoints)
-
-
-
 
