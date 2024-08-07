@@ -40,8 +40,11 @@ async def text_to_speech_pipeline(request: Request, user = Depends(get_current_u
     try:
         # Generate response text using OpenAI GPT
         gpt_response = client.chat.completions.create(
-            model="gpt-3.5-turbo-0301",
-            messages=[{"role": "user", "content": text}]
+            model="gpt-4o-mini-2024-07-18",
+            messages=[
+                # {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "user", "content": text}
+                ]
         )
         response_text = gpt_response.choices[0].message.content.strip()
 

@@ -407,3 +407,29 @@ async def list_files(user_id: str):
         return JSONResponse(status_code=200, content={"files": files})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@router.post("/upload-file-dev/")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        # Generate a unique file name
+        file_extension = os.path.splitext(file.filename)[1]
+        unique_filename = f"dev/{uuid.uuid4().hex}{file_extension}"
+
+        # Upload file to R2
+        r2_client.upload_fileobj(
+            file.file,
+            bucket_name,
+            unique_filename,
+            ExtraArgs={"ContentType": file.content_type, "ACL": "public-read"}
+        )
+
+        # Construct the file URL
+        file_url = f"https://{os.getenv('R2_DEV_URL')}/dev/{unique_filename}"
+        # file_url = f"https://{os.getenv('R2_DEV_URL')}/{file_key.replace('/', '%2F')}"
+# 
+
+        return {"message": "File uploaded successfully", "url": file_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,4 +1,5 @@
 from itertools import groupby
+import mimetypes
 from asyncpg.exceptions import UndefinedColumnError
 import traceback
 import asyncpg
@@ -44,14 +45,42 @@ s3 = boto3.client(
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-async def upload_media(file: UploadFile, post_id: str, index: int):
-    print('upload_media')
+# async def upload_media(file: UploadFile, post_id: str, index: int):
+#     print('upload_media')
+#     try:
+#         bucket_name = os.getenv('R2_BUCKET_NAME')
+#         file_extension = os.path.splitext(file.filename)[1]
+#         object_name = f"posts/{post_id}/{index}{file_extension}"
+
+#         file.file.seek(0)
+#         s3.upload_fileobj(
+#             file.file,
+#             bucket_name,
+#             object_name,
+#             ExtraArgs={'ContentType': file.content_type}
+#         )
+
+#         media_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
+#         logger.info(f"Media uploaded successfully: {media_url}")
+#         return media_url
+#     except Exception as e:
+#         logger.error(f"Failed to upload media: {str(e)}")
+#         raise
+
+async def upload_media(file: UploadFile, post_id: str, index: int) -> dict:
     try:
         bucket_name = os.getenv('R2_BUCKET_NAME')
         file_extension = os.path.splitext(file.filename)[1]
         object_name = f"posts/{post_id}/{index}{file_extension}"
 
-        file.file.seek(0)
+        # Determine media type
+        media_type = 'video' if file.content_type.startswith(
+            'video/') else 'image'
+
+        # Reset file pointer to the beginning
+        await file.seek(0)
+
+        # Upload to Cloudflare R2
         s3.upload_fileobj(
             file.file,
             bucket_name,
@@ -61,7 +90,8 @@ async def upload_media(file: UploadFile, post_id: str, index: int):
 
         media_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
         logger.info(f"Media uploaded successfully: {media_url}")
-        return media_url
+
+        return {"url": media_url, "type": media_type}
     except Exception as e:
         logger.error(f"Failed to upload media: {str(e)}")
         raise
@@ -387,7 +417,7 @@ async def get_post_comments(
 async def get_user_posts(
     user_id: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=100),
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
@@ -756,13 +786,13 @@ async def create_post(
         sanitized_content = bleach.clean(content)
         logger.info(f"Creating post: {post_id}")
 
-        media_urls = []
+        media_data = []
         if media:
             logger.info(f"Received {len(media)} media files")
             for index, file in enumerate(media):
                 try:
-                    media_url = await upload_media(file, post_id, index)
-                    media_urls.append(media_url)
+                    media_info = await upload_media(file, post_id, index)
+                    media_data.append(media_info)
                 except Exception as e:
                     logger.error(
                         f"Media upload error for file {index}: {str(e)}")
@@ -786,21 +816,21 @@ async def create_post(
         logger.info(f"Post inserted: {post_id}")
 
         # Insert media
-        if media_urls:
+        if media_data:
             media_query = """
             INSERT INTO post_media (post_id, media_url, media_type, order_index)
             VALUES (:post_id, :media_url, :media_type, :order_index)
             """
-            for index, url in enumerate(media_urls):
+            for index, media_info in enumerate(media_data):
                 media_values = {
                     "post_id": post_id,
-                    "media_url": url,
-                    "media_type": "image",  # You'd need logic to determine if it's a video
+                    "media_url": media_info['url'],
+                    "media_type": media_info['type'],
                     "order_index": index
                 }
                 await db.execute(query=media_query, values=media_values)
             logger.info(
-                f"Inserted {len(media_urls)} media entries for post {post_id}")
+                f"Inserted {len(media_data)} media entries for post {post_id}")
         else:
             logger.info(f"No media entries to insert for post {post_id}")
 
