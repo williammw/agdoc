@@ -38,7 +38,7 @@ app.add_middleware(
     allow_origins=["*"],  # Update this to your frontend's URL in production
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"], 
 )
 # Add SessionMiddleware
 app.add_middleware(SessionMiddleware, secret_key=os.getenv(
@@ -100,7 +100,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 @app.get("/")
 async def greeting():
-    return {"message": "Nothing to see here."}
+    return {"message": "Nothing to see here. v0.1.0"}
 
 
 @app.get("/check-ffmpeg")
