@@ -30,7 +30,7 @@ origins = [
     "https://235534.netlify.app",
     "https://umamiverse.netlify.app",
     "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
-    "https://422c-185-245-239-143.ngrok-free.app",
+    "https://f648-185-245-239-88.ngrok-free.app ",
 ]
 
 app.add_middleware(

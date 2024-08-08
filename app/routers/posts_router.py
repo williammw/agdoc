@@ -417,7 +417,7 @@ async def get_post_comments(
 async def get_user_posts(
     user_id: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(40, ge=1, le=100),
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
