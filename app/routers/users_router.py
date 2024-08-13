@@ -51,3 +51,6 @@ async def get_public_user_profile(username: str, db: Database = Depends(get_data
         }
     else:
         raise HTTPException(status_code=404, detail="User not found")
+
+
+

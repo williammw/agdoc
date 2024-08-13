@@ -1,4 +1,5 @@
 from itertools import groupby
+import json
 import mimetypes
 from asyncpg.exceptions import UndefinedColumnError
 import traceback
@@ -7,7 +8,7 @@ from fastapi.logger import logger
 from fastapi import Form, HTTPException
 from fastapi import Form
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Header, Query, BackgroundTasks
-from app.dependencies import get_database, verify_token
+from app.dependencies import get_current_user, get_database, verify_token
 from databases import Database
 from pydantic import BaseModel, constr, HttpUrl
 from datetime import datetime, timedelta
@@ -102,6 +103,7 @@ class PostCreate(BaseModel):
 
 
 class MediaItem(BaseModel):
+    id: int
     media_url: str
     media_type: str
     order_index: int
@@ -179,25 +181,25 @@ async def get_post(
     return PostResponse(**result)
 
 
-@router.get("/", response_model=List[PostResponse])
-async def get_posts(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        # Verify token
-        token = authorization.split("Bearer ")[1]
-        verify_token(token)
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
+# @router.get("/", response_model=List[PostResponse])
+# async def get_posts(
+#     skip: int = Query(0, ge=0),
+#     limit: int = Query(10, ge=1, le=100),
+#     authorization: str = Header(...),
+#     db: Database = Depends(get_database)
+# ):
+#     try:
+#         # Verify token
+#         token = authorization.split("Bearer ")[1]
+#         verify_token(token)
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=401, detail="Invalid authorization token")
 
-    query = "SELECT * FROM posts ORDER BY created_at DESC LIMIT :limit OFFSET :skip"
-    results = await db.fetch_all(query=query, values={"skip": skip, "limit": limit})
+#     query = "SELECT * FROM posts ORDER BY created_at DESC LIMIT :limit OFFSET :skip"
+#     results = await db.fetch_all(query=query, values={"skip": skip, "limit": limit})
 
-    return [PostResponse(**result) for result in results]
+#     return [PostResponse(**result) for result in results]
 
 
 class PostUpdate(BaseModel):
@@ -766,6 +768,7 @@ def extract_rich_media(content: str) -> Optional[RichMedia]:
 async def create_post(
     background_tasks: BackgroundTasks,
     content: str = Form(...),
+    privacy_setting: str = Form("public"),
     media: List[UploadFile] = File(None),
     authorization: str = Header(...),
     db: Database = Depends(get_database),
@@ -801,14 +804,15 @@ async def create_post(
 
         # Insert post
         post_query = """
-        INSERT INTO posts (id, user_id, content, created_at, updated_at)
-        VALUES (:id, :user_id, :content, :created_at, :updated_at)
+        INSERT INTO posts (id, user_id, content, privacy_setting, created_at, updated_at)
+        VALUES (:id, :user_id, :content, :privacy_setting, :created_at, :updated_at)
         RETURNING *
         """
         post_values = {
             "id": post_id,
             "user_id": user_id,
             "content": sanitized_content,
+            "privacy_setting": privacy_setting,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
         }
@@ -1223,3 +1227,197 @@ async def get_posts_by_hashtag(
 
 # ... (keep existing endpoints)
 
+
+# async def check_if_following(db: Database, follower_id: str, followed_id: str) -> bool:
+#     query = """
+#     SELECT 1 FROM followers
+#     WHERE follower_id = :follower_id AND followed_id = :followed_id
+#     """
+#     result = await db.fetch_one(query=query, values={
+#         "follower_id": follower_id,
+#         "followed_id": followed_id
+#     })
+#     return result is not None
+
+@router.get("/{user_id}/all", response_model=List[PostResponse])
+async def get_all_user_posts(
+    user_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    authorization: str = Header(...),
+    db: Database = Depends(get_database)
+):
+    try:
+        # Verify token and get current user
+        token = authorization.split("Bearer ")[1]
+        current_user = verify_token(token)
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
+
+    # Check if the current user is authorized to view all posts
+    if current_user['uid'] != user_id:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to view all posts")
+
+    query = """
+    SELECT p.*, 
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id, 
+                   'media_url', pm.media_url, 
+                   'media_type', pm.media_type,
+                   'order_index', pm.order_index
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+    FROM posts p
+    LEFT JOIN post_media pm ON p.id = pm.post_id
+    WHERE p.user_id = :user_id 
+    GROUP BY p.id
+    ORDER BY p.created_at DESC 
+    LIMIT :limit OFFSET :skip
+    """
+    results = await db.fetch_all(query=query, values={
+        "user_id": user_id,
+        "skip": skip,
+        "limit": limit
+    })
+
+    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
+
+
+@router.get("/{user_id}/visible", response_model=List[PostResponse])
+async def get_visible_user_posts(
+    user_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    authorization: str = Header(...),
+    db: Database = Depends(get_database)
+):
+    try:
+        # Verify token and get current user
+        token = authorization.split("Bearer ")[1]
+        current_user = verify_token(token)
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
+
+    # Check if the current user is following the target user
+    is_following = await check_if_following(db, current_user['uid'], user_id)
+
+    # Check if there's a mutual follow relationship
+    is_mutual_follow = is_following and await check_if_following(db, user_id, current_user['uid'])
+
+    query = """
+    SELECT p.*, 
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id, 
+                   'media_url', pm.media_url, 
+                   'media_type', pm.media_type,
+                   'order_index', pm.order_index
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+    FROM posts p
+    LEFT JOIN post_media pm ON p.id = pm.post_id
+    WHERE p.user_id = :user_id AND (
+        p.privacy_setting = 'public'
+        OR (p.privacy_setting = 'followers' AND :is_following = TRUE)
+        OR (p.privacy_setting = 'mutual_followers' AND :is_mutual_follow = TRUE)
+    )
+    GROUP BY p.id
+    ORDER BY p.created_at DESC 
+    LIMIT :limit OFFSET :skip
+    """
+    results = await db.fetch_all(query=query, values={
+        "user_id": user_id,
+        "is_following": is_following,
+        "is_mutual_follow": is_mutual_follow,
+        "skip": skip,
+        "limit": limit
+    })
+
+    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
+
+# Update the original endpoint as well
+
+
+@router.get("/", response_model=List[PostResponse])
+async def get_posts(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    authorization: str = Header(...),
+    db: Database = Depends(get_database)
+):
+    try:
+        # Verify token
+        token = authorization.split("Bearer ")[1]
+        verify_token(token)
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
+
+    query = """
+    SELECT p.*, 
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id, 
+                   'media_url', pm.media_url, 
+                   'media_type', pm.media_type,
+                   'order_index', pm.order_index
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+    FROM posts p
+    LEFT JOIN post_media pm ON p.id = pm.post_id
+    GROUP BY p.id
+    ORDER BY p.created_at DESC 
+    LIMIT :limit OFFSET :skip
+    """
+    results = await db.fetch_all(query=query, values={"skip": skip, "limit": limit})
+
+    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
+
+
+
+
+@router.get("/feed", response_model=List[PostResponse])
+async def get_user_feed(
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    query = """
+    SELECT p.id, p.user_id, p.content, p.created_at, p.updated_at, p.privacy_setting
+    FROM posts p
+    JOIN followers f ON p.user_id = f.followed_id
+    WHERE f.follower_id = :user_id
+    AND (
+        p.privacy_setting = 'public'
+        OR (p.privacy_setting = 'followers')
+        OR (p.privacy_setting = 'mutual_followers' AND EXISTS (
+            SELECT 1 FROM followers 
+            WHERE follower_id = p.user_id AND followed_id = :user_id
+        ))
+    )
+    ORDER BY p.created_at DESC
+    LIMIT :limit OFFSET :offset
+    """
+    results = await db.fetch_all(query=query, values={
+        "user_id": current_user["id"],
+        "limit": limit,
+        "offset": offset
+    })
+    return [PostResponse(**result) for result in results]
+
+
+async def check_if_following(db: Database, follower_id: str, followed_id: str) -> bool:
+    query = """
+    SELECT 1 FROM followers
+    WHERE follower_id = :follower_id AND followed_id = :followed_id
+    """
+    result = await db.fetch_one(query=query, values={
+        "follower_id": follower_id,
+        "followed_id": followed_id
+    })
+    return result is not None
