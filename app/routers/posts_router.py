@@ -1359,14 +1359,14 @@ async def get_posts(
 
     query = """
     SELECT p.*, 
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id, 
-                   'media_url', pm.media_url, 
-                   'media_type', pm.media_type,
-                   'order_index', pm.order_index
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+        COALESCE(json_agg(
+            json_build_object(
+                'id', pm.id, 
+                'media_url', pm.media_url, 
+                'media_type', pm.media_type,
+                'order_index', pm.order_index
+            ) ORDER BY pm.order_index
+        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
     GROUP BY p.id

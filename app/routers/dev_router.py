@@ -77,3 +77,6 @@ async def delete_item(item_id: int, database: Database = Depends(get_database)):
     delete_query = "DELETE FROM items WHERE id = :id"
     await database.execute(delete_query, values={"id": item_id})
     return {"message": "Item deleted successfully"}
+
+# citi today 4482
+# 
