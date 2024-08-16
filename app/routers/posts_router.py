@@ -28,6 +28,9 @@ import logging
 from PIL import Image
 
 from app.routers.auth2_router import UserResponse
+from app.routers.cdn_router import upload_to_cloudflare
+from app.utils.cloudflare import upload_to_r2
+# from app.utils.cloudflare import upload_to_cloudflare
 
 
 router = APIRouter()
@@ -68,33 +71,18 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 #         logger.error(f"Failed to upload media: {str(e)}")
 #         raise
 
-async def upload_media(file: UploadFile, post_id: str, index: int) -> dict:
+async def upload_media(file: UploadFile, user_id: str, dimensions: dict) -> dict:
     try:
-        bucket_name = os.getenv('R2_BUCKET_NAME')
-        file_extension = os.path.splitext(file.filename)[1]
-        object_name = f"posts/{post_id}/{index}{file_extension}"
-
-        # Determine media type
-        media_type = 'video' if file.content_type.startswith(
-            'video/') else 'image'
-
-        # Reset file pointer to the beginning
-        await file.seek(0)
-
-        # Upload to Cloudflare R2
-        s3.upload_fileobj(
-            file.file,
-            bucket_name,
-            object_name,
-            ExtraArgs={'ContentType': file.content_type}
-        )
-
-        media_url = f"https://{os.getenv('R2_DEV_URL')}/{object_name}"
-        logger.info(f"Media uploaded successfully: {media_url}")
-
-        return {"url": media_url, "type": media_type}
+        r2_response = await upload_to_r2(file, user_id)
+        return {
+            'url': r2_response['url'],
+            'type': file.content_type,
+            'width': dimensions.get('width'),
+            'height': dimensions.get('height'),
+            'aspect_ratio': dimensions.get('width') / dimensions.get('height') if dimensions.get('width') and dimensions.get('height') else None
+        }
     except Exception as e:
-        logger.error(f"Failed to upload media: {str(e)}")
+        logger.error(f"Error uploading media to R2: {str(e)}")
         raise
 
 
@@ -107,6 +95,9 @@ class MediaItem(BaseModel):
     media_url: str
     media_type: str
     order_index: int
+    width: Optional[int]
+    height: Optional[int]
+    aspect_ratio: Optional[float]
 
 
 class PostResponse(BaseModel):
@@ -159,26 +150,46 @@ def validate_image(file: UploadFile) -> bool:
     return True
 
 
-@router.get("/{post_id}", response_model=PostResponse, operation_id="get_single_post")
-async def get_post(
-    post_id: str,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        verify_token(token)
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
+@router.get("/{post_id}")
+async def get_post_detail(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    query = """
+    SELECT p.*, u.username, u.avatar_url
+    FROM posts p
+    JOIN users u ON p.user_id = u.id
+    WHERE p.id = :post_id
+    """
+    post = await db.fetch_one(query=query, values={"post_id": post_id})
 
-    query = "SELECT * FROM posts WHERE user_id = :post_id"
-    result = await db.fetch_one(query=query, values={"post_id": post_id})
-
-    if result is None:
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    return PostResponse(**result)
+    media_query = """
+    SELECT media_url, media_type, order_index
+    FROM post_media
+    WHERE post_id = :post_id
+    ORDER BY order_index
+    """
+    media = await db.fetch_all(query=media_query, values={"post_id": post_id})
+
+    comments_query = """
+    SELECT c.*, u.username, u.avatar_url
+    FROM comments c
+    JOIN users u ON c.user_id = u.id
+    WHERE c.post_id = :post_id
+    ORDER BY c.created_at DESC
+    """
+    comments = await db.fetch_all(query=comments_query, values={"post_id": post_id})
+
+    return {
+        **post,
+        "media": media,
+        "comments": comments,
+        "user": {
+            "username": post["username"],
+            "avatar_url": post["avatar_url"]
+        }
+    }
+
 
 
 # @router.get("/", response_model=List[PostResponse])
@@ -770,6 +781,7 @@ async def create_post(
     content: str = Form(...),
     privacy_setting: str = Form("public"),
     media: List[UploadFile] = File(None),
+    media_dimensions: str = Form(None),
     authorization: str = Header(...),
     db: Database = Depends(get_database),
 ):
@@ -779,28 +791,24 @@ async def create_post(
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
         logger.info(f"User authenticated: {user_id}")
-    except Exception as e:
-        logger.error(f"Authorization error: {str(e)}")
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
 
-    try:
         post_id = str(uuid.uuid4())[:28]
         sanitized_content = bleach.clean(content)
         logger.info(f"Creating post: {post_id}")
 
         media_data = []
+        media_dimensions_list = json.loads(
+            media_dimensions) if media_dimensions else []
+
         if media:
             logger.info(f"Received {len(media)} media files")
-            for index, file in enumerate(media):
+            for index, (file, dimensions) in enumerate(zip(media, media_dimensions_list)):
                 try:
-                    media_info = await upload_media(file, post_id, index)
+                    media_info = await upload_media(file, user_id, dimensions)
                     media_data.append(media_info)
                 except Exception as e:
                     logger.error(
                         f"Media upload error for file {index}: {str(e)}")
-        else:
-            logger.info("No media files received")
 
         # Insert post
         post_query = """
@@ -822,25 +830,26 @@ async def create_post(
         # Insert media
         if media_data:
             media_query = """
-            INSERT INTO post_media (post_id, media_url, media_type, order_index)
-            VALUES (:post_id, :media_url, :media_type, :order_index)
+            INSERT INTO post_media (post_id, media_url, media_type, order_index, width, height, aspect_ratio)
+            VALUES (:post_id, :media_url, :media_type, :order_index, :width, :height, :aspect_ratio)
             """
             for index, media_info in enumerate(media_data):
                 media_values = {
                     "post_id": post_id,
                     "media_url": media_info['url'],
                     "media_type": media_info['type'],
-                    "order_index": index
+                    "order_index": index,
+                    "width": media_info.get('width'),
+                    "height": media_info.get('height'),
+                    "aspect_ratio": media_info.get('aspect_ratio')
                 }
                 await db.execute(query=media_query, values=media_values)
             logger.info(
                 f"Inserted {len(media_data)} media entries for post {post_id}")
-        else:
-            logger.info(f"No media entries to insert for post {post_id}")
 
         # Fetch media for response
         media_result = await db.fetch_all(
-            "SELECT media_url, media_type FROM post_media WHERE post_id = :post_id ORDER BY order_index",
+            "SELECT media_url, media_type, width, height, aspect_ratio FROM post_media WHERE post_id = :post_id ORDER BY order_index",
             values={"post_id": post_id}
         )
         logger.info(f"Fetched {len(media_result)} media entries for response")
@@ -1256,6 +1265,8 @@ async def get_all_user_posts(
             status_code=401, detail="Invalid authorization token")
 
     # Check if the current user is authorized to view all posts
+    logger.info(f"current['uid']: {current_user['uid']} user_id: {user_id}")
+    
     if current_user['uid'] != user_id:
         raise HTTPException(
             status_code=403, detail="Not authorized to view all posts")
@@ -1267,7 +1278,10 @@ async def get_all_user_posts(
                    'id', pm.id, 
                    'media_url', pm.media_url, 
                    'media_type', pm.media_type,
-                   'order_index', pm.order_index
+                   'order_index', pm.order_index,
+                   'aspect_ratio', pm.aspect_ratio,
+                   'width', pm.width,
+                   'height', pm.height
                ) ORDER BY pm.order_index
            ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
@@ -1315,7 +1329,10 @@ async def get_visible_user_posts(
                    'id', pm.id, 
                    'media_url', pm.media_url, 
                    'media_type', pm.media_type,
-                   'order_index', pm.order_index
+                   'order_index', pm.order_index,
+                   'aspect_ratio', pm.aspect_ratio,
+                   'width', pm.width,
+                   'height', pm.height
                ) ORDER BY pm.order_index
            ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
