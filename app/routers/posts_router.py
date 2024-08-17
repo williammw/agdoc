@@ -100,6 +100,10 @@ class MediaItem(BaseModel):
     aspect_ratio: Optional[float]
 
 
+class User(BaseModel):
+    username: str
+    avatar_url: Optional[str] = None
+
 class PostResponse(BaseModel):
     id: str
     user_id: str
@@ -426,57 +430,141 @@ async def get_post_comments(
     return [CommentResponse(**comment) for comment in comments]
 
 
-@router.get("/user/{user_id}", response_model=List[PostResponse], operation_id="get_user_posts")
+@router.get("/user/{username}", response_model=List[PostResponse])
 async def get_user_posts(
-    user_id: str,
+    username: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(40, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=100),
+    authorization: str = Header(...),
+    db: Database = Depends(get_database)
+):
+    try:
+        # Verify token and get current user
+        token = authorization.split("Bearer ")[1]
+        current_user = verify_token(token)
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token")
+
+    # First, get the user_id from the username
+    user_query = "SELECT id FROM users WHERE username = :username"
+    user = await db.fetch_one(user_query, values={"username": username})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = user['id']
+
+    # Check if the current user is authorized to view all posts
+    logger.info(f"current['uid']: {current_user['uid']} user_id: {user_id}")
+
+    is_own_profile = current_user['uid'] == user_id
+
+    query = """
+    SELECT p.*, 
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id, 
+                   'media_url', pm.media_url, 
+                   'media_type', pm.media_type,
+                   'order_index', pm.order_index,
+                   'aspect_ratio', pm.aspect_ratio,
+                   'width', pm.width,
+                   'height', pm.height
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+    FROM posts p
+    LEFT JOIN post_media pm ON p.id = pm.post_id
+    WHERE p.user_id = :user_id 
+    """
+
+    if not is_own_profile:
+        query += " AND p.visibility = 'public'"
+
+    query += """
+    GROUP BY p.id
+    ORDER BY p.created_at DESC 
+    LIMIT :limit OFFSET :skip
+    """
+
+    results = await db.fetch_all(query=query, values={
+        "user_id": user_id,
+        "skip": skip,
+        "limit": limit
+    })
+
+    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
+
+
+class PostDetailResponse(BaseModel):
+    id: str
+    user_id: str
+    username: str
+    content: str
+    created_at: datetime
+    updated_at: datetime
+    likes_count: int = 0
+    comments_count: int = 0
+    media: List[MediaItem] = []
+
+    class Config:
+        from_attributes = True
+
+
+@router.get("/user/{username}/post/{post_id}", response_model=PostDetailResponse)
+async def get_post_detail(
+    username: str,
+    post_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
     try:
         token = authorization.split("Bearer ")[1]
-        verify_token(token)
+        current_user = verify_token(token)
     except Exception as e:
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
-    # Fetch posts with media in a single query
     query = """
-    SELECT p.id, p.user_id, p.content, p.created_at, p.updated_at, 
-           p.likes_count, p.comments_count,
-           pm.media_url, pm.media_type, pm.order_index
+    SELECT p.*, u.username,
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id, 
+                   'media_url', pm.media_url, 
+                   'media_type', pm.media_type,
+                   'order_index', pm.order_index,
+                   'aspect_ratio', pm.aspect_ratio,
+                   'width', pm.width,
+                   'height', pm.height
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
-    WHERE p.user_id = :user_id 
-    ORDER BY p.created_at DESC, pm.order_index ASC
-    LIMIT :limit OFFSET :skip
+    JOIN users u ON p.user_id = u.id
+    WHERE u.username = :username AND p.id = :post_id 
+    GROUP BY p.id, u.username
     """
-    rows = await db.fetch_all(query, values={"user_id": user_id, "limit": limit, "skip": skip})
 
-    # Group the results by post
-    result = []
-    for post_id, group in groupby(rows, key=lambda x: x['id']):
-        group_list = list(group)
-        post = group_list[0]
-        post_dict = {
-            'id': post['id'],
-            'user_id': post['user_id'],
-            'content': post['content'],
-            'created_at': post['created_at'],
-            'updated_at': post['updated_at'],
-            'likes_count': post['likes_count'],
-            'comments_count': post['comments_count'],
-            'media': [
-                MediaItem(
-                    media_url=row['media_url'], media_type=row['media_type'], order_index=row['order_index'])
-                for row in group_list
-                if row['media_url'] is not None
-            ]
-        }
-        result.append(PostResponse(**post_dict))
+    result = await db.fetch_one(query=query, values={
+        "username": username,
+        "post_id": post_id
+    })
+    
+    print('*********************************************')
+    print('*********************************************')
+    print(query)
+    # print(values)
+    print('*********************************************')
+    print('*********************************************')
+    if not result:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-    return result
+    post_data = dict(result)
+    post_data['media'] = json.loads(post_data['media'])
+    return PostDetailResponse(**post_data)
+
 
 
 class NotificationResponse(BaseModel):
@@ -1342,10 +1430,14 @@ async def get_visible_user_posts(
         OR (p.privacy_setting = 'followers' AND :is_following = TRUE)
         OR (p.privacy_setting = 'mutual_followers' AND :is_mutual_follow = TRUE)
     )
+    AND p.privacy_setting = 'public'
     GROUP BY p.id
     ORDER BY p.created_at DESC 
     LIMIT :limit OFFSET :skip
     """
+
+
+    print(query)
     results = await db.fetch_all(query=query, values={
         "user_id": user_id,
         "is_following": is_following,
