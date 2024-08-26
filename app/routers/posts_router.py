@@ -27,14 +27,18 @@ from bs4 import BeautifulSoup
 import logging
 from PIL import Image
 
-from app.routers.auth2_router import UserResponse
-from app.routers.cdn_router import upload_to_cloudflare
-from app.utils.cloudflare import upload_to_r2
+from botocore.exceptions import ClientError
+
+# from app.routers.auth2_router import UserResponse
+from app.models.modelapp import UserResponse
+# from app.routers.cdn_router import upload_to_cloudflare
+from app.utils.cloudflare import delete_file_from_r2, upload_to_r2
 # from app.utils.cloudflare import upload_to_cloudflare
 
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
 
 
 # Initialize S3 client
@@ -108,15 +112,21 @@ class PostResponse(BaseModel):
     id: str
     user_id: str
     content: str
-    # image_url: Optional[str]
+    privacy_setting: str
     created_at: datetime
     updated_at: datetime
     likes_count: int = 0
     comments_count: int = 0
     media: List[MediaItem] = []
+    liked_by_user: bool
 
     class Config:
+        # orm_mode = True
         from_attributes = True
+        # json_encoders = {
+        #     datetime: lambda v: v.isoformat()
+        # }
+
 
 
 
@@ -167,6 +177,22 @@ async def get_post_detail(post_id: str, current_user: dict = Depends(get_current
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
+    # Privacy checks
+    if post['user_id'] != current_user["id"]:
+        if post['privacy_setting'] == 'private':
+            raise HTTPException(
+                status_code=403, detail="You don't have permission to view this post")
+        elif post['privacy_setting'] == 'followers':
+            is_following = await check_if_following(db, current_user["id"], post['user_id'])
+            if not is_following:
+                raise HTTPException(
+                    status_code=403, detail="You don't have permission to view this post")
+        elif post['privacy_setting'] == 'mutual_followers':
+            is_mutual_follow = await check_if_mutual_follow(db, current_user["id"], post['user_id'])
+            if not is_mutual_follow:
+                raise HTTPException(
+                    status_code=403, detail="You don't have permission to view this post")
+
     media_query = """
     SELECT media_url, media_type, order_index
     FROM post_media
@@ -193,6 +219,7 @@ async def get_post_detail(post_id: str, current_user: dict = Depends(get_current
             "avatar_url": post["avatar_url"]
         }
     }
+
 
 
 
@@ -248,7 +275,7 @@ async def update_post(
         "post_id": post_id,
         "user_id": user_id,
         "content": sanitized_content,
-        "updated_at": datetime.utcnow()
+        "updated_at": datetime.now()
     }
 
     result = await db.fetch_one(query=query, values=values)
@@ -260,28 +287,73 @@ async def update_post(
     return PostResponse(**result)
 
 
-@router.delete("/{post_id}", status_code=204, operation_id="delete_post")
-async def delete_post(
+class PrivacyUpdate(BaseModel):
+    privacy_setting: str
+
+
+@router.patch("/{post_id}/privacy")
+async def update_post_privacy(
     post_id: str,
-    authorization: str = Header(...),
+    privacy_update: PrivacyUpdate,
+    current_user: User = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
+    # Check if the post exists and belongs to the current user
+    query = """
+    SELECT * FROM posts WHERE id = :post_id AND user_id = :user_id
+    """
+    post = await db.fetch_one(query=query, values={"post_id": post_id, "user_id": current_user['id']})
+
+    if not post:
         raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
+            status_code=404, detail="Post not found or you don't have permission to modify it")
 
-    query = "DELETE FROM posts WHERE id = :post_id AND user_id = :user_id"
-    result = await db.execute(query=query, values={"post_id": post_id, "user_id": user_id})
+    # Update the post's privacy setting
+    update_query = """
+    UPDATE posts
+    SET privacy_setting = :privacy_setting
+    WHERE id = :post_id
+    RETURNING *
+    """
+    updated_post = await db.fetch_one(
+        query=update_query,
+        values={
+            "post_id": post_id,
+            "privacy_setting": privacy_update.privacy_setting
+        }
+    )
 
-    if result == 0:
-        raise HTTPException(
-            status_code=404, detail="Post not found or you don't have permission to delete it")
+    return updated_post
 
-    return None
+@router.delete("/{post_id}")
+async def delete_post(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    async with db.transaction():
+        # Verify the post belongs to the current user
+        post = await db.fetch_one("SELECT * FROM posts WHERE id = :id AND user_id = :user_id",
+                                  values={"id": post_id, "user_id": current_user["id"]})
+        if not post:
+            raise HTTPException(
+                status_code=404, detail="Post not found or you don't have permission to delete it")
+
+        try:
+            # Fetch media URLs associated with the post
+            media_records = await db.fetch_all("SELECT media_url FROM post_media WHERE post_id = :post_id",
+                                               values={"post_id": post_id})
+
+            # Delete media files from Cloudflare R2
+            for media in media_records:
+                await delete_file_from_r2(media['media_url'])
+
+            # Delete the post (this will cascade to delete post_media records)
+            await db.execute("DELETE FROM posts WHERE id = :id", values={"id": post_id})
+
+            return {"message": "Post and associated media deleted successfully"}
+        except Exception as e:
+            print(f"Error deleting post and media: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail="An error occurred while deleting the post and media")
+
+
 
 
 
@@ -305,59 +377,6 @@ class CommentResponse(BaseModel):
 
 # ... (keep existing functions like validate_image)
 
-@router.post("/{post_id}/like", response_model=PostResponse, operation_id="like_post")
-async def like_post(
-    post_id: str,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    async with db.transaction():
-        # Check if the user has already liked the post
-        check_query = "SELECT id FROM post_likes WHERE user_id = :user_id AND post_id = :post_id"
-        existing_like = await db.fetch_one(check_query, values={"user_id": user_id, "post_id": post_id})
-
-        if existing_like:
-            # Unlike the post
-            delete_query = "DELETE FROM post_likes WHERE user_id = :user_id AND post_id = :post_id"
-            await db.execute(delete_query, values={"user_id": user_id, "post_id": post_id})
-
-            update_query = """
-            UPDATE posts SET likes_count = likes_count - 1
-            WHERE id = :post_id RETURNING *
-            """
-        else:
-            # Like the post
-            like_id = str(uuid.uuid4())[:28]
-            insert_query = """
-            INSERT INTO post_likes (id, user_id, post_id, created_at)
-            VALUES (:id, :user_id, :post_id, :created_at)
-            """
-            await db.execute(insert_query, values={
-                "id": like_id,
-                "user_id": user_id,
-                "post_id": post_id,
-                "created_at": datetime.utcnow()
-            })
-
-            update_query = """
-            UPDATE posts SET likes_count = likes_count + 1
-            WHERE id = :post_id RETURNING *
-            """
-
-        updated_post = await db.fetch_one(update_query, values={"post_id": post_id})
-
-        if not updated_post:
-            raise HTTPException(status_code=404, detail="Post not found")
-
-        return PostResponse(**updated_post)
 
 
 @router.post("/{post_id}/comments", response_model=CommentResponse)
@@ -597,27 +616,6 @@ async def create_notification(db: Database, user_id: str, type: str, content: st
 # ... (keep existing functions)
 
 
-@router.post("/{post_id}/like", response_model=PostResponse)
-async def like_post(
-    post_id: str,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    # ... (keep existing like_post logic)
-
-    # Add notification for post like
-    post_query = "SELECT user_id FROM posts WHERE id = :post_id"
-    post = await db.fetch_one(post_query, values={"post_id": post_id})
-    if post and post['user_id'] != user_id:
-        await create_notification(
-            db,
-            post['user_id'],
-            "like",
-            f"User liked your post",
-            post_id
-        )
-
-    return PostResponse(**updated_post)
 
 
 
@@ -1340,7 +1338,7 @@ async def get_posts_by_hashtag(
 async def get_all_user_posts(
     user_id: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=100),
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
@@ -1361,26 +1359,30 @@ async def get_all_user_posts(
 
     query = """
     SELECT p.*, 
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id, 
-                   'media_url', pm.media_url, 
-                   'media_type', pm.media_type,
-                   'order_index', pm.order_index,
-                   'aspect_ratio', pm.aspect_ratio,
-                   'width', pm.width,
-                   'height', pm.height
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+        COALESCE(json_agg(
+            json_build_object(
+                'id', pm.id, 
+                'media_url', pm.media_url, 
+                'media_type', pm.media_type,
+                'order_index', pm.order_index,
+                'aspect_ratio', pm.aspect_ratio,
+                'width', pm.width,
+                'height', pm.height
+            ) ORDER BY pm.order_index
+        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
+        CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
+        COALESCE(p.likes_count, 0) as likes_count
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
+    LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = :current_user_id
     WHERE p.user_id = :user_id 
-    GROUP BY p.id
+    GROUP BY p.id, l.user_id
     ORDER BY p.created_at DESC 
     LIMIT :limit OFFSET :skip
     """
     results = await db.fetch_all(query=query, values={
         "user_id": user_id,
+        "current_user_id": current_user['uid'],
         "skip": skip,
         "limit": limit
     })
@@ -1392,7 +1394,7 @@ async def get_all_user_posts(
 async def get_visible_user_posts(
     user_id: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=100),
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
@@ -1412,34 +1414,37 @@ async def get_visible_user_posts(
 
     query = """
     SELECT p.*, 
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id, 
-                   'media_url', pm.media_url, 
-                   'media_type', pm.media_type,
-                   'order_index', pm.order_index,
-                   'aspect_ratio', pm.aspect_ratio,
-                   'width', pm.width,
-                   'height', pm.height
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+        COALESCE(json_agg(
+            json_build_object(
+                'id', pm.id, 
+                'media_url', pm.media_url, 
+                'media_type', pm.media_type,
+                'order_index', pm.order_index,
+                'aspect_ratio', pm.aspect_ratio,
+                'width', pm.width,
+                'height', pm.height
+            ) ORDER BY pm.order_index
+        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
+        CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
+        COALESCE(p.likes_count, 0) as likes_count
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
+    LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = :current_user_id
     WHERE p.user_id = :user_id AND (
         p.privacy_setting = 'public'
         OR (p.privacy_setting = 'followers' AND :is_following = TRUE)
         OR (p.privacy_setting = 'mutual_followers' AND :is_mutual_follow = TRUE)
+        OR (p.user_id = :current_user_id)  -- This allows the user to see their own private posts
     )
-    AND p.privacy_setting = 'public'
-    GROUP BY p.id
+    GROUP BY p.id, l.user_id
     ORDER BY p.created_at DESC 
     LIMIT :limit OFFSET :skip
     """
 
-
     print(query)
     results = await db.fetch_all(query=query, values={
         "user_id": user_id,
+        "current_user_id": current_user['uid'],
         "is_following": is_following,
         "is_mutual_follow": is_mutual_follow,
         "skip": skip,
@@ -1459,15 +1464,17 @@ async def get_posts(
     db: Database = Depends(get_database)
 ):
     try:
-        # Verify token
+        # Verify token and get user_id
         token = authorization.split("Bearer ")[1]
-        verify_token(token)
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
     except Exception as e:
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
     query = """
-    SELECT p.*, 
+    SELECT 
+        p.*,
         COALESCE(json_agg(
             json_build_object(
                 'id', pm.id, 
@@ -1475,16 +1482,25 @@ async def get_posts(
                 'media_type', pm.media_type,
                 'order_index', pm.order_index
             ) ORDER BY pm.order_index
-        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
+        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
+        CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
+        COALESCE(p.likes_count, 0) as likes_count
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
-    GROUP BY p.id
+    LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = :user_id
+    GROUP BY p.id, l.user_id
     ORDER BY p.created_at DESC 
     LIMIT :limit OFFSET :skip
     """
-    results = await db.fetch_all(query=query, values={"skip": skip, "limit": limit})
 
-    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
+    results = await db.fetch_all(query=query, values={"user_id": user_id, "skip": skip, "limit": limit})
+
+    return [PostResponse(**{
+        **result,
+        'media': json.loads(result['media']),
+        'liked_by_user': result['liked_by_user'],
+        'likes_count': result['likes_count']
+    }) for result in results]
 
 
 
@@ -1520,13 +1536,119 @@ async def get_user_feed(
     return [PostResponse(**result) for result in results]
 
 
+# Helper functions for checking follower status
 async def check_if_following(db: Database, follower_id: str, followed_id: str) -> bool:
     query = """
-    SELECT 1 FROM followers
-    WHERE follower_id = :follower_id AND followed_id = :followed_id
+    SELECT EXISTS(
+        SELECT 1 FROM followers 
+        WHERE follower_id = :follower_id AND followed_id = :followed_id
+    )
     """
-    result = await db.fetch_one(query=query, values={
-        "follower_id": follower_id,
-        "followed_id": followed_id
-    })
-    return result is not None
+    result = await db.fetch_val(query=query, values={"follower_id": follower_id, "followed_id": followed_id})
+    return result
+
+
+async def check_if_mutual_follow(db: Database, user1_id: str, user2_id: str) -> bool:
+    query = """
+    SELECT EXISTS(
+        SELECT 1 FROM followers f1
+        JOIN followers f2 ON f1.follower_id = f2.followed_id AND f1.followed_id = f2.follower_id
+        WHERE f1.follower_id = :user1_id AND f1.followed_id = :user2_id
+    )
+    """
+    result = await db.fetch_val(query=query, values={"user1_id": user1_id, "user2_id": user2_id})
+    return result
+
+
+@router.post("/{post_id}/like")
+async def like_post(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    async with db.transaction():
+        try:
+            # Check if the like already exists
+            check_query = "SELECT 1 FROM likes WHERE post_id = :post_id AND user_id = :user_id"
+            existing_like = await db.fetch_one(check_query, values={"post_id": post_id, "user_id": current_user["id"]})
+
+            if existing_like:
+                # Like exists, so remove it (unlike)
+                delete_query = "DELETE FROM likes WHERE post_id = :post_id AND user_id = :user_id"
+                await db.execute(delete_query, values={"post_id": post_id, "user_id": current_user["id"]})
+
+                # Decrement likes count
+                update_query = "UPDATE posts SET likes_count = likes_count - 1 WHERE id = :post_id"
+                await db.execute(update_query, values={"post_id": post_id})
+
+                action = "unliked"
+            else:
+                # Like doesn't exist, so add it
+                insert_query = "INSERT INTO likes (post_id, user_id) VALUES (:post_id, :user_id)"
+                await db.execute(insert_query, values={"post_id": post_id, "user_id": current_user["id"]})
+
+                # Increment likes count
+                update_query = "UPDATE posts SET likes_count = likes_count + 1 WHERE id = :post_id"
+                await db.execute(update_query, values={"post_id": post_id})
+
+                action = "liked"
+
+            # Fetch updated post details
+            post_query = """
+            SELECT p.*, 
+                CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
+                (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count
+            FROM posts p
+            LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = :user_id
+            WHERE p.id = :post_id
+            """
+            updated_post = await db.fetch_one(post_query, values={"post_id": post_id, "user_id": current_user["id"]})
+
+            if not updated_post:
+                raise HTTPException(status_code=404, detail="Post not found")
+
+            # Convert datetime fields to ISO format strings
+            updated_post = dict(updated_post)
+            updated_post['created_at'] = updated_post['created_at'].isoformat()
+            updated_post['updated_at'] = updated_post['updated_at'].isoformat()
+
+            return {
+                "message": f"Post {action} successfully",
+                "post": updated_post
+            }
+
+        except Exception as e:
+            print(f"Error in like_post: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail="An error occurred while processing the request")
+
+
+@router.delete("/{post_id}/like")
+async def unlike_post(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    async with db.transaction():
+        # Remove like from likes table
+        query = "DELETE FROM likes WHERE post_id = :post_id AND user_id = :user_id"
+        result = await db.execute(query=query, values={"post_id": post_id, "user_id": current_user["id"]})
+
+        if result == 0:
+            raise HTTPException(status_code=400, detail="Post not liked")
+
+        # Decrement likes count in posts table
+        query = "UPDATE posts SET likes_count = likes_count - 1 WHERE id = :post_id"
+        await db.execute(query=query, values={"post_id": post_id})
+
+    return {"message": "Post unliked successfully"}
+
+
+@router.get("/{post_id}/likes")
+async def get_post_likes(post_id: str, db: Database = Depends(get_database)):
+    query = "SELECT likes_count FROM posts WHERE id = :post_id"
+    result = await db.fetch_one(query=query, values={"post_id": post_id})
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    return {"likes": result["likes_count"]}
+
+
+@router.get("/posts/{post_id}/liked")
+async def check_post_liked(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    query = "SELECT 1 FROM likes WHERE post_id = :post_id AND user_id = :user_id"
+    result = await db.fetch_one(query=query, values={"post_id": post_id, "user_id": current_user["id"]})
+    return {"liked": result is not None}

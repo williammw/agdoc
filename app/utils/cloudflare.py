@@ -3,6 +3,7 @@ import os
 from fastapi import UploadFile
 from botocore.exceptions import ClientError
 import uuid
+from urllib.parse import urlparse
 
 
 def get_r2_client():
@@ -38,4 +39,21 @@ async def upload_to_r2(file: UploadFile, user_id: str):
         return {"url": file_url}
     except ClientError as e:
         print(f"Error uploading file to R2: {e}")
+        raise
+
+
+def extract_file_key_from_url(url: str) -> str:
+    parsed_url = urlparse(url)
+    # The path starts with a leading slash, so we remove it
+    return parsed_url.path.lstrip('/')
+
+
+async def delete_file_from_r2(file_url: str):
+    r2 = get_r2_client()
+    file_key = extract_file_key_from_url(file_url)
+    try:
+        r2.delete_object(Bucket=os.getenv('R2_BUCKET_NAME'), Key=file_key)
+        print(f"File {file_key} deleted successfully from R2")
+    except ClientError as e:
+        print(f"Error deleting file {file_key} from R2: {str(e)}")
         raise

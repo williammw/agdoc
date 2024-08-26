@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, video_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -30,7 +30,7 @@ origins = [
     "https://235534.netlify.app",
     "https://umamiverse.netlify.app",
     "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
-    "https://f648-185-245-239-88.ngrok-free.app ",
+    "https://bed5-185-245-239-88.ngrok-free.app",
     "https://umamiai.netlify.app",
 ]
 
@@ -60,7 +60,8 @@ router_list = [
     (live_stream_router, "/api/v1/live-stream", ["live-stream"]),
     (users_router, "/api/v1/users", ["users"]),
     (posts_router, "/api/v1/posts", ["posts"]),
-    # (video_router, "/api/v1/video", ["video"]),
+    (comment_router, "/api/v1/comments", ["comments"]),
+    (videos_router, "/api/v1/videos", ["videos"]),
     # (recognize_router, "/api/v1/recognize", ["recognition"]),
     # (search_router, "/api/v1/search", ["search"]),
 ]
