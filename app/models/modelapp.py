@@ -42,6 +42,8 @@ class UserResponse(BaseModel):
     dob: Optional[date] = None
     cover_image: Optional[str] = None
     status: Optional[str] = None
+    last_username_change: Optional[datetime] = None
+
 
     class Config:
         from_attributes = True

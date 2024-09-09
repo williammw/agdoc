@@ -7,7 +7,7 @@ from app.dependencies import get_current_user, get_database
 from databases import Database
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from email.message import EmailMessage
 import smtplib
 import os
@@ -111,7 +111,7 @@ async def get_user(current_user: dict = Depends(get_current_user)):
 
 @router.put("/user")
 async def update_user(user_data: UserUpdate, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
-    print("user_data", user_data) 
+    # print("user_data", user_data) 
     try:
         update_args = {k: v for k, v in user_data.model_dump().items()
                        if v is not None}
@@ -310,7 +310,8 @@ async def google_login(authorization: str = Header(...), db: Database = Depends(
             "auth_provider": user['auth_provider'],
             "cover_image": user['cover_image'],
             "status": user['status'],
-            "bio": user['bio']
+            "bio": user['bio'],
+            "last_username_change" : user['last_username_change']
         }
 
     except Exception as e:
@@ -429,26 +430,27 @@ def send_verification_email(email: str, token: str):
 
 @router.get("/test-email")
 async def test_email():
-  # print(os.getenv("EMAIL_PASSWORD"))
-  test_email = "iamcheapcoder@gmail.com"
+    # print(os.getenv("EMAIL_PASSWORD"))
+    test_email = "iamcheapcoder@gmail.com"
 
-  # Generate a dummy token for testing
-  
-  test_token = secrets.token_urlsafe(32)
+    # Generate a dummy token for testing
 
-  # Set your Gmail app password as an environment variable
-  # You can do this in your terminal before running the script:
-  # export EMAIL_PASSWORD="your-app-password-here"
+    test_token = secrets.token_urlsafe(32)
 
-  try:
-      send_verification_email(test_email, test_token)
-  except Exception as e:
-      print(f"An error occurred: {e}")
+    # Set your Gmail app password as an environment variable
+    # You can do this in your terminal before running the script:
+    # export EMAIL_PASSWORD="your-app-password-here"
+
+    try:
+        send_verification_email(test_email, test_token)
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 
 class UserCreate(BaseModel):
     firebaseUid: Optional[str] = None
-    phoneNumber: Optional[str] = None
+    phone_number: Optional[str] = None
+    country_code: Optional[str] = None
     username: Optional[str] = None
     fullName: Optional[str] = None
 
@@ -469,23 +471,35 @@ async def create_user(user_data: UserCreate, authorization: str = Header(...), d
         if firebase_uid != user_data.firebaseUid:
             raise HTTPException(status_code=403, detail="Unauthorized")
 
+        print('create-user', user_data)
+
+        # Check if the user already exists
+        existing_user_query = "SELECT id FROM users WHERE id = :firebase_uid"
+        existing_user = await db.fetch_one(existing_user_query, values={"firebase_uid": firebase_uid})
+
+        if existing_user:
+            raise HTTPException(status_code=409, detail="User already exists")
+
+        # Insert the new user
         query = """
-        INSERT INTO users (id, phone_number, username, full_name)
-        VALUES (:firebase_uid, :phone_number, :username, :full_name)
+        INSERT INTO users (id, phone_number, country_code, username, full_name)
+        VALUES (:firebase_uid, :phone_number, :country_code, :username, :full_name)
         RETURNING id
         """
         values = {
             "firebase_uid": firebase_uid,
-            "phone_number": user_data.phoneNumber,
-            "username": user_data.username,
-            "full_name": user_data.fullName
+            "phone_number": user_data.phone_number,
+            "country_code": user_data.country_code,
+            "username": user_data.username or None,  # Use None if username is not provided
+            "full_name": user_data.fullName or None  # Use None if fullName is not provided
         }
-
+        
         user_id = await db.fetch_val(query=query, values=values)
         return {"id": user_id, "message": "User created successfully"}
     except firebase_auth.InvalidIdTokenError:
         raise HTTPException(status_code=401, detail="Invalid Firebase token")
     except Exception as e:
+        print(f"Error creating user: {str(e)}")  # Add this line for debugging
         raise HTTPException(
             status_code=500, detail=f"Database error: {str(e)}")
 
@@ -499,6 +513,7 @@ async def update_profile(
     user_id: str,
     username: str = Form(None),
     full_name: str = Form(None),
+    email: str = Form(None),
     bio: str = Form(None),
     status: str = Form(None),
     avatar_url: UploadFile = File(None),
@@ -517,11 +532,25 @@ async def update_profile(
 
     update_data = {}
     if username is not None and username != current_user_data['username']:
+        # Check if username can be changed
+        if current_user_data['last_username_change']:
+            last_change = datetime.fromisoformat(
+                current_user_data['last_username_change'].replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) - last_change < timedelta(days=14):
+                raise HTTPException(
+                    status_code=400, detail="Username can only be changed once every 14 days")
+
+        update_data['username'] = username
+        update_data['last_username_change'] = datetime.now(timezone.utc)
+
+    if username is not None and username != current_user_data['username']:
         update_data['username'] = clean_username(username)
     if full_name is not None and full_name != current_user_data['full_name']:
         update_data['full_name'] = full_name
     if bio is not None and bio != current_user_data['bio']:
         update_data['bio'] = bio
+    if email is not None and email != current_user_data['email']:
+        update_data['email'] = email
     if status is not None and status != current_user_data['status']:
         if status not in ['available', 'busy', 'at_restaurant', 'cooking', 'food_coma']:
             raise HTTPException(status_code=400, detail="Invalid status")

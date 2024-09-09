@@ -1,118 +1,228 @@
 from datetime import datetime
 import subprocess
 import uuid
-from fastapi import APIRouter, FastAPI, File, HTTPException, Header, UploadFile
+from celery import Celery
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from starlette.responses import JSONResponse
 import boto3
 import os
-
+import logging
+from app.dependencies import get_current_user
 from app.firebase_admin_config import verify_token
 
 router = APIRouter()
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 s3_client = boto3.client('s3',
-                          endpoint_url=os.getenv('R2_ENDPOINT_URL'),
-                          aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
-                          aws_secret_access_key=os.getenv(
-                              'R2_SECRET_ACCESS_KEY'),
-                          region_name='weur'
-                          )
+                        endpoint_url=os.getenv('R2_ENDPOINT_URL'),
+                        aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+                        aws_secret_access_key=os.getenv(
+                            'R2_SECRET_ACCESS_KEY'),
+                        region_name='weur'
+                        )
 bucket_name = 'umami'
 
 
+
 # Update this if your ffmpeg path is different "",
-FFMPEG_PATH = "/opt/homebrew/bin/ffmpeg"
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
 
 
-@router.post("/convert")
-async def convert_video(filename: str):
-    input_filename = f"/tmp/{uuid.uuid4()}.webm"
-    output_filename = f"/tmp/{uuid.uuid4()}.mp4"
+# Celery setup
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+celery_app = Celery('tasks', broker=REDIS_URL)
 
-    # Download the WebM file from Cloudflare R2
-    try:
-        s3_client.download_file(bucket_name, filename, input_filename)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to download file from storage: {e}")
 
-    # Construct the ffmpeg command to convert WebM to MP4
+class ConvertRequest(BaseModel):
+    filename: str
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class ConvertRequest(BaseModel):
+    file_key: str
+    unique_id: str
+
+
+
+
+
+async def convert_video_task(input_path: str, output_path: str):
     command = [
         FFMPEG_PATH,
-        "-i", input_filename,
+        "-i", input_path,
         "-c:v", "libx264",
         "-c:a", "aac",
         "-strict", "experimental",
-        output_filename
+        output_path
     ]
-
-    # Execute the ffmpeg command
     try:
-        subprocess.run(command, check=True)
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        logger.info(f"FFmpeg stdout: {result.stdout}")
+        logger.info(f"FFmpeg stderr: {result.stderr}")
     except subprocess.CalledProcessError as e:
-        os.remove(input_filename)  # Clean up the input file
-        raise HTTPException(
-            status_code=500, detail=f"Video conversion failed: {e}")
+        logger.error(f"FFmpeg conversion failed: {str(e)}")
+        logger.error(f"FFmpeg stderr: {e.stderr}")
+        raise Exception(f"Video conversion failed: {str(e)}")
+    
 
-    # Clean up the input file after conversion
-    os.remove(input_filename)
-
-    # Ensure output file exists before sending response
-    if not os.path.exists(output_filename):
-        raise HTTPException(
-            status_code=500, detail="Output file not found after conversion")
-
-    # Upload the converted file back to Cloudflare R2
+# Function to generate a presigned URL
+def generate_presigned_url(file_key: str, expires_in: int = 3600) -> str:
     try:
-        converted_file_key = filename.replace('.webm', '.mp4')
-        s3_client.upload_file(output_filename, bucket_name, converted_file_key, ExtraArgs={
-                              "ContentType": "video/mp4", "ACL": "public-read"})
-        file_url = f"https://{os.getenv('R2_DEV_URL')}/{converted_file_key.replace('/', '%2F')}"
+        presigned_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket_name, 'Key': file_key},
+            ExpiresIn=expires_in  # Time in seconds for the URL to expire
+        )
+        return presigned_url
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to upload converted file: {e}")
-    finally:
-        os.remove(output_filename)  # Clean up the output file after upload
-
-    return JSONResponse({"file_url": file_url})
+        raise HTTPException(status_code=500, detail="Error generating URL")
 
 
-@router.post("/upload")
-async def upload_video(
+# FastAPI endpoint that converts the Cloudflare R2 media URL to a presigned URL
+@router.get("/convert-url/")
+async def convert_url(file_key: str, expires_in: int = 3600):
+    """
+    Convert a Cloudflare R2 media file key into a presigned URL with an expiration time.
+    Also return the original file key and the corresponding MP4 file key.
+    """
+    
+    try:
+        presigned_url = generate_presigned_url(file_key, expires_in)
+        
+        # Assuming the file_key follows the pattern: "{user_id}/videos/{timestamp}_{unique_id}.{extension}"
+        parts = file_key.split('/')
+        filename = parts[-1]
+        folder = '/'.join(parts[:-1])
+        
+        name, extension = os.path.splitext(filename)
+        mp4_filename = f"{name}.mp4"
+        mp4_file_key = f"{folder}/{mp4_filename}"
+        
+        return {
+            "presigned_url": presigned_url,
+            "original_file_key": file_key,
+            "mp4_file_key": mp4_file_key
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/upload-and-convert")
+async def upload_and_convert_video(
     file: UploadFile = File(...),
     authorization: str = Header(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    expires_in: int = 3600  # Default expiration time of 1 hour
 ):
-    token = authorization.split(" ")[1]
-    decoded_token = verify_token(token)
-    user_id = decoded_token['uid']
-
-    if file.content_type != "video/webm":
-        raise HTTPException(
-            status_code=400, detail="Only WebM files are supported")
+    try:
+        token = authorization.split("Bearer ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
 
     try:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        file_extension = os.path.splitext(file.filename)[1]
-        unique_filename = f"{timestamp}_{unique_id}{file_extension}"
+        unique_id = str(uuid.uuid4())
+        original_file_extension = os.path.splitext(file.filename)[1]
+        original_filename = f"{timestamp}_{unique_id}{original_file_extension}"
+        mp4_filename = f"{timestamp}_{unique_id}.mp4"
 
         folder = f"{user_id}/videos"
-        # Generate a unique filename for the upload
-        filename = f"{uuid.uuid4()}.webm"
-        file_key = f"{folder}/{unique_filename}"
+        original_file_key = f"{folder}/{original_filename}"
+        mp4_file_key = f"{folder}/{mp4_filename}"
 
-        # Upload the file to R2 (or save it locally if desired)
+        # Upload the original file to R2
         s3_client.upload_fileobj(
             file.file,
             bucket_name,
-            file_key,
+            original_file_key,
             ExtraArgs={"ContentType": file.content_type, "ACL": "public-read"}
         )
 
-        file_url = f"https://{os.getenv('R2_DEV_URL')}/{file_key.replace('/', '%2F')}"
+        original_file_url = f"https://{os.getenv('R2_DEV_URL')}/{original_file_key.replace('/', '%2F')}"
 
-        return JSONResponse({"file_url": file_url, "filename": filename})
+        # If the file is not already MP4, convert it
+        if original_file_extension.lower() != '.mp4':
+            input_path = f"/tmp/{original_filename}"
+            output_path = f"/tmp/{mp4_filename}"
+
+            # Download the original file
+            s3_client.download_file(bucket_name, original_file_key, input_path)
+
+            # Convert the file to MP4
+            await convert_video_task(input_path, output_path)
+
+            # Upload the converted MP4 file
+            s3_client.upload_file(
+                output_path,
+                bucket_name,
+                mp4_file_key,
+                ExtraArgs={"ContentType": "video/mp4", "ACL": "public-read"}
+            )
+
+            mp4_file_url = f"https://{os.getenv('R2_DEV_URL')}/{mp4_file_key.replace('/', '%2F')}"
+
+            # Clean up temporary files
+            background_tasks.add_task(os.remove, input_path)
+            background_tasks.add_task(os.remove, output_path)
+        else:
+            mp4_file_url = original_file_url
+
+        # Generate presigned URLs
+        original_presigned_url = s3_client.generate_presigned_url('get_object',
+                                                                  Params={'Bucket': bucket_name, 'Key': original_file_key},
+                                                                  ExpiresIn=expires_in)
+
+        mp4_presigned_url = s3_client.generate_presigned_url('get_object',
+                                                             Params={'Bucket': bucket_name, 'Key': mp4_file_key},
+                                                             ExpiresIn=expires_in)
+
+        return JSONResponse({
+            "original_file_url": original_file_url,
+            "mp4_file_url": mp4_file_url,
+            "original_presigned_url": original_presigned_url,
+            "mp4_presigned_url": mp4_presigned_url,
+            "expires_in": expires_in,
+            "original_file_key": original_file_key,
+            "mp4_file_key": mp4_file_key
+        })
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"File upload failed: {e}")
+        logger.error(f"File upload and conversion failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"File upload and conversion failed: {str(e)}")
+    
+
+@router.delete("/delete/{bucket_name}/{prefix}")
+async def delete_files_with_prefix(bucket_name: str, prefix: str):
+    try:
+        # List all objects with the given prefix
+        objects_to_delete = s3_client.list_objects_v2(
+            Bucket=bucket_name, Prefix=prefix)
+
+        if 'Contents' not in objects_to_delete:
+            return {"message": "No objects found with the given prefix"}
+
+        # Create a list of keys to delete
+        delete_keys = [{'Key': obj['Key']}
+                       for obj in objects_to_delete['Contents']]
+
+        # Delete all objects under the given prefix
+        delete_response = s3_client.delete_objects(
+            Bucket=bucket_name,
+            Delete={'Objects': delete_keys}
+        )
+
+        return {"message": "Objects deleted successfully", "deleted_objects": delete_response['Deleted']}
+
+    except Exception as e:  
+        raise HTTPException(
+            status_code=404, detail=f"Error deleting objects: {e}")
+

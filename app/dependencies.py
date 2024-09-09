@@ -69,7 +69,7 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
                 status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
 
         query = """
-        SELECT id, username, email, auth_provider, created_at, is_active, full_name, 
+        SELECT id, username, email, auth_provider, created_at, is_active, full_name, last_username_change,
                bio, avatar_url, phone_number, dob, status, cover_image
         FROM users 
         WHERE id = :uid
