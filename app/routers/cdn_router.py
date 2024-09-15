@@ -10,6 +10,7 @@ from databases import Database
 from app.dependencies import get_database, get_current_user, verify_token
 import boto3
 import os
+import tempfile
 
 router = APIRouter()
 
@@ -95,7 +96,7 @@ async def upload_to_r2(
     file: UploadFile = File(...),
     database: Database = Depends(get_database),
     authorization: str = Header(...),
-    image_type: str = None  # New parameter for 'avatar' or 'cover'
+    image_type: str = None  # 'avatar', 'cover', or None for post media
 ):
     token = authorization.split(" ")[1]
     decoded_token = verify_token(token)
@@ -106,71 +107,113 @@ async def upload_to_r2(
     if mime_type not in allowed_mime_types:
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    # Generate a unique filename
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    unique_id = str(uuid.uuid4())[:8]
+    # Generate common components
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
+    asset_id = str(uuid.uuid4())
     file_extension = os.path.splitext(file.filename)[1]
-    unique_filename = f"{timestamp}_{unique_id}{file_extension}"
 
-    # Determine the folder based on image_type
+    # Determine file path and variants based on image_type
     if image_type in ['avatar', 'cover']:
-        folder = f"{user_id}/{image_type}"
+        base_path = f"profile/{year}/{month}/{day}/{asset_id}"
+        variants = ['original', 'thumbnail', 'optimized']
     else:
-        folder = f"{user_id}/images"
-
-    file_key = f"{folder}/{unique_filename}"
-
-    try:
-        # Upload file to R2
-        r2_client.upload_fileobj(
-            file.file,
-            bucket_name,
-            file_key,
-            ExtraArgs={"ContentType": file.content_type, "ACL": "public-read"}
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not upload the image to Cloudflare R2: {str(e)}"
-        )
-
-    # Construct the file URL
-    file_url = f"https://{os.getenv('R2_DEV_URL')}/{file_key.replace('/', '%2F')}"
-
-    # Insert new record or update existing one
-    query = """
-    INSERT INTO cloudflare_r2_data (filename, url, content_type, r2_object_key, user_id, is_public)
-    VALUES (:filename, :url, :content_type, :r2_object_key, :user_id, :is_public)
-    ON CONFLICT (r2_object_key) 
-    DO UPDATE SET 
-        filename = EXCLUDED.filename,
-        url = EXCLUDED.url,
-        content_type = EXCLUDED.content_type,
-        user_id = EXCLUDED.user_id,
-        is_public = EXCLUDED.is_public
-    RETURNING id
-    """
-    values = {
-        "filename": unique_filename,
-        "url": file_url,
-        "content_type": file.content_type,
-        "r2_object_key": file_key,
-        "user_id": user_id,
-        "is_public": False  # Default to private
-    }
-
-    try:
-        result = await database.fetch_one(query=query, values=values)
-        if result:
-            return {"message": "Image uploaded to Cloudflare R2 and metadata saved successfully", "url": file_url, "id": result['id']}
+        base_path = f"media/{year}/{month}/{day}/{asset_id}"
+        if mime_type.startswith('image/'):
+            variants = ['original', 'optimized', 'thumbnail']
+        elif mime_type.startswith('video/'):
+            variants = ['original', '720p', 'thumbnail']
         else:
-            raise HTTPException(
-                status_code=500, detail="Failed to insert or update metadata in the database")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to insert or update metadata in the database: {str(exc)}"
-        )
+            variants = ['original']
+
+    uploaded_files = []
+
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        # Write the contents of the uploaded file to the temporary file
+        content = await file.read()
+        temp_file.write(content)
+        temp_file_path = temp_file.name
+
+    try:
+        for variant in variants:
+            file_key = f"{base_path}/{variant}{file_extension}"
+            content_type = file.content_type
+
+            # Open the temporary file for each variant
+            with open(temp_file_path, 'rb') as file_to_upload:
+                try:
+                    # Upload file to R2
+                    r2_client.upload_fileobj(
+                        file_to_upload,
+                        bucket_name,
+                        file_key,
+                        ExtraArgs={"ContentType": content_type, "ACL": "public-read"}
+                    )
+
+                    # Construct the file URL
+                    file_url = f"https://{os.getenv('R2_DEV_URL')}/{file_key.replace('/', '%2F')}"
+
+                    uploaded_files.append({
+                        "variant": variant,
+                        "url": file_url,
+                        "file_key": file_key,
+                    })
+
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Could not upload the {variant} variant to Cloudflare R2: {str(e)}"
+                    )
+
+        # Insert new record or update existing one for each variant
+        for uploaded_file in uploaded_files:
+            query = """
+            INSERT INTO cloudflare_r2_data (filename, url, content_type, r2_object_key, user_id, is_public, variant)
+            VALUES (:filename, :url, :content_type, :r2_object_key, :user_id, :is_public, :variant)
+            ON CONFLICT (r2_object_key) 
+            DO UPDATE SET 
+                filename = EXCLUDED.filename,
+                url = EXCLUDED.url,
+                content_type = EXCLUDED.content_type,
+                user_id = EXCLUDED.user_id,
+                is_public = EXCLUDED.is_public,
+                variant = EXCLUDED.variant
+            RETURNING id
+            """
+            values = {
+                "filename": os.path.basename(uploaded_file['file_key']),
+                "url": uploaded_file['url'],
+                "content_type": file.content_type,
+                "r2_object_key": uploaded_file['file_key'],
+                "user_id": user_id,
+                "is_public": False,  # Default to private
+                "variant": uploaded_file['variant']
+            }
+
+            try:
+                result = await database.fetch_one(query=query, values=values)
+                if not result:
+                    raise HTTPException(
+                        status_code=500, detail=f"Failed to insert or update metadata for {uploaded_file['variant']} variant in the database")
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to insert or update metadata for {uploaded_file['variant']} variant in the database: {str(exc)}"
+                )
+
+    finally:
+        # Clean up the temporary file
+        os.unlink(temp_file_path)
+
+    # Return a structure compatible with the existing code
+    return {
+        "url": uploaded_files[0]['url'],  # Use the URL of the first (original) variant
+        "message": "Files uploaded to Cloudflare R2 and metadata saved successfully",
+        "files": uploaded_files
+    }
 
 
 @router.post("/toggle-public-status/")

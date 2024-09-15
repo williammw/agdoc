@@ -861,13 +861,23 @@ def extract_rich_media(content: str) -> Optional[RichMedia]:
         return None
 
 
+from fastapi import Form, File, UploadFile, Header, HTTPException, BackgroundTasks, Request
+from typing import List, Optional
+import json
+import logging
+import uuid
+from datetime import datetime
+import bleach
+
+logger = logging.getLogger(__name__)
+
 @router.post("/", response_model=dict)
 async def create_post(
+    request: Request,
     background_tasks: BackgroundTasks,
     content: str = Form(...),
     privacy_setting: str = Form("public"),
-    media: List[UploadFile] = File(None),
-    media_dimensions: str = Form(None),
+    media_count: int = Form(...),
     authorization: str = Header(...),
     db: Database = Depends(get_database),
 ):
@@ -882,19 +892,25 @@ async def create_post(
         sanitized_content = bleach.clean(content)
         logger.info(f"Creating post: {post_id}")
 
-        media_data = []
-        media_dimensions_list = json.loads(
-            media_dimensions) if media_dimensions else []
+        logger.info(f"Content: {content}")
+        logger.info(f"Privacy setting: {privacy_setting}")
+        logger.info(f"Media count: {media_count}")
 
-        if media:
-            logger.info(f"Received {len(media)} media files")
-            for index, (file, dimensions) in enumerate(zip(media, media_dimensions_list)):
-                try:
-                    media_info = await upload_media(file, user_id, dimensions)
-                    media_data.append(media_info)
-                except Exception as e:
-                    logger.error(
-                        f"Media upload error for file {index}: {str(e)}")
+        form_data = await request.form()
+        media_data = []
+
+        for i in range(media_count):
+            media_file = form_data.get(f'media_{i}')
+            media_dimensions = form_data.get(f'media_dimensions_{i}')
+            media_info = form_data.get(f'media_info_{i}')
+
+            if media_file:
+                dimensions = json.loads(media_dimensions)
+                media_info = await upload_media(media_file, user_id, dimensions)
+                media_data.append(media_info)
+            elif media_info:
+                video_info = json.loads(media_info)
+                media_data.append(video_info)
 
         # Insert post
         post_query = """
@@ -916,26 +932,26 @@ async def create_post(
         # Insert media
         if media_data:
             media_query = """
-            INSERT INTO post_media (post_id, media_url, media_type, order_index, width, height, aspect_ratio)
-            VALUES (:post_id, :media_url, :media_type, :order_index, :width, :height, :aspect_ratio)
+            INSERT INTO post_media (post_id, media_url, media_type, order_index, width, height, aspect_ratio, cloudflare_info)
+            VALUES (:post_id, :media_url, :media_type, :order_index, :width, :height, :aspect_ratio, :cloudflare_info)
             """
             for index, media_info in enumerate(media_data):
                 media_values = {
                     "post_id": post_id,
-                    "media_url": media_info['url'],
+                    "media_url": media_info.get('url') or media_info.get('mp4_file_url'),
                     "media_type": media_info['type'],
                     "order_index": index,
                     "width": media_info.get('width'),
                     "height": media_info.get('height'),
-                    "aspect_ratio": media_info.get('aspect_ratio')
+                    "aspect_ratio": media_info.get('width') / media_info.get('height') if media_info.get('width') and media_info.get('height') else None,
+                    "cloudflare_info": json.dumps(media_info) if media_info['type'] == 'video' else None
                 }
                 await db.execute(query=media_query, values=media_values)
-            logger.info(
-                f"Inserted {len(media_data)} media entries for post {post_id}")
+            logger.info(f"Inserted {len(media_data)} media entries for post {post_id}")
 
         # Fetch media for response
         media_result = await db.fetch_all(
-            "SELECT media_url, media_type, width, height, aspect_ratio FROM post_media WHERE post_id = :post_id ORDER BY order_index",
+            "SELECT media_url, media_type, width, height, aspect_ratio, cloudflare_info FROM post_media WHERE post_id = :post_id ORDER BY order_index",
             values={"post_id": post_id}
         )
         logger.info(f"Fetched {len(media_result)} media entries for response")
@@ -949,8 +965,7 @@ async def create_post(
 
     except Exception as e:
         logger.error(f"Error creating post: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create post: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
 
 
 @router.post("/share", response_model=SharedPostResponse)
@@ -1342,6 +1357,7 @@ async def get_all_user_posts(
     authorization: str = Header(...),
     db: Database = Depends(get_database)
 ):
+    
     try:
         # Verify token and get current user
         token = authorization.split("Bearer ")[1]

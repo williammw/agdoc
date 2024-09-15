@@ -25,8 +25,8 @@ def clean_username(username):
     return cleaned_username
 
 router = APIRouter()
-logging.basicConfig(level=logging.INFO)
-
+# logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 
@@ -101,7 +101,7 @@ async def register_with_phone(user_data: PhoneRegister, db: Database = Depends(g
 @router.get("/user", response_model=UserResponse)
 async def get_user(current_user: dict = Depends(get_current_user)):
     try:
-        print("Current user data:", current_user)
+        logger.info("Current user data:", current_user)
         return UserResponse(**current_user)
     except Exception as e:
         print(f"Error in get_user: {str(e)}")
