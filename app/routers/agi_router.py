@@ -21,52 +21,52 @@ router = APIRouter()
 load_dotenv()
 
 client = OpenAI(
-    api_key=os.getenv('OPENAI_API_KEY'),
+  api_key=os.getenv('OPENAI_API_KEY'),
 )
 
 
 @router.get("/")
 async def greeting():
-    return {"message": "Hello from Agi API!"}
+  return {"message": "Hello from Agi API!"}
 
 @router.get("/getApi")
 async def getApi():
-    return {os.getenv('TEST_API')}
+  return {os.getenv('TEST_API')}
 
 
 @router.post("/get-files-size/")
 async def create_file(file: Annotated[bytes, File()]):
-    return {"file_size": len(file)}
+  return {"file_size": len(file)}
 
 
 
 
 @router.post("/upload-image-cloudflare/")
 async def upload_to_cloudflare(file: UploadFile = File(...)):
-    # Assuming you have a function to get a fresh BATCH_TOKEN if needed
-    # BATCH_TOKEN = await get_batch_token()
-    headers = {
-        "Authorization": f"Bearer {os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')}",
-        # Additional headers if needed
-    }
+  # Assuming you have a function to get a fresh BATCH_TOKEN if needed
+  # BATCH_TOKEN = await get_batch_token()
+  headers = {
+    "Authorization": f"Bearer {os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')}",
+    # Additional headers if needed
+  }
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/images/v1"
+  url = f"https://api.cloudflare.com/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/images/v1"
 
-    # Read file content
-    content = await file.read()
+  # Read file content
+  content = await file.read()
 
-    files = {
-        'file': (file.filename, content, file.content_type),
-    }
+  files = {
+    'file': (file.filename, content, file.content_type),
+  }
 
-    # Using httpx to send the multipart/form-data request
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, files=files)
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=400, detail="Could not upload the image to Cloudflare")
+  # Using httpx to send the multipart/form-data request
+  async with httpx.AsyncClient() as client:
+    response = await client.post(url, headers=headers, files=files)
+    if response.status_code != 200:
+      raise HTTPException(
+        status_code=400, detail="Could not upload the image to Cloudflare")
 
-    return response.json()
+  return response.json()
 
     
 

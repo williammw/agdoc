@@ -121,14 +121,16 @@ async def upload_and_convert_video(
     original_file_extension = os.path.splitext(file.filename)[1]
     original_filename = f"{timestamp}_{unique_id}{original_file_extension}"
     mp4_filename = f"{timestamp}_{unique_id}.mp4"
+    thumbnail_filename = f"{timestamp}_{unique_id}_thumbnail.jpg"
     now = datetime.now()
     year = now.strftime("%Y")
     month = now.strftime("%m")
     day = now.strftime("%d")
 
-    folder = f"media/{year}/{month}/{day}/{user_id}"
-    original_file_key = f"{folder}/{original_filename}"
-    mp4_file_key = f"{folder}/{mp4_filename}"
+    folder = f"media/{year}/{month}/{day}"
+    original_file_key = f"{folder}/{uuid.uuid4()}{original_filename}"
+    mp4_file_key = f"{folder}/{uuid.uuid4()}{mp4_filename}"
+    thumbnail_file_key = f"{folder}/{uuid.uuid4()}{thumbnail_filename}"
 
     # Upload the original file to R2
     s3_client.upload_fileobj(
@@ -140,32 +142,55 @@ async def upload_and_convert_video(
 
     original_file_url = f"https://{os.getenv('R2_DEV_URL')}/{original_file_key.replace('/', '%2F')}"
 
-    # If the file is not already MP4, convert it
+    input_path = f"/tmp/{original_filename}"
+    output_path = f"/tmp/{mp4_filename}"
+    thumbnail_path = f"/tmp/{thumbnail_filename}"
+
+    # Download the original file
+    s3_client.download_file(bucket_name, original_file_key, input_path)
+
+    # Convert the file to MP4 if it's not already
     if original_file_extension.lower() != '.mp4':
-      input_path = f"/tmp/{original_filename}"
-      output_path = f"/tmp/{mp4_filename}"
-
-      # Download the original file
-      s3_client.download_file(bucket_name, original_file_key, input_path)
-
-      # Convert the file to MP4
       await convert_video_task(input_path, output_path)
+    else:
+      output_path = input_path
 
-      # Upload the converted MP4 file
+    # Generate thumbnail
+    thumbnail_command = [
+      FFMPEG_PATH,
+      "-i", output_path,
+      "-ss", "00:00:01",  # Take screenshot at 1 second
+      "-vframes", "1",
+      "-vf", "scale=320:-1",  # Resize to 320px width, maintain aspect ratio
+      thumbnail_path
+    ]
+    try:
+      subprocess.run(thumbnail_command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+      logger.error(f"Thumbnail generation failed: {str(e)}")
+      logger.error(f"FFmpeg stderr: {e.stderr}")
+      raise Exception(f"Thumbnail generation failed: {str(e)}")
+
+    # Upload the MP4 file (if converted)
+    if original_file_extension.lower() != '.mp4':
       s3_client.upload_file(
         output_path,
         bucket_name,
         mp4_file_key,
         ExtraArgs={"ContentType": "video/mp4", "ACL": "public-read"}
       )
-
       mp4_file_url = f"https://{os.getenv('R2_DEV_URL')}/{mp4_file_key.replace('/', '%2F')}"
-
-      # Clean up temporary files
-      background_tasks.add_task(os.remove, input_path)
-      background_tasks.add_task(os.remove, output_path)
     else:
       mp4_file_url = original_file_url
+
+    # Upload the thumbnail
+    s3_client.upload_file(
+      thumbnail_path,
+      bucket_name,
+      thumbnail_file_key,
+      ExtraArgs={"ContentType": "image/jpeg", "ACL": "public-read"}
+    )
+    thumbnail_file_url = f"https://{os.getenv('R2_DEV_URL')}/{thumbnail_file_key.replace('/', '%2F')}"
 
     # Generate presigned URLs
     original_presigned_url = s3_client.generate_presigned_url('get_object',
@@ -176,19 +201,31 @@ async def upload_and_convert_video(
                                                         Params={'Bucket': bucket_name, 'Key': mp4_file_key},
                                                         ExpiresIn=expires_in)
 
+    thumbnail_presigned_url = s3_client.generate_presigned_url('get_object',
+                                                              Params={'Bucket': bucket_name, 'Key': thumbnail_file_key},
+                                                              ExpiresIn=expires_in)
+
+    # Clean up temporary files
+    background_tasks.add_task(os.remove, input_path)
+    background_tasks.add_task(os.remove, output_path)
+    background_tasks.add_task(os.remove, thumbnail_path)
+
     return JSONResponse({
       "original_file_url": original_file_url,
       "mp4_file_url": mp4_file_url,
+      "thumbnail_file_url": thumbnail_file_url,
       "original_presigned_url": original_presigned_url,
       "mp4_presigned_url": mp4_presigned_url,
+      "thumbnail_presigned_url": thumbnail_presigned_url,
       "expires_in": expires_in,
       "original_file_key": original_file_key,
-      "mp4_file_key": mp4_file_key
+      "mp4_file_key": mp4_file_key,
+      "thumbnail_file_key": thumbnail_file_key
     })
 
   except Exception as e:
-    logger.error(f"File upload and conversion failed: {str(e)}")
-    raise HTTPException(status_code=500, detail=f"File upload and conversion failed: {str(e)}")
+    logger.error(f"File upload, conversion, and thumbnail generation failed: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"File upload, conversion, and thumbnail generation failed: {str(e)}")
 
 @router.delete("/delete/{bucket_name}/{prefix}")
 async def delete_files_with_prefix(bucket_name: str, prefix: str):

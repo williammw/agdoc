@@ -21,10 +21,15 @@ def get_r2_client():
 async def upload_to_r2(file: UploadFile, user_id: str):
     r2_client = get_r2_client()
     bucket_name = os.getenv('R2_BUCKET_NAME')
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
 
     # Generate a unique filename
     file_extension = os.path.splitext(file.filename)[1]
-    unique_filename = f"{user_id}/{uuid.uuid4()}{file_extension}"
+    # unique_filename = f"{user_id}/{uuid.uuid4()}{file_extension}"
+    unique_filename = f"media/{year}/{month}/{day}/{uuid.uuid4()}{file_extension}"
 
     try:
         # Upload file to R2

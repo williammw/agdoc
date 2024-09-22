@@ -194,7 +194,7 @@ async def get_post_detail(post_id: str, current_user: dict = Depends(get_current
                     status_code=403, detail="You don't have permission to view this post")
 
     media_query = """
-    SELECT media_url, media_type, order_index
+    SELECT media_url, media_type, order_index, cloudflare_info
     FROM post_media
     WHERE post_id = :post_id
     ORDER BY order_index
@@ -489,7 +489,8 @@ async def get_user_posts(
                    'order_index', pm.order_index,
                    'aspect_ratio', pm.aspect_ratio,
                    'width', pm.width,
-                   'height', pm.height
+                   'height', pm.height,
+                   'cloudflare_info', pm.cloudflare_info
                ) ORDER BY pm.order_index
            ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
@@ -556,7 +557,8 @@ async def get_post_detail(
                    'order_index', pm.order_index,
                    'aspect_ratio', pm.aspect_ratio,
                    'width', pm.width,
-                   'height', pm.height
+                   'height', pm.height,
+                   'cloudflare_info', pm.cloudflare_info
                ) ORDER BY pm.order_index
            ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
     FROM posts p
@@ -1383,7 +1385,8 @@ async def get_all_user_posts(
                 'order_index', pm.order_index,
                 'aspect_ratio', pm.aspect_ratio,
                 'width', pm.width,
-                'height', pm.height
+                'height', pm.height,
+                'cloudflare_info', pm.cloudflare_info
             ) ORDER BY pm.order_index
         ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
         CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
@@ -1436,9 +1439,10 @@ async def get_visible_user_posts(
                 'media_url', pm.media_url, 
                 'media_type', pm.media_type,
                 'order_index', pm.order_index,
-                'aspect_ratio', pm.aspect_ratio,
+                'aspect_ratio', pm.aspect_ratio,                
                 'width', pm.width,
-                'height', pm.height
+                'height', pm.height,
+                'cloudflare_info', pm.cloudflare_info
             ) ORDER BY pm.order_index
         ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
         CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
@@ -1496,7 +1500,11 @@ async def get_posts(
                 'id', pm.id, 
                 'media_url', pm.media_url, 
                 'media_type', pm.media_type,
-                'order_index', pm.order_index
+                'order_index', pm.order_index,
+                'aspect_ratio', pm.aspect_ratio,
+                'width', pm.width,
+                'height', pm.height,
+                'cloudflare_info', pm.cloudflare_info
             ) ORDER BY pm.order_index
         ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
         CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
