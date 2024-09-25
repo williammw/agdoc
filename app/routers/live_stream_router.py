@@ -35,7 +35,13 @@ def get_ffmpeg_input_args():
     
     if FFMPEG_INPUT_METHOD == 'auto':
         if system == 'darwin':  # macOS
-            return ['-f', 'avfoundation', '-i', '0:0']
+            return [
+                '-f', 'avfoundation',
+                '-framerate', '30',
+                '-video_size', '1280x720',  # Adjust as needed
+                '-i', '0:0',  # '0' is usually the default camera, '1' is usually the default mic
+                '-pix_fmt', 'yuv420p'
+            ]
         elif system == 'linux':
             return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
         elif system == 'windows':
@@ -43,10 +49,10 @@ def get_ffmpeg_input_args():
     elif FFMPEG_INPUT_METHOD == 'custom':
         return ['-f', FFMPEG_VIDEO_INPUT, '-i', FFMPEG_AUDIO_INPUT]
     
-    # Fallback to test pattern
+    # Fallback to test pattern with audio tone
     return [
         '-f', 'lavfi', '-i', 'testsrc=size=480x270:rate=30',
-        '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+        '-f', 'lavfi', '-i', 'sine=frequency=1000:sample_rate=44100'
     ]
 
 
