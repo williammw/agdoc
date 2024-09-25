@@ -181,48 +181,25 @@ async def start_stream(
     full_rtmps_url = f"{rtmps_url}{stream_key}"
     logger.info(f"Full RTMPS URL: {full_rtmps_url}")
 
-    # ffmpeg_command = [
-    #     'ffmpeg',
-    #     '-f', 'avfoundation',
-    #     '-framerate', '30',
-    #     '-i', '0:0',
-    #     '-c:v', 'libx264',
-    #     '-preset', 'medium',
-    #     '-tune', 'zerolatency',
-    #     '-b:v', '3500k',
-    #     '-maxrate', '3500k',
-    #     '-bufsize', '7000k',
-    #     '-vf', 'scale=640:360',
-    #     '-pix_fmt', 'yuv420p',
-    #     '-crf', '18',
-    #     '-g', '60',
-    #     '-keyint_min', '60',
-    #     '-sc_threshold', '0',
-    #     '-c:a', 'aac',
-    #     '-b:a', '192k',
-    #     '-ar', '44100',
-    #     '-f', 'flv',
-    #     full_rtmps_url
-    # ]
     ffmpeg_command = [
         'ffmpeg',
         '-f', 'avfoundation',
         '-framerate', '30',
         '-i', '0:0',
         '-c:v', 'libx264',
-        '-preset', 'medium',
+        '-preset', 'veryfast',  # Changed from 'medium' to 'veryfast'
         '-tune', 'zerolatency',
-        '-b:v', '2500k',  # Lowered bitrate to 2500k to reduce VBV underflow risk
-        '-maxrate', '2500k',  # Lowered maxrate to 2500k
-        '-bufsize', '5000k',  # Adjusted buffer size to twice the maxrate
-        '-vf', 'scale=640:360',
+        '-b:v', '2000k',  # Lowered bitrate to 2000k
+        '-maxrate', '2500k',
+        '-bufsize', '2500k',  # Reduced buffer size
+        '-vf', 'scale=480:270',
         '-pix_fmt', 'yuv420p',
-        '-crf', '23',  # Adjusted CRF to 23 to lower strain on encoding
+        '-crf', '28',  # Increased CRF for more flexibility
         '-g', '60',
         '-keyint_min', '60',
         '-sc_threshold', '0',
         '-c:a', 'aac',
-        '-b:a', '192k',
+        '-b:a', '128k',  # Lowered audio bitrate
         '-ar', '44100',
         '-f', 'flv',
         full_rtmps_url
