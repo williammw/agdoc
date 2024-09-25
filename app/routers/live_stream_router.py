@@ -13,6 +13,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 import psutil
 import uuid  # Add this import statement
 from datetime import datetime
+import platform
 
 
 router = APIRouter()
@@ -23,6 +24,30 @@ logger = logging.getLogger(__name__)
 
 CLOUDFLARE_ACCOUNT_ID = os.getenv('CLOUDFLARE_ACCOUNT_ID')
 CLOUDFLARE_API_TOKEN = os.getenv('CLOUDFLARE_STREAM_AND_IMAGES_API_TOKEN')
+
+# Add these constants at the top of your file
+FFMPEG_INPUT_METHOD = os.getenv('FFMPEG_INPUT_METHOD', 'auto')
+FFMPEG_VIDEO_INPUT = os.getenv('FFMPEG_VIDEO_INPUT', 'default')
+FFMPEG_AUDIO_INPUT = os.getenv('FFMPEG_AUDIO_INPUT', 'default')
+
+def get_ffmpeg_input_args():
+    system = platform.system().lower()
+    
+    if FFMPEG_INPUT_METHOD == 'auto':
+        if system == 'darwin':  # macOS
+            return ['-f', 'avfoundation', '-i', '0:0']
+        elif system == 'linux':
+            return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
+        elif system == 'windows':
+            return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
+    elif FFMPEG_INPUT_METHOD == 'custom':
+        return ['-f', FFMPEG_VIDEO_INPUT, '-i', FFMPEG_AUDIO_INPUT]
+    
+    # Fallback to test pattern
+    return [
+        '-f', 'lavfi', '-i', 'testsrc=size=480x270:rate=30',
+        '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+    ]
 
 
 class StreamCreate(BaseModel):
@@ -110,7 +135,7 @@ async def handle_offer(offer: dict, current_user: dict = Depends(get_current_use
     # Store the peer connection in the dictionary
     peer_connections[current_user['id']] = pc
 
-    # Set the remote description with the offer
+    # Set the remote description with the offer 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=offer['sdp'], type=offer['type']))
 
     # Create an answer
@@ -181,25 +206,24 @@ async def start_stream(
     full_rtmps_url = f"{rtmps_url}{stream_key}"
     logger.info(f"Full RTMPS URL: {full_rtmps_url}")
 
+    ffmpeg_input_args = get_ffmpeg_input_args()
+    
     ffmpeg_command = [
         'ffmpeg',
-        '-f', 'avfoundation',
-        '-framerate', '30',
-        '-i', '0:0',
+        *ffmpeg_input_args,
         '-c:v', 'libx264',
-        '-preset', 'veryfast',  # Changed from 'medium' to 'veryfast'
+        '-preset', 'veryfast',
         '-tune', 'zerolatency',
-        '-b:v', '2000k',  # Lowered bitrate to 2000k
+        '-b:v', '2000k',
         '-maxrate', '2500k',
-        '-bufsize', '2500k',  # Reduced buffer size
+        '-bufsize', '2500k',
         '-vf', 'scale=480:270',
         '-pix_fmt', 'yuv420p',
-        '-crf', '28',  # Increased CRF for more flexibility
         '-g', '60',
         '-keyint_min', '60',
         '-sc_threshold', '0',
         '-c:a', 'aac',
-        '-b:a', '128k',  # Lowered audio bitrate
+        '-b:a', '128k',
         '-ar', '44100',
         '-f', 'flv',
         full_rtmps_url
