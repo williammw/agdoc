@@ -1,16 +1,19 @@
 # live_stream_router.py
-from fastapi import HTTPException
-from fastapi import APIRouter, HTTPException, Depends, Header
-import psutil
-
+from fastapi import HTTPException, APIRouter, Depends, WebSocket, WebSocketDisconnect, Header
+from fastapi.responses import JSONResponse
 from app.dependencies import get_current_user, get_database, verify_token
 from databases import Database
 from pydantic import BaseModel
 import httpx
 import os
 import asyncio
-import subprocess
 import logging
+import subprocess
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+import psutil
+import uuid  # Add this import statement
+from datetime import datetime
+
 
 router = APIRouter()
 
@@ -27,7 +30,7 @@ class StreamCreate(BaseModel):
 
 
 @router.post("/create-stream")
-async def create_stream(stream: StreamCreate, current_user: dict = Depends(get_current_user)):
+async def create_stream(stream: StreamCreate, current_user: dict = Depends(get_current_user), database: Database = Depends(get_database)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -39,7 +42,11 @@ async def create_stream(stream: StreamCreate, current_user: dict = Depends(get_c
                     "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
                     "Content-Type": "application/json"
                 },
-                json={"meta": {"name": stream.name}}
+                json={
+                    "meta": {"name": stream.name},
+                    "recording": {"mode": "automatic"},
+                    "playback": {"mode": "live"}
+                }
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -47,33 +54,95 @@ async def create_stream(stream: StreamCreate, current_user: dict = Depends(get_c
                                 detail=f"Cloudflare API error: {e.response.text}")
 
     stream_data = response.json()['result']
-    print(stream_data)
-    return {
-        "stream_key": stream_data['uid'],
+
+    # Insert stream data into the livestreams table
+    query = """
+    INSERT INTO livestreams (
+        id, user_id, stream_key, rtmps_url, cloudflare_id, status, created_at, webrtc_url
+    ) VALUES (
+        :id, :user_id, :stream_key, :rtmps_url, :cloudflare_id, :status, :created_at, :webrtc_url
+    )
+    """
+
+    logger.info(f"Inserting stream data into database: {stream_data}")
+    values = {
+        "id": uuid.uuid4(),
+        "user_id": current_user['uid'],
+        "stream_key": stream_data['rtmps']['streamKey'],
         "rtmps_url": stream_data['rtmps']['url'],
-        "stream_id": stream_data['uid']
+        "cloudflare_id": stream_data['uid'],
+        "status": 'created',
+        "created_at": datetime.now(),
+        # This might be None if not provided
+        "webrtc_url": stream_data.get('webRTC', {}).get('url')
+    }
+
+    try:
+        await database.execute(query=query, values=values)
+    except Exception as e:
+        logger.error(f"Failed to insert stream data into database: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail="Failed to create stream in database")
+
+    return {
+        "stream_id": values["id"],
+        "cloudflare_id": stream_data['uid'],
+        "stream_key": stream_data['rtmps']['streamKey'],
+        "rtmps_url": stream_data['rtmps']['url'],
+        "webrtc_url": values["webrtc_url"]
     }
 
 
-@router.get("/stream/{stream_id}")
-async def get_stream(stream_id: str, current_user: dict = Depends(get_current_user)):
+peer_connections = {}
+
+
+@router.post("/offer")
+async def handle_offer(offer: dict, current_user: dict = Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(
-                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/stream/live_inputs/{stream_id}",
-                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
-            )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Stream not found")
-            raise HTTPException(status_code=e.response.status_code,
-                                detail=f"Cloudflare API error: {e.response.text}")
+    if 'sdp' not in offer or 'type' not in offer:
+        raise HTTPException(status_code=400, detail="Invalid offer format")
 
-    return response.json()['result']
+    # Create a new RTCPeerConnection
+    pc = RTCPeerConnection()
+
+    # Store the peer connection in the dictionary
+    peer_connections[current_user['id']] = pc
+
+    # Set the remote description with the offer
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=offer['sdp'], type=offer['type']))
+
+    # Create an answer
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return JSONResponse(content={"answer": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}})
+
+
+@router.post("/ice-candidate")
+async def handle_ice_candidate(candidate: dict, current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if 'candidate' not in candidate:
+        raise HTTPException(status_code=400, detail="Invalid candidate format")
+
+    pc = peer_connections.get(current_user['id'])
+    if not pc:
+        raise HTTPException(
+            status_code=404, detail="Peer connection not found")
+
+    # Add the ICE candidate to the peer connection
+    try:
+        await pc.addIceCandidate(RTCIceCandidate(candidate=candidate['candidate']))
+    except Exception as e:
+        logger.error(f"Failed to add ICE candidate: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail="Failed to add ICE candidate")
+
+    return JSONResponse(content={"status": "ok"})
+
 
 
 @router.post("/start-stream/{stream_id}")
@@ -82,86 +151,116 @@ async def start_stream(
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
+    logger.info(f"Received request to start stream: {stream_id}")
+
     try:
         token = authorization.split(" ")[1]
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
+        logger.info(f"Authenticated user: {user_id}")
     except Exception as e:
         logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(
             status_code=401, detail="Invalid authorization token")
 
+    query = "SELECT rtmps_url, stream_key FROM livestreams WHERE id = :stream_id AND user_id = :user_id"
+    values = {"stream_id": stream_id, "user_id": user_id}
+    logger.info(f"Executing query: {query} with values: {values}")
+    result = await database.fetch_one(query=query, values=values)
+
+    if not result:
+        logger.error(
+            f"Stream not found for ID: {stream_id} and user ID: {user_id}")
+        raise HTTPException(status_code=404, detail="Stream not found")
+
+    rtmps_url = result['rtmps_url']
+    stream_key = result['stream_key']
+    logger.info(
+        f"Retrieved stream info: RTMPS URL: {rtmps_url}, Stream Key: {stream_key}")
+
+    full_rtmps_url = f"{rtmps_url}{stream_key}"
+    logger.info(f"Full RTMPS URL: {full_rtmps_url}")
+
+    # ffmpeg_command = [
+    #     'ffmpeg',
+    #     '-f', 'avfoundation',
+    #     '-framerate', '30',
+    #     '-i', '0:0',
+    #     '-c:v', 'libx264',
+    #     '-preset', 'medium',
+    #     '-tune', 'zerolatency',
+    #     '-b:v', '3500k',
+    #     '-maxrate', '3500k',
+    #     '-bufsize', '7000k',
+    #     '-vf', 'scale=640:360',
+    #     '-pix_fmt', 'yuv420p',
+    #     '-crf', '18',
+    #     '-g', '60',
+    #     '-keyint_min', '60',
+    #     '-sc_threshold', '0',
+    #     '-c:a', 'aac',
+    #     '-b:a', '192k',
+    #     '-ar', '44100',
+    #     '-f', 'flv',
+    #     full_rtmps_url
+    # ]
+    ffmpeg_command = [
+        'ffmpeg',
+        '-f', 'avfoundation',
+        '-framerate', '30',
+        '-i', '0:0',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-tune', 'zerolatency',
+        '-b:v', '2500k',  # Lowered bitrate to 2500k to reduce VBV underflow risk
+        '-maxrate', '2500k',  # Lowered maxrate to 2500k
+        '-bufsize', '5000k',  # Adjusted buffer size to twice the maxrate
+        '-vf', 'scale=640:360',
+        '-pix_fmt', 'yuv420p',
+        '-crf', '23',  # Adjusted CRF to 23 to lower strain on encoding
+        '-g', '60',
+        '-keyint_min', '60',
+        '-sc_threshold', '0',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-ar', '44100',
+        '-f', 'flv',
+        full_rtmps_url
+    ]
+
+    logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
+
     try:
-        query = "SELECT rtmps_url, stream_key FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
-        values = {"stream_id": stream_id, "user_id": user_id}
-        result = await database.fetch_one(query=query, values=values)
-
-        if not result:
-            logger.error(
-                f"Stream not found for ID: {stream_id} and user ID: {user_id}")
-            raise HTTPException(status_code=404, detail="Stream not found")
-
-        rtmps_url = result['rtmps_url']
-        stream_key = result['stream_key']
-
-        full_rtmps_url = f"{rtmps_url}{stream_key}"
-
-        
-
-        ffmpeg_command = [
-            'ffmpeg',
-            '-f', 'avfoundation',
-            '-framerate', '30',
-            '-i', '0:0',
-            '-c:v', 'libx264',
-            '-preset', 'medium',  # 'medium' provides a better balance between quality and speed
-            '-tune', 'zerolatency',
-            '-b:v', '3500k',  # Increased bitrate for better quality
-            '-maxrate', '3500k',  # Matching the bitrate
-            '-bufsize', '7000k',  # Increased buffer size
-            '-vf', 'scale=640:360',  # Scaling to 720p
-            '-pix_fmt', 'yuv420p',
-            '-crf', '18',  # Constant rate factor for better quality control
-            '-g', '60',
-            '-keyint_min', '60',
-            '-sc_threshold', '0',
-            '-c:a', 'aac',
-            '-b:a', '192k',  # Increased audio bitrate for better audio quality
-            '-ar', '44100',
-            '-f', 'flv',
-            full_rtmps_url
-        ]
-
-        logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
-
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
         logger.info(f"FFmpeg process started with PID: {process.pid}")
-
-        try:
-            update_query = """
-            UPDATE livestreams
-            SET process_id = :process_id, status = 'live'
-            WHERE cloudflare_id = :stream_id AND user_id = :user_id
-            """
-            update_values = {"process_id": process.pid,
-                             "stream_id": stream_id, "user_id": user_id}
-            await database.execute(query=update_query, values=update_values)
-        except Exception as db_error:
-            logger.warning(
-                f"Failed to update process_id in database: {str(db_error)}")
-
-        asyncio.create_task(log_ffmpeg_output(process))
-
-        return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
-    except Exception as e:
-        logger.error(f"Failed to start stream: {str(e)}", exc_info=True)
+    except Exception as ffmpeg_error:
+        logger.error(f"Failed to start FFmpeg process: {str(ffmpeg_error)}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to start stream: {str(e)}")
+            status_code=500, detail="Failed to start FFmpeg process")
+
+    try:
+        update_query = """
+        UPDATE livestreams
+        SET process_id = :process_id, status = 'live'
+        WHERE id = :stream_id AND user_id = :user_id
+        """
+        update_values = {"process_id": process.pid,
+                         "stream_id": stream_id, "user_id": user_id}
+        logger.info(
+            f"Updating database with query: {update_query} and values: {update_values}")
+        await database.execute(query=update_query, values=update_values)
+    except Exception as db_error:
+        logger.error(f"Failed to update database: {str(db_error)}")
+        raise HTTPException(
+            status_code=500, detail="Failed to update stream status in database")
+
+    asyncio.create_task(log_ffmpeg_output(process))
+
+    return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
 
 
 async def log_ffmpeg_output(process):
@@ -191,7 +290,7 @@ async def stop_stream(
 
     try:
         # Fetch the process ID from the database
-        query = "SELECT process_id FROM livestreams WHERE cloudflare_id = :stream_id AND user_id = :user_id"
+        query = "SELECT process_id FROM livestreams WHERE id = :stream_id AND user_id = :user_id"
         values = {"stream_id": stream_id, "user_id": user_id}
         result = await database.fetch_one(query=query, values=values)
 
@@ -209,7 +308,7 @@ async def stop_stream(
             update_query = """
             UPDATE livestreams
             SET process_id = NULL, status = 'stopped'
-            WHERE cloudflare_id = :stream_id AND user_id = :user_id
+            WHERE id = :stream_id AND user_id = :user_id
             """
             await database.execute(query=update_query, values=values)
 
