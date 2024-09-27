@@ -30,44 +30,6 @@ FFMPEG_INPUT_METHOD = os.getenv('FFMPEG_INPUT_METHOD', 'auto')
 FFMPEG_VIDEO_INPUT = os.getenv('FFMPEG_VIDEO_INPUT', 'default')
 FFMPEG_AUDIO_INPUT = os.getenv('FFMPEG_AUDIO_INPUT', 'default')
 
-def get_ffmpeg_input_args():
-    system = platform.system().lower()
-    
-    if FFMPEG_INPUT_METHOD == 'auto':
-        if system == 'darwin':  # macOS
-            return [
-                '-f', 'avfoundation',
-                '-framerate', '30',
-                '-video_size', '1280x720',
-                '-i', '0:0',
-                '-pix_fmt', 'yuv420p'
-            ]
-        elif system == 'linux':
-            # Check for different video input devices
-            video_devices = ['/dev/video0', '/dev/video1', '/dev/video2']
-            for device in video_devices:
-                if os.path.exists(device):
-                    logger.info(f"Found video device: {device}")
-                    return ['-f', 'v4l2', '-i', device, '-f', 'alsa', '-i', 'default']
-            
-            # If no video device is found, fall back to test source
-            logger.warning("No video device found, using test source")
-            return [
-                '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
-                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
-            ]
-        elif system == 'windows':
-            return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
-    elif FFMPEG_INPUT_METHOD == 'custom':
-        return ['-f', FFMPEG_VIDEO_INPUT, '-i', FFMPEG_AUDIO_INPUT]
-    
-    # Fallback to test pattern with audio tone
-    return [
-        '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
-        '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
-    ]
-
-
 class StreamCreate(BaseModel):
     name: str
 
@@ -136,234 +98,47 @@ async def create_stream(stream: StreamCreate, current_user: dict = Depends(get_c
     }
 
 
-peer_connections = {}
-
-
-@router.post("/offer")
-async def handle_offer(offer: dict, current_user: dict = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    if 'sdp' not in offer or 'type' not in offer:
-        raise HTTPException(status_code=400, detail="Invalid offer format")
-
-    # Create a new RTCPeerConnection
-    pc = RTCPeerConnection()
-    #thing changes
-    # Store the peer connection in the dictionary
-    peer_connections[current_user['id']] = pc
-
-    # Set the remote description with the offer 
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=offer['sdp'], type=offer['type']))
-
-    # Create an answer
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    return JSONResponse(content={"answer": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}})
-
-
-@router.post("/ice-candidate")
-async def handle_ice_candidate(candidate: dict, current_user: dict = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    if 'candidate' not in candidate:
-        raise HTTPException(status_code=400, detail="Invalid candidate format")
-
-    pc = peer_connections.get(current_user['id'])
-    if not pc:
-        raise HTTPException(
-            status_code=404, detail="Peer connection not found")
-
-    # Add the ICE candidate to the peer connection
-    try:
-        await pc.addIceCandidate(RTCIceCandidate(candidate=candidate['candidate']))
-    except Exception as e:
-        logger.error(f"Failed to add ICE candidate: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail="Failed to add ICE candidate")
-
-    return JSONResponse(content={"status": "ok"})
-
- 
-
 @router.post("/start-stream/{stream_id}")
 async def start_stream(
     stream_id: str,
     database: Database = Depends(get_database),
     authorization: str = Header(...)
 ):
-    logger.info(f"Received request to start stream: {stream_id}")
-
     try:
         token = authorization.split(" ")[1]
         decoded_token = verify_token(token)
         user_id = decoded_token['uid']
-        logger.info(f"Authenticated user: {user_id}")
     except Exception as e:
-        logger.error(f"Authentication error: {str(e)}")
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
+
+    # Update the stream status to 'live'
+    update_query = """
+    UPDATE livestreams
+    SET status = 'live'
+    WHERE id = :stream_id AND user_id = :user_id
+    """
+    update_values = {"stream_id": stream_id, "user_id": user_id}
+    await database.execute(query=update_query, values=update_values)
+
+    return {"message": "Stream marked as live"}
+
+@router.get("/stream-info/{stream_id}")
+async def get_stream_info(
+    stream_id: str,
+    database: Database = Depends(get_database),
+    current_user: dict = Depends(get_current_user)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
     query = "SELECT rtmps_url, stream_key FROM livestreams WHERE id = :stream_id AND user_id = :user_id"
-    values = {"stream_id": stream_id, "user_id": user_id}
-    logger.info(f"Executing query: {query} with values: {values}")
+    values = {"stream_id": stream_id, "user_id": current_user['uid']}
     result = await database.fetch_one(query=query, values=values)
 
     if not result:
-        logger.error(
-            f"Stream not found for ID: {stream_id} and user ID: {user_id}")
         raise HTTPException(status_code=404, detail="Stream not found")
 
-    rtmps_url = result['rtmps_url']
-    stream_key = result['stream_key']
-    logger.info(
-        f"Retrieved stream info: RTMPS URL: {rtmps_url}, Stream Key: {stream_key}")
-
-    full_rtmps_url = f"{rtmps_url}{stream_key}"
-    logger.info(f"Full RTMPS URL: {full_rtmps_url}")
-
-    ffmpeg_input_args = get_ffmpeg_input_args()
-    
-    ffmpeg_command = [
-        'ffmpeg',
-        '-itsoffset', '0.5',  # Adjust this value as needed
-        *ffmpeg_input_args,
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-tune', 'zerolatency',
-        '-b:v', '2000k',
-        '-maxrate', '2500k',
-        '-bufsize', '2500k',
-        '-vf', 'scale=480:270',
-        '-pix_fmt', 'yuv420p',
-        '-g', '60',
-        '-keyint_min', '60',
-        '-sc_threshold', '0',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-ar', '44100',
-        '-f', 'flv',
-        full_rtmps_url
-    ]  
-
-    logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        logger.info(f"FFmpeg process started with PID: {process.pid}")
-    except Exception as ffmpeg_error:
-        logger.error(f"Failed to start FFmpeg process: {str(ffmpeg_error)}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to start FFmpeg process: {str(ffmpeg_error)}")
-
-    try:
-        update_query = """
-        UPDATE livestreams
-        SET process_id = :process_id, status = 'live'
-        WHERE id = :stream_id AND user_id = :user_id
-        """
-        update_values = {"process_id": process.pid,
-                         "stream_id": stream_id, "user_id": user_id}
-        logger.info(
-            f"Updating database with query: {update_query} and values: {update_values}")
-        await database.execute(query=update_query, values=update_values)
-    except Exception as db_error:
-        logger.error(f"Failed to update database: {str(db_error)}")
-        raise HTTPException(
-            status_code=500, detail="Failed to update stream status in database")
-
-    asyncio.create_task(monitor_ffmpeg_process(process, stream_id, user_id, database))
-
-    return {"message": "Stream started with test source", "process_id": process.pid}
-
-async def monitor_ffmpeg_process(process, stream_id, user_id, database):
-    await log_ffmpeg_output(process)
-    
-    # Check if the process ended prematurely
-    if process.returncode != 0:
-        logger.error(f"FFmpeg process for stream {stream_id} ended with return code {process.returncode}")
-        
-        # Update the database to mark the stream as stopped
-        update_query = """
-        UPDATE livestreams
-        SET process_id = NULL, status = 'stopped'
-        WHERE id = :stream_id AND user_id = :user_id
-        """
-        update_values = {"stream_id": stream_id, "user_id": user_id}
-        await database.execute(query=update_query, values=update_values)
-
-async def log_ffmpeg_output(process):
-    while True:
-        line = await process.stderr.readline()
-        if not line:
-            break
-        log_line = f"FFmpeg: {line.decode().strip()}"
-        logger.info(log_line)
-
-    # Capture any remaining output
-    remaining_output, _ = await process.communicate()
-    if remaining_output:
-        logger.info(f"Remaining FFmpeg output: {remaining_output.decode().strip()}")
-
-    return_code = await process.wait()
-    logger.info(f"FFmpeg process ended with return code: {return_code}")
-
-
-@router.post("/stop-stream/{stream_id}")
-async def stop_stream(
-    stream_id: str,
-    database: Database = Depends(get_database),
-    authorization: str = Header(...)
-):
-    try:
-        token = authorization.split(" ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    try:
-        # Fetch the process ID from the database
-        query = "SELECT process_id FROM livestreams WHERE id = :stream_id AND user_id = :user_id"
-        values = {"stream_id": stream_id, "user_id": user_id}
-        result = await database.fetch_one(query=query, values=values)
-
-        if not result or not result['process_id']:
-            raise HTTPException(
-                status_code=404, detail="Stream process not found")
-
-        process_id = result['process_id']
-
-        try:
-            process = psutil.Process(process_id)
-            process.terminate()
-
-            # Update the database to clear the process_id and set status to 'stopped'
-            update_query = """
-            UPDATE livestreams
-            SET process_id = NULL, status = 'stopped'
-            WHERE id = :stream_id AND user_id = :user_id
-            """
-            await database.execute(query=update_query, values=values)
-
-            return {"message": "Stream stopped"}
-        except psutil.NoSuchProcess:
-            # If the process is not found, just update the database
-            update_query = """
-            UPDATE livestreams
-            SET process_id = NULL, status = 'stopped'
-            WHERE cloudflare_id = :stream_id AND user_id = :user_id
-            """
-            await database.execute(query=update_query, values=values)
-            return {"message": "Stream process not found, database updated"}
-    except Exception as e:
-        logger.error(f"Failed to stop stream: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to stop stream: {str(e)}")
+    return {
+        "rtmps_url": result['rtmps_url'],
+        "stream_key": result['stream_key']
+    }
