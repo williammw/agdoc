@@ -226,13 +226,14 @@ async def start_stream(
         'ffmpeg',
         '-itsoffset', '0.5',  # Adjust this value as needed (in seconds)
         *ffmpeg_input_args,
+        '-use_wallclock_as_timestamps', '1',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
         '-b:v', '2000k',
         '-maxrate', '2500k',
         '-bufsize', '2500k',
-        '-vf', 'scale=480:270',
+        '-vf', 'scale=480:270,fps=30',
         '-pix_fmt', 'yuv420p',
         '-g', '60',
         '-keyint_min', '60',
@@ -240,7 +241,6 @@ async def start_stream(
         '-c:a', 'aac',
         '-b:a', '128k',
         '-ar', '44100',
-        '-af', 'asyncts=min_delta=0.001',
         '-vsync', '1',
         '-async', '1',
         '-f', 'flv',
@@ -283,11 +283,15 @@ async def start_stream(
 
 
 async def log_ffmpeg_output(process):
-    while True:
-        line = await process.stderr.readline()
-        if not line:
-            break
-        logger.info(f"FFmpeg: {line.decode().strip()}")
+    log_file = f"ffmpeg_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(log_file, 'w') as f:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            log_line = f"FFmpeg: {line.decode().strip()}"
+            logger.info(log_line)
+            f.write(log_line + '\n')
 
     await process.wait()
     logger.info(f"FFmpeg process ended with return code: {process.returncode}")
