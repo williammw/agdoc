@@ -43,14 +43,19 @@ def get_ffmpeg_input_args():
                 '-pix_fmt', 'yuv420p'
             ]
         elif system == 'linux':
-            # Check if we're running on a server without a camera
-            if not os.path.exists('/dev/video0'):
-                return [
-                    '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
-                    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
-                ]
-            else:
-                return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
+            # Check for different video input devices
+            video_devices = ['/dev/video0', '/dev/video1', '/dev/video2']
+            for device in video_devices:
+                if os.path.exists(device):
+                    logger.info(f"Found video device: {device}")
+                    return ['-f', 'v4l2', '-i', device, '-f', 'alsa', '-i', 'default']
+            
+            # If no video device is found, fall back to test source
+            logger.warning("No video device found, using test source")
+            return [
+                '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+            ]
         elif system == 'windows':
             return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
     elif FFMPEG_INPUT_METHOD == 'custom':
@@ -225,14 +230,13 @@ async def start_stream(
         'ffmpeg',
         '-itsoffset', '0.5',  # Adjust this value as needed
         *ffmpeg_input_args,
-        # '-use_wallclock_as_timestamps', '1',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
         '-b:v', '2000k',
         '-maxrate', '2500k',
         '-bufsize', '2500k',
-        '-vf', 'scale=480:270,fps=30',
+        '-vf', 'scale=480:270',
         '-pix_fmt', 'yuv420p',
         '-g', '60',
         '-keyint_min', '60',
@@ -240,8 +244,6 @@ async def start_stream(
         '-c:a', 'aac',
         '-b:a', '128k',
         '-ar', '44100',
-        '-vsync', '1',
-        '-async', '1',
         '-f', 'flv',
         full_rtmps_url
     ]  
