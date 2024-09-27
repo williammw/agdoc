@@ -182,14 +182,27 @@ async def start_rtmp_stream(pc: RTCPeerConnection, stream_id: str, database: Dat
         stderr=asyncio.subprocess.PIPE
     )
 
+    @pc.on("track")
+    def on_track(track):
+        logger.info(f"Received {track.kind} track")
+        if track.kind == "video":
+            asyncio.ensure_future(forward_track(track, process))
+
+    async def forward_track(track, process):
+        try:
+            while True:
+                frame = await track.recv()
+                if isinstance(frame, av.VideoFrame):
+                    packet = frame.to_ndarray().tobytes()
+                    if process.stdin:
+                        process.stdin.write(packet)
+                        await process.stdin.drain()
+        except Exception as e:
+            logger.error(f"Error forwarding track: {str(e)}")
+
     try:
-        while True:
-            frame = await pc.recv()
-            if isinstance(frame, av.VideoFrame):
-                packet = frame.to_ndarray().tobytes()
-                if process.stdin:
-                    process.stdin.write(packet)
-                    await process.stdin.drain()
+        # Wait for the FFmpeg process to complete
+        await process.wait()
     except Exception as e:
         logger.error(f"Error in RTMP stream: {str(e)}")
     finally:
