@@ -225,7 +225,7 @@ async def start_stream(
         'ffmpeg',
         '-itsoffset', '0.5',  # Adjust this value as needed
         *ffmpeg_input_args,
-        '-use_wallclock_as_timestamps', '1',
+        # '-use_wallclock_as_timestamps', '1',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
