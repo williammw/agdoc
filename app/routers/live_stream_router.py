@@ -236,7 +236,7 @@ async def start_stream(
         '-async', '1',
         '-f', 'flv',
         full_rtmps_url
-    ]
+    ]  
 
     logger.info(f"Executing FFmpeg command: {' '.join(ffmpeg_command)}")
 
