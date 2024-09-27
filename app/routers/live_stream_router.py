@@ -38,12 +38,19 @@ def get_ffmpeg_input_args():
             return [
                 '-f', 'avfoundation',
                 '-framerate', '30',
-                '-video_size', '1280x720',  # Adjust as needed
-                '-i', '0:0',  # '0' is usually the default camera, '1' is usually the default mic
+                '-video_size', '1280x720',
+                '-i', '0:0',
                 '-pix_fmt', 'yuv420p'
             ]
         elif system == 'linux':
-            return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
+            # Check if we're running on a server without a camera
+            if not os.path.exists('/dev/video0'):
+                return [
+                    '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+                    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+                ]
+            else:
+                return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
         elif system == 'windows':
             return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
     elif FFMPEG_INPUT_METHOD == 'custom':
@@ -51,8 +58,8 @@ def get_ffmpeg_input_args():
     
     # Fallback to test pattern with audio tone
     return [
-        '-f', 'lavfi', '-i', 'testsrc=size=480x270:rate=30',
-        '-f', 'lavfi', '-i', 'sine=frequency=1000:sample_rate=44100'
+        '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+        '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
     ]
 
 
@@ -216,6 +223,7 @@ async def start_stream(
     
     ffmpeg_command = [
         'ffmpeg',
+        '-itsoffset', '0.5',  # Adjust this value as needed
         *ffmpeg_input_args,
         '-use_wallclock_as_timestamps', '1',
         '-c:v', 'libx264',
@@ -250,7 +258,7 @@ async def start_stream(
     except Exception as ffmpeg_error:
         logger.error(f"Failed to start FFmpeg process: {str(ffmpeg_error)}")
         raise HTTPException(
-            status_code=500, detail="Failed to start FFmpeg process")
+            status_code=500, detail=f"Failed to start FFmpeg process: {str(ffmpeg_error)}")
 
     try:
         update_query = """
@@ -268,20 +276,41 @@ async def start_stream(
         raise HTTPException(
             status_code=500, detail="Failed to update stream status in database")
 
-    asyncio.create_task(log_ffmpeg_output(process))
+    asyncio.create_task(monitor_ffmpeg_process(process, stream_id, user_id, database))
 
-    return {"message": "Stream started with optimized 720p settings", "process_id": process.pid}
+    return {"message": "Stream started with test source", "process_id": process.pid}
 
+async def monitor_ffmpeg_process(process, stream_id, user_id, database):
+    await log_ffmpeg_output(process)
+    
+    # Check if the process ended prematurely
+    if process.returncode != 0:
+        logger.error(f"FFmpeg process for stream {stream_id} ended with return code {process.returncode}")
+        
+        # Update the database to mark the stream as stopped
+        update_query = """
+        UPDATE livestreams
+        SET process_id = NULL, status = 'stopped'
+        WHERE id = :stream_id AND user_id = :user_id
+        """
+        update_values = {"stream_id": stream_id, "user_id": user_id}
+        await database.execute(query=update_query, values=update_values)
 
 async def log_ffmpeg_output(process):
     while True:
         line = await process.stderr.readline()
         if not line:
             break
-        logger.info(f"FFmpeg: {line.decode().strip()}")
+        log_line = f"FFmpeg: {line.decode().strip()}"
+        logger.info(log_line)
 
-    await process.wait()
-    logger.info(f"FFmpeg process ended with return code: {process.returncode}")
+    # Capture any remaining output
+    remaining_output, _ = await process.communicate()
+    if remaining_output:
+        logger.info(f"Remaining FFmpeg output: {remaining_output.decode().strip()}")
+
+    return_code = await process.wait()
+    logger.info(f"FFmpeg process ended with return code: {return_code}")
 
 
 @router.post("/stop-stream/{stream_id}")
