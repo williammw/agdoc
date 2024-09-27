@@ -186,7 +186,7 @@ async def handle_ice_candidate(candidate: dict, current_user: dict = Depends(get
 
     return JSONResponse(content={"status": "ok"})
 
-
+ 
 
 @router.post("/start-stream/{stream_id}")
 async def start_stream(
