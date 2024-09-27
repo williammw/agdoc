@@ -300,3 +300,4 @@ async def remove_assets(
   except Exception as e:
     logger.error(f"Error deleting assets: {str(e)}")
     raise HTTPException(status_code=500, detail=f"Failed to delete assets: {str(e)}")
+

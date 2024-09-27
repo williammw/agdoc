@@ -43,7 +43,15 @@ def get_ffmpeg_input_args():
                 '-pix_fmt', 'yuv420p'
             ]
         elif system == 'linux':
-            return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
+            # Check if we're running in a server environment (e.g., DigitalOcean)
+            if not os.path.exists('/dev/video0'):
+                # Use test sources for both video and audio
+                return [
+                    '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+                    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+                ]
+            else:
+                return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
         elif system == 'windows':
             return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
     elif FFMPEG_INPUT_METHOD == 'custom':
@@ -216,6 +224,7 @@ async def start_stream(
     
     ffmpeg_command = [
         'ffmpeg',
+        '-itsoffset', '0.5',  # Adjust this value as needed (in seconds)
         *ffmpeg_input_args,
         '-c:v', 'libx264',
         '-preset', 'veryfast',
@@ -231,6 +240,9 @@ async def start_stream(
         '-c:a', 'aac',
         '-b:a', '128k',
         '-ar', '44100',
+        '-af', 'asyncts=min_delta=0.001',
+        '-vsync', '1',
+        '-async', '1',
         '-f', 'flv',
         full_rtmps_url
     ]
