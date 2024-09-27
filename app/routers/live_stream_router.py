@@ -43,15 +43,7 @@ def get_ffmpeg_input_args():
                 '-pix_fmt', 'yuv420p'
             ]
         elif system == 'linux':
-            # Check if we're running in a server environment (e.g., DigitalOcean)
-            if not os.path.exists('/dev/video0'):
-                # Use test sources for both video and audio
-                return [
-                    '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
-                    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
-                ]
-            else:
-                return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
+            return ['-f', 'v4l2', '-i', '/dev/video0', '-f', 'alsa', '-i', 'default']
         elif system == 'windows':
             return ['-f', 'dshow', '-i', 'video=Integrated Camera:audio=Microphone Array']
     elif FFMPEG_INPUT_METHOD == 'custom':
@@ -224,7 +216,6 @@ async def start_stream(
     
     ffmpeg_command = [
         'ffmpeg',
-        '-itsoffset', '0.5',  # Adjust this value as needed (in seconds)
         *ffmpeg_input_args,
         '-use_wallclock_as_timestamps', '1',
         '-c:v', 'libx264',
@@ -283,15 +274,11 @@ async def start_stream(
 
 
 async def log_ffmpeg_output(process):
-    log_file = f"ffmpeg_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(log_file, 'w') as f:
-        while True:
-            line = await process.stderr.readline()
-            if not line:
-                break
-            log_line = f"FFmpeg: {line.decode().strip()}"
-            logger.info(log_line)
-            f.write(log_line + '\n')
+    while True:
+        line = await process.stderr.readline()
+        if not line:
+            break
+        logger.info(f"FFmpeg: {line.decode().strip()}")
 
     await process.wait()
     logger.info(f"FFmpeg process ended with return code: {process.returncode}")
