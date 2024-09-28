@@ -120,11 +120,12 @@ async def handle_offer(offer: dict, current_user: dict = Depends(get_current_use
     async def on_track(track):
         logger.info(f"Received track: {track.kind}")
         if track.kind == "video":
+            logger.info(f"Video track received. ID: {track.id}, readyState: {track.readyState}")
             # Start streaming to Cloudflare here
             logger.info("Starting stream to Cloudflare")
-            asyncio.create_task(stream_to_cloudflare(
-                current_user['uid'], track, database))
+            asyncio.create_task(stream_to_cloudflare(current_user['uid'], track, database))
         elif track.kind == "audio":
+            logger.info(f"Audio track received. ID: {track.id}, readyState: {track.readyState}")
             # For now, we're not handling audio. You can add audio support later if needed.
             logger.info("Received audio track, but not processing it yet.")
 
@@ -187,20 +188,19 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
         '-s', '640x480',  # Adjust this to match your video resolution
         '-r', '30',  # Adjust this to match your frame rate
         '-i', 'pipe:0',
-        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-b:v', '2500k',
-        '-maxrate', '2500k',
-        '-bufsize', '5000k',
+        '-preset', 'ultrafast',  # Changed from veryfast to ultrafast for lower latency
+        '-tune', 'zerolatency',  # Added for streaming
+        '-b:v', '1500k',  # Reduced bitrate
+        '-maxrate', '1500k',
+        '-bufsize', '3000k',
         '-pix_fmt', 'yuv420p',
-        '-g', '60',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-ar', '44100',
+        '-g', '30',  # Changed from 60 to 30 (1 second at 30 fps)
         '-f', 'flv',
         full_rtmps_url
     ]
+
+    logger.info(f"FFmpeg command: {' '.join(command)}")
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -211,28 +211,28 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
 
     try:
         frame_count = 0
+        start_time = asyncio.get_event_loop().time()
         while True:
             try:
                 frame = await track.recv()
                 frame_count += 1
-                if frame_count % 100 == 0:
-                    logger.info(f"Processed {frame_count} frames for user {user_id}")
+                if frame_count % 30 == 0:  # Log every second (assuming 30 fps)
+                    current_time = asyncio.get_event_loop().time()
+                    elapsed_time = current_time - start_time
+                    fps = frame_count / elapsed_time
+                    logger.info(f"Processed {frame_count} frames for user {user_id}. FPS: {fps:.2f}")
 
                 if process.stdin.is_closing():
-                    logger.info("FFmpeg process stdin is closing")
+                    logger.error("FFmpeg process stdin is closing")
                     break
 
-                # Convert the frame to the correct format
                 if isinstance(frame, av.VideoFrame):
                     img = frame.to_ndarray(format="yuv420p")
-                    logger.debug(f"Frame shape: {img.shape}, dtype: {img.dtype}")
                     process.stdin.write(img.tobytes())
-                    logger.debug(f"Wrote frame {frame_count} to FFmpeg")
+                    await process.stdin.drain()
                 elif isinstance(frame, av.AudioFrame):
-                    # If you want to add audio support later, you can handle it here
+                    # We're not handling audio for now
                     pass
-
-                await process.stdin.drain()
 
             except asyncio.CancelledError:
                 logger.info(f"Streaming cancelled for user {user_id}")
@@ -240,6 +240,7 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
             except Exception as e:
                 logger.error(f"Error processing frame: {str(e)}")
                 break
+
     except BrokenPipeError:
         logger.error(f"Broken pipe error for user {user_id}. FFmpeg process may have terminated.")
     except Exception as e:
@@ -252,6 +253,8 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
         logger.info(f"FFmpeg process finished. Exit code: {process.returncode}")
         logger.info(f"FFmpeg stdout: {stdout.decode()}")
         logger.error(f"FFmpeg stderr: {stderr.decode()}")
+
+    logger.info(f"Streaming ended for user {user_id}")
 
 @router.post("/ice-candidate")
 async def handle_ice_candidate(candidate: dict, current_user: dict = Depends(get_current_user)):
