@@ -187,13 +187,17 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
         '-s', '640x480',  # Adjust this to match your video resolution
         '-r', '30',  # Adjust this to match your frame rate
         '-i', 'pipe:0',
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-b:v', '2500k',
         '-maxrate', '2500k',
-        '-bufsize', '2500k',
+        '-bufsize', '5000k',
         '-pix_fmt', 'yuv420p',
-        '-g', '30',
+        '-g', '60',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-ar', '44100',
         '-f', 'flv',
         full_rtmps_url
     ]
@@ -221,7 +225,9 @@ async def stream_to_cloudflare(user_id: str, track: MediaStreamTrack, database: 
                 # Convert the frame to the correct format
                 if isinstance(frame, av.VideoFrame):
                     img = frame.to_ndarray(format="yuv420p")
+                    logger.debug(f"Frame shape: {img.shape}, dtype: {img.dtype}")
                     process.stdin.write(img.tobytes())
+                    logger.debug(f"Wrote frame {frame_count} to FFmpeg")
                 elif isinstance(frame, av.AudioFrame):
                     # If you want to add audio support later, you can handle it here
                     pass
