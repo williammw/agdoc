@@ -18,7 +18,7 @@ import logging
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(lifespan=app_lifespan)
+app = FastAPI(lifespan=app_lifespan, debug=True)
 logger = logging.getLogger(__name__)
 
 # CORS configuration
@@ -62,6 +62,7 @@ router_list = [
     (posts_router, "/api/v1/posts", ["posts"]),
     (comment_router, "/api/v1/comments", ["comments"]),
     (videos_router, "/api/v1/videos", ["videos"]),
+    # (webrtc_router, "/webrtc", ["webrtc"]),
     # (recognize_router, "/api/v1/recognize", ["recognition"]),
     # (search_router, "/api/v1/search", ["search"]),
 ]
@@ -102,7 +103,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 @app.get("/")
 async def greeting():
-    return {"message": "Nothing to see here. v0.2.0"}
+    return {"message": "Nothing to see here. v0.2.1"}
 
 
 @app.get("/check-ffmpeg")
