@@ -6,7 +6,7 @@ import uuid
 from urllib.parse import urlparse
 from datetime import datetime
 import tempfile
-
+import logging
 
 def get_r2_client():
     return boto3.client(
@@ -18,7 +18,7 @@ def get_r2_client():
     )
 
 
-async def upload_to_r2(file: UploadFile, user_id: str):
+async def upload_to_r2(file: UploadFile, user_id: str) -> dict:
     r2_client = get_r2_client()
     bucket_name = os.getenv('R2_BUCKET_NAME')
     now = datetime.now()
@@ -41,11 +41,10 @@ async def upload_to_r2(file: UploadFile, user_id: str):
         )
 
         # Construct the URL for the uploaded file
-        file_url = f"https://{os.getenv('R2_DEV_URL')}/{unique_filename}"
-
-        return {"url": file_url}
+        url = f"https://{os.getenv('R2_DEV_URL')}/{unique_filename}"
+        return {"url": url, "content_type": file.content_type}
     except ClientError as e:
-        print(f"Error uploading file to R2: {e}")
+        logging.error(f"Failed to upload file to R2: {str(e)}")
         raise
 
 

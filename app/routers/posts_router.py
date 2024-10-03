@@ -7,7 +7,7 @@ import asyncpg
 from fastapi.logger import logger
 from fastapi import Form, HTTPException
 from fastapi import Form
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Header, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Header, Query, BackgroundTasks, Request
 from app.dependencies import get_current_user, get_database, verify_token
 from databases import Database
 from pydantic import BaseModel, constr, HttpUrl
@@ -36,9 +36,18 @@ from app.utils.cloudflare import delete_file_from_r2, upload_to_r2
 # from app.utils.cloudflare import upload_to_cloudflare
 
 
+from pydantic import BaseModel
+from app.models.modelapp import SharedPostResponse, SharedPostCreate, SharedPostResponse, PostResponse, CommentResponse, MediaItem, User, UserInteraction, UserInteractionResponse, PostResponseWithMedia, ReportCreate, ReportResponse
+from app.routers.videos_router import upload_and_convert_video
+
+class SharedPostCreate(BaseModel):
+    # Add the fields you need for creating a shared post
+    original_post_id: int
+    # Add other fields as necessary
+
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
 
 
 # Initialize S3 client
@@ -49,6 +58,7 @@ s3 = boto3.client(
     aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
     region_name='weur'
 )
+bucket_name = 'umami'
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -78,6 +88,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 async def upload_media(file: UploadFile, user_id: str, dimensions: dict) -> dict:
     try:
         r2_response = await upload_to_r2(file, user_id)
+        if not r2_response.get('url'):
+            raise ValueError("No URL returned from R2 upload")
         return {
             'url': r2_response['url'],
             'type': file.content_type,
@@ -90,47 +102,10 @@ async def upload_media(file: UploadFile, user_id: str, dimensions: dict) -> dict
         raise
 
 
-class PostCreate(BaseModel):
-    content: constr(max_length=5000)  # type: ignore # Limit content length
 
 
-class MediaItem(BaseModel):
-    id: int
-    media_url: str
-    media_type: str
-    order_index: int
-    width: Optional[int]
-    height: Optional[int]
-    aspect_ratio: Optional[float]
-
-
-class User(BaseModel):
-    username: str
-    avatar_url: Optional[str] = None
-
-class PostResponse(BaseModel):
-    id: str
-    user_id: str
-    content: str
-    privacy_setting: str
-    created_at: datetime
-    updated_at: datetime
-    likes_count: int = 0
-    comments_count: int = 0
-    media: List[MediaItem] = []
-    liked_by_user: bool
-
-    class Config:
-        # orm_mode = True
-        from_attributes = True
-        # json_encoders = {
-        #     datetime: lambda v: v.isoformat()
-        # }
-
-
-
-
-ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'} # Allowed image file extensions
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png',
+                      '.gif', '.webp'}  # Allowed image file extensions
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
@@ -223,27 +198,6 @@ async def get_post_detail(post_id: str, current_user: dict = Depends(get_current
 
 
 
-# @router.get("/", response_model=List[PostResponse])
-# async def get_posts(
-#     skip: int = Query(0, ge=0),
-#     limit: int = Query(10, ge=1, le=100),
-#     authorization: str = Header(...),
-#     db: Database = Depends(get_database)
-# ):
-#     try:
-#         # Verify token
-#         token = authorization.split("Bearer ")[1]
-#         verify_token(token)
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=401, detail="Invalid authorization token")
-
-#     query = "SELECT * FROM posts ORDER BY created_at DESC LIMIT :limit OFFSET :skip"
-#     results = await db.fetch_all(query=query, values={"skip": skip, "limit": limit})
-
-#     return [PostResponse(**result) for result in results]
-
-
 class PostUpdate(BaseModel):
     content: constr(max_length=5000)
 
@@ -325,6 +279,7 @@ async def update_post_privacy(
 
     return updated_post
 
+
 @router.delete("/{post_id}")
 async def delete_post(post_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
     async with db.transaction():
@@ -354,9 +309,6 @@ async def delete_post(post_id: str, current_user: dict = Depends(get_current_use
                 status_code=500, detail="An error occurred while deleting the post and media")
 
 
-
-
-
 # ... (keep existing imports and configurations)
 
 
@@ -373,10 +325,7 @@ class CommentResponse(BaseModel):
     updated_at: datetime
 
 
-
-
 # ... (keep existing functions like validate_image)
-
 
 
 @router.post("/{post_id}/comments", response_model=CommentResponse)
@@ -458,432 +407,6 @@ async def get_user_posts(
     db: Database = Depends(get_database)
 ):
     try:
-        # Verify token and get current user
-        token = authorization.split("Bearer ")[1]
-        current_user = verify_token(token)
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    # First, get the user_id from the username
-    user_query = "SELECT id FROM users WHERE username = :username"
-    user = await db.fetch_one(user_query, values={"username": username})
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    user_id = user['id']
-
-    # Check if the current user is authorized to view all posts
-    logger.info(f"current['uid']: {current_user['uid']} user_id: {user_id}")
-
-    is_own_profile = current_user['uid'] == user_id
-
-    query = """
-    SELECT p.*, 
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id, 
-                   'media_url', pm.media_url, 
-                   'media_type', pm.media_type,
-                   'order_index', pm.order_index,
-                   'aspect_ratio', pm.aspect_ratio,
-                   'width', pm.width,
-                   'height', pm.height,
-                   'cloudflare_info', pm.cloudflare_info
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
-    FROM posts p
-    LEFT JOIN post_media pm ON p.id = pm.post_id
-    WHERE p.user_id = :user_id 
-    """
-
-    if not is_own_profile:
-        query += " AND p.visibility = 'public'"
-
-    query += """
-    GROUP BY p.id
-    ORDER BY p.created_at DESC 
-    LIMIT :limit OFFSET :skip
-    """
-
-    results = await db.fetch_all(query=query, values={
-        "user_id": user_id,
-        "skip": skip,
-        "limit": limit
-    })
-
-    return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
-
-
-class PostDetailResponse(BaseModel):
-    id: str
-    user_id: str
-    username: str
-    content: str
-    created_at: datetime
-    updated_at: datetime
-    likes_count: int = 0
-    comments_count: int = 0
-    media: List[MediaItem] = []
-
-    class Config:
-        from_attributes = True
-
-
-@router.get("/user/{username}/post/{post_id}", response_model=PostDetailResponse)
-async def get_post_detail(
-    username: str,
-    post_id: str,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        current_user = verify_token(token)
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    query = """
-    SELECT p.*, u.username,
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id, 
-                   'media_url', pm.media_url, 
-                   'media_type', pm.media_type,
-                   'order_index', pm.order_index,
-                   'aspect_ratio', pm.aspect_ratio,
-                   'width', pm.width,
-                   'height', pm.height,
-                   'cloudflare_info', pm.cloudflare_info
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media
-    FROM posts p
-    LEFT JOIN post_media pm ON p.id = pm.post_id
-    JOIN users u ON p.user_id = u.id
-    WHERE u.username = :username AND p.id = :post_id 
-    GROUP BY p.id, u.username
-    """
-
-    result = await db.fetch_one(query=query, values={
-        "username": username,
-        "post_id": post_id
-    })
-    
-    print('*********************************************')
-    print('*********************************************')
-    print(query)
-    # print(values)
-    print('*********************************************')
-    print('*********************************************')
-    if not result:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    post_data = dict(result)
-    post_data['media'] = json.loads(post_data['media'])
-    return PostDetailResponse(**post_data)
-
-
-
-class NotificationResponse(BaseModel):
-    id: str
-    type: str
-    content: str
-    related_id: Optional[str]
-    is_read: bool
-    created_at: datetime
-
-# ... (keep existing model classes)
-
-
-async def create_notification(db: Database, user_id: str, type: str, content: str, related_id: Optional[str] = None):
-    notification_id = str(uuid.uuid4())[:28]
-    query = """
-    INSERT INTO notifications (id, user_id, type, content, related_id, created_at)
-    VALUES (:id, :user_id, :type, :content, :related_id, :created_at)
-    """
-    values = {
-        "id": notification_id,
-        "user_id": user_id,
-        "type": type,
-        "content": content,
-        "related_id": related_id,
-        "created_at": datetime.now()
-    }
-    await db.execute(query, values=values)
-
-# ... (keep existing functions)
-
-
-
-
-
-
-@router.put("/comments/{comment_id}", response_model=CommentResponse)
-async def update_comment(
-    comment_id: str,
-    comment_update: CommentCreate,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    sanitized_content = bleach.clean(comment_update.content)
-
-    query = """
-    UPDATE comments 
-    SET content = :content, updated_at = :updated_at
-    WHERE id = :comment_id AND user_id = :user_id
-    RETURNING *
-    """
-    values = {
-        "comment_id": comment_id,
-        "user_id": user_id,
-        "content": sanitized_content,
-        "updated_at": datetime.utcnow()
-    }
-
-    updated_comment = await db.fetch_one(query, values=values)
-
-    if not updated_comment:
-        raise HTTPException(
-            status_code=404, detail="Comment not found or you don't have permission to update it")
-
-    return CommentResponse(**updated_comment)
-
-
-@router.delete("/comments/{comment_id}", status_code=204)
-async def delete_comment(
-    comment_id: str,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    async with db.transaction():
-        # Get the post_id before deleting the comment
-        post_query = "SELECT post_id FROM comments WHERE id = :comment_id"
-        comment = await db.fetch_one(post_query, values={"comment_id": comment_id})
-
-        if not comment:
-            raise HTTPException(status_code=404, detail="Comment not found")
-
-        delete_query = "DELETE FROM comments WHERE id = :comment_id AND user_id = :user_id"
-        result = await db.execute(delete_query, values={"comment_id": comment_id, "user_id": user_id})
-
-        if result == 0:
-            raise HTTPException(
-                status_code=404, detail="Comment not found or you don't have permission to delete it")
-
-        # Update comment count on the post
-        update_query = """
-        UPDATE posts SET comments_count = comments_count - 1
-        WHERE id = :post_id
-        """
-        await db.execute(update_query, values={"post_id": comment['post_id']})
-
-    return None  # 204 No Content
-
-
-@router.get("/feed", response_model=List[PostResponse], operation_id="get_feed")
-async def get_feed(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    # This is a basic feed algorithm. It gets posts from users that the current user follows,
-    # as well as the user's own posts, ordered by creation time.
-    query = """
-    SELECT p.* FROM posts p
-    JOIN user_followers uf ON p.user_id = uf.followed_id
-    WHERE uf.follower_id = :user_id
-    UNION
-    SELECT * FROM posts WHERE user_id = :user_id
-    ORDER BY created_at DESC
-    LIMIT :limit OFFSET :skip
-    """
-    posts = await db.fetch_all(query, values={"user_id": user_id, "limit": limit, "skip": skip})
-
-    return [PostResponse(**post) for post in posts]
-
-
-@router.get("/notifications", response_model=List[NotificationResponse])
-async def get_notifications(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    query = """
-    SELECT * FROM notifications
-    WHERE user_id = :user_id
-    ORDER BY created_at DESC
-    LIMIT :limit OFFSET :skip
-    """
-    notifications = await db.fetch_all(query, values={"user_id": user_id, "limit": limit, "skip": skip})
-
-    return [NotificationResponse(**notification) for notification in notifications]
-
-
-@router.post("/notifications/{notification_id}/read", response_model=NotificationResponse)
-async def mark_notification_as_read(
-    notification_id: str,
-    authorization: str = Header(...),
-    db: Database = Depends(get_database)
-):
-    try:
-        token = authorization.split("Bearer ")[1]
-        decoded_token = verify_token(token)
-        user_id = decoded_token['uid']
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    query = """
-    UPDATE notifications
-    SET is_read = TRUE
-    WHERE id = :notification_id AND user_id = :user_id
-    RETURNING *
-    """
-    updated_notification = await db.fetch_one(query, values={"notification_id": notification_id, "user_id": user_id})
-
-    if not updated_notification:
-        raise HTTPException(
-            status_code=404, detail="Notification not found or you don't have permission to update it")
-
-    return NotificationResponse(**updated_notification)
-
-
-class SharedPostCreate(BaseModel):
-    original_post_id: str
-    content: Optional[constr(max_length=1000)]
-
-
-class SharedPostResponse(BaseModel):
-    id: str
-    user_id: str
-    original_post_id: str
-    content: Optional[str]
-    created_at: datetime
-    original_post: PostResponse
-
-
-class RichMedia(BaseModel):
-    type: str  # 'link', 'video', 'image'
-    url: HttpUrl
-    title: Optional[str]
-    description: Optional[str]
-    thumbnail: Optional[HttpUrl]
-
-
-class PostCreateWithMedia(PostCreate):
-    rich_media: Optional[RichMedia]
-
-
-class PostResponseWithMedia(BaseModel):
-    id: str
-    user_id: str
-    content: str
-    image_url: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-    likes_count: Optional[int] = 0
-    comments_count: Optional[int] = 0
-    rich_media: Optional[dict] = None  # Changed from RichMedia to dict
-
-    class Config:
-        from_attributes = True
-
-# ... (keep existing functions)
-
-
-def extract_rich_media(content: str) -> Optional[RichMedia]:
-    urls = re.findall(r'(https?://\S+)', content)
-    if not urls:
-        return None
-
-    url = urls[0]
-    try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        og_title = soup.find('meta', property='og:title')
-        og_description = soup.find('meta', property='og:description')
-        og_image = soup.find('meta', property='og:image')
-        og_type = soup.find('meta', property='og:type')
-
-        media_type = 'link'
-        if og_type:
-            if og_type['content'] == 'video':
-                media_type = 'video'
-            elif og_type['content'] == 'image':
-                media_type = 'image'
-
-        return RichMedia(
-            type=media_type,
-            url=url,
-            title=og_title['content'] if og_title else None,
-            description=og_description['content'] if og_description else None,
-            thumbnail=og_image['content'] if og_image else None
-        )
-    except Exception as e:
-        print(f"Error extracting rich media: {str(e)}")
-        return None
-
-
-from fastapi import Form, File, UploadFile, Header, HTTPException, BackgroundTasks, Request
-from typing import List, Optional
-import json
-import logging
-import uuid
-from datetime import datetime
-import bleach
-
-logger = logging.getLogger(__name__)
-
-@router.post("/", response_model=dict)
-async def create_post(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    content: str = Form(...),
-    privacy_setting: str = Form("public"),
-    media_count: int = Form(...),
-    authorization: str = Header(...),
-    db: Database = Depends(get_database),
-):
-    try:
         # Verify token
         token = authorization.split("Bearer ")[1]
         decoded_token = verify_token(token)
@@ -930,6 +453,7 @@ async def create_post(
         }
         post_result = await db.fetch_one(query=post_query, values=post_values)
         logger.info(f"Post inserted: {post_id}")
+        logger.info(f"MEDIA INFO: {media_data}")
 
         # Insert media
         if media_data:
@@ -949,7 +473,8 @@ async def create_post(
                     "cloudflare_info": json.dumps(media_info) if media_info['type'] == 'video' else None
                 }
                 await db.execute(query=media_query, values=media_values)
-            logger.info(f"Inserted {len(media_data)} media entries for post {post_id}")
+            logger.info(
+                f"Inserted {len(media_data)} media entries for post {post_id}")
 
         # Fetch media for response
         media_result = await db.fetch_all(
@@ -967,7 +492,8 @@ async def create_post(
 
     except Exception as e:
         logger.error(f"Error creating post: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create post: {str(e)}")
 
 
 @router.post("/share", response_model=SharedPostResponse)
@@ -1221,7 +747,6 @@ async def update_post_analytics(db: Database, post_id: str, view_increment: int 
         logger.error(traceback.format_exc())
 
 
-
 @router.post("/report", response_model=ReportResponse)
 async def report_content(
     report: ReportCreate,
@@ -1354,57 +879,35 @@ async def get_posts_by_hashtag(
 @router.get("/{user_id}/all", response_model=List[PostResponse])
 async def get_all_user_posts(
     user_id: str,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
-    authorization: str = Header(...),
+    current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    
-    try:
-        # Verify token and get current user
-        token = authorization.split("Bearer ")[1]
-        current_user = verify_token(token)
-    except Exception as e:
-        raise HTTPException(
-            status_code=401, detail="Invalid authorization token")
-
-    # Check if the current user is authorized to view all posts
     logger.info(f"current['uid']: {current_user['uid']} user_id: {user_id}")
-    
     if current_user['uid'] != user_id:
-        raise HTTPException(
-            status_code=403, detail="Not authorized to view all posts")
+        raise HTTPException(status_code=403, detail="Not authorized to view these posts")
 
     query = """
     SELECT p.*, 
-        COALESCE(json_agg(
-            json_build_object(
-                'id', pm.id, 
-                'media_url', pm.media_url, 
-                'media_type', pm.media_type,
-                'order_index', pm.order_index,
-                'aspect_ratio', pm.aspect_ratio,
-                'width', pm.width,
-                'height', pm.height,
-                'cloudflare_info', pm.cloudflare_info
-            ) ORDER BY pm.order_index
-        ) FILTER (WHERE pm.id IS NOT NULL), '[]') AS media,
-        CASE WHEN l.user_id IS NOT NULL THEN TRUE ELSE FALSE END as liked_by_user,
-        COALESCE(p.likes_count, 0) as likes_count
+           COALESCE(json_agg(
+               json_build_object(
+                   'id', pm.id,
+                   'media_url', pm.media_url,
+                   'media_type', pm.media_type,
+                   'width', pm.width,
+                   'height', pm.height,
+                   'aspect_ratio', pm.aspect_ratio,
+                   'cloudflare_info', pm.cloudflare_info,
+                   'status', COALESCE(pm.status, 'completed'),
+                   'task_id', pm.task_id
+               ) ORDER BY pm.order_index
+           ) FILTER (WHERE pm.id IS NOT NULL), '[]'::json) as media
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
-    LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = :current_user_id
-    WHERE p.user_id = :user_id 
-    GROUP BY p.id, l.user_id
-    ORDER BY p.created_at DESC 
-    LIMIT :limit OFFSET :skip
+    WHERE p.user_id = :user_id
+    GROUP BY p.id
+    ORDER BY p.created_at DESC
     """
-    results = await db.fetch_all(query=query, values={
-        "user_id": user_id,
-        "current_user_id": current_user['uid'],
-        "skip": skip,
-        "limit": limit
-    })
+    results = await db.fetch_all(query=query, values={"user_id": user_id})
 
     return [PostResponse(**{**result, 'media': json.loads(result['media'])}) for result in results]
 
@@ -1525,8 +1028,6 @@ async def get_posts(
         'liked_by_user': result['liked_by_user'],
         'likes_count': result['likes_count']
     }) for result in results]
-
-
 
 
 @router.get("/feed", response_model=List[PostResponse])
@@ -1676,3 +1177,186 @@ async def check_post_liked(post_id: str, current_user: dict = Depends(get_curren
     query = "SELECT 1 FROM likes WHERE post_id = :post_id AND user_id = :user_id"
     result = await db.fetch_one(query=query, values={"post_id": post_id, "user_id": current_user["id"]})
     return {"liked": result is not None}
+
+
+async def process_video_upload(db: Database, user_id: str, file: UploadFile, post_id: str):
+    try:
+        # Call the upload_and_convert_video function
+        result = await upload_and_convert_video(BackgroundTasks(), file, user_id, db)
+        
+        # Extract the task_id from the JSONResponse
+        response_content = json.loads(result.body.decode('utf-8'))
+        task_id = response_content.get("task_id")
+        
+        if not task_id:
+            raise ValueError("Task ID not found in the response")
+        
+        # Update the post with the task_id
+        update_query = """
+        UPDATE posts SET video_processing_task_id = :task_id, status = 'processing'
+        WHERE id = :post_id
+        """
+        await db.execute(update_query, {"task_id": task_id, "post_id": post_id})
+        
+        return response_content
+        
+    except Exception as e:
+        logger.error(f"Error processing video upload: {str(e)}")
+        # Update post status to indicate error
+        error_update_query = """
+        UPDATE posts SET status = 'error', error_message = :error_message
+        WHERE id = :post_id
+        """
+        await db.execute(error_update_query, {"error_message": str(e), "post_id": post_id})
+        raise
+
+
+@router.post("/", response_model=PostResponse)
+async def create_post(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    authorization: str = Header(...),
+    db: Database = Depends(get_database),
+):
+    try:
+        token = authorization.split("Bearer ")[1]
+        decoded_token = verify_token(token)
+        user_id = decoded_token['uid']
+
+        form_data = await request.form()
+        
+        content = form_data.get('content', '')
+        privacy_setting = form_data.get('privacy_setting', 'public')
+        
+        post_id = str(uuid.uuid4())[:28]
+        sanitized_content = bleach.clean(content)
+
+        media_data = []
+        media_count = int(form_data.get('media_count', 0))
+
+        async with db.transaction():
+            # Insert post
+            post_query = """
+            INSERT INTO posts (id, user_id, content, privacy_setting, created_at, updated_at, status)
+            VALUES (:id, :user_id, :content, :privacy_setting, :created_at, :updated_at, :status)
+            RETURNING *
+            """
+            post_values = {
+                "id": post_id,
+                "user_id": user_id,
+                "content": sanitized_content,
+                "privacy_setting": privacy_setting,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+                "status": "processing"  # Initial status
+            }
+            post_result = await db.fetch_one(query=post_query, values=post_values)
+
+            for i in range(media_count):
+                media_file = form_data.get(f'media_{i}')
+                if media_file:
+                    if media_file.content_type.startswith('video'):
+                        # For video files, prepare for background processing
+                        task_id = str(uuid.uuid4())
+                        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                        unique_id = str(uuid.uuid4())
+                        original_file_extension = os.path.splitext(media_file.filename)[1]
+                        original_filename = f"{timestamp}_{unique_id}{original_file_extension}"
+                        mp4_filename = f"{timestamp}_{unique_id}.mp4"
+                        thumbnail_filename = f"{timestamp}_{unique_id}_thumbnail.jpg"
+                        folder = f"media/{datetime.now().strftime('%Y/%m/%d')}"
+                        original_file_key = f"{folder}/{original_filename}"
+                        mp4_file_key = f"{folder}/{mp4_filename}"
+                        thumbnail_file_key = f"{folder}/{thumbnail_filename}"
+
+                        # Upload the original file to R2
+                        s3.upload_fileobj(
+                            media_file.file,
+                            bucket_name,
+                            original_file_key,
+                            ExtraArgs={"ContentType": media_file.content_type, "ACL": "public-read"}
+                        )
+
+                        # Create a new task in the process_tasks table
+                        task_query = """
+                        INSERT INTO process_tasks (id, related_id, user_id, task_type, status, progress)
+                        VALUES (:id, :related_id, :user_id, :task_type, :status, :progress)
+                        """
+                        task_values = {
+                            "id": task_id,
+                            "related_id": post_id,  # Changed from user_id to post_id
+                            "user_id": user_id,     # Added user_id
+                            "task_type": "video_conversion",
+                            "status": "pending",
+                            "progress": 0
+                        }
+                        await db.execute(task_query, task_values)
+
+                        # Add the background task
+                        background_tasks.add_task(
+                            upload_and_convert_video,
+                            db,
+                            task_id,
+                            original_file_key,
+                            mp4_file_key,
+                            thumbnail_file_key
+                        )
+
+                        media_data.append({
+                            'type': 'video',
+                            'task_id': task_id,
+                            'status': 'processing',
+                            'url': original_file_key
+                        })
+                    else:
+                        # For image files, process as before
+                        media_info = await upload_media(media_file, user_id, {})
+                        media_data.append(media_info)
+
+            # Insert media
+            if media_data:
+                media_query = """
+                INSERT INTO post_media (post_id, media_url, media_type, order_index, width, height, aspect_ratio, cloudflare_info, status, task_id)
+                VALUES (:post_id, :media_url, :media_type, :order_index, :width, :height, :aspect_ratio, :cloudflare_info, :status, :task_id)
+                RETURNING id
+                """
+                for index, media_info in enumerate(media_data):
+                    media_values = {
+                        "post_id": post_id,
+                        "media_url": media_info.get('url'),
+                        "media_type": media_info['type'],
+                        "order_index": index,
+                        "width": media_info.get('width'),
+                        "height": media_info.get('height'),
+                        "aspect_ratio": media_info.get('width') / media_info.get('height') if media_info.get('width') and media_info.get('height') else None,
+                        "cloudflare_info": json.dumps(media_info) if media_info['type'] == 'video' else None,
+                        "status": media_info.get('status', 'completed'),
+                        "task_id": str(media_info.get('task_id')) if media_info.get('task_id') else None
+                    }
+                    result = await db.fetch_one(query=media_query, values=media_values)
+                    media_info['id'] = result['id']
+
+            # Extract and save hashtags
+            await extract_and_save_hashtags(db, post_id, sanitized_content)
+
+        # Fetch media for response
+        media_result = await db.fetch_all(
+            "SELECT id, media_url, media_type, width, height, aspect_ratio, cloudflare_info, status, task_id FROM post_media WHERE post_id = :post_id ORDER BY order_index",
+            values={"post_id": post_id}
+        )
+
+        # Combine post and media data
+        response_data = dict(post_result)
+        response_data['media'] = [
+            {
+                **dict(m),
+                'cloudflare_info': json.loads(m['cloudflare_info']) if m['cloudflare_info'] else None,
+                'task_id': str(m['task_id']) if m['task_id'] else None
+            } for m in media_result
+        ]
+
+        return PostResponse(**response_data)
+
+    except Exception as e:
+        logger.error(f"Error creating post: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
