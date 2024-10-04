@@ -32,6 +32,7 @@ origins = [
     "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
     "https://bed5-185-245-239-88.ngrok-free.app",
     "https://umamiai.netlify.app",
+    "ws://localhost:8000/api/v1/ws"
 ]
 
 app.add_middleware(
