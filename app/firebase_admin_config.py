@@ -46,3 +46,4 @@ def verify_token(token):
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+# SC 30106.59

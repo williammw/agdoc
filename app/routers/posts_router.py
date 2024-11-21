@@ -888,19 +888,19 @@ async def get_all_user_posts(
 
     query = """
     SELECT p.*, 
-           COALESCE(json_agg(
-               json_build_object(
-                   'id', pm.id,
-                   'media_url', pm.media_url,
-                   'media_type', pm.media_type,
-                   'width', pm.width,
-                   'height', pm.height,
-                   'aspect_ratio', pm.aspect_ratio,
-                   'cloudflare_info', pm.cloudflare_info,
-                   'status', COALESCE(pm.status, 'completed'),
-                   'task_id', pm.task_id
-               ) ORDER BY pm.order_index
-           ) FILTER (WHERE pm.id IS NOT NULL), '[]'::json) as media
+        COALESCE(json_agg(
+            json_build_object(
+                'id', pm.id,
+                'media_url', pm.media_url,
+                'media_type', pm.media_type,
+                'width', pm.width,
+                'height', pm.height,
+                'aspect_ratio', pm.aspect_ratio,
+                'cloudflare_info', pm.cloudflare_info,
+                'status', COALESCE(pm.status, 'completed'),
+                'task_id', pm.task_id
+            ) ORDER BY pm.order_index
+        ) FILTER (WHERE pm.id IS NOT NULL), '[]'::json) as media
     FROM posts p
     LEFT JOIN post_media pm ON p.id = pm.post_id
     WHERE p.user_id = :user_id
@@ -1232,7 +1232,7 @@ async def create_post(
         sanitized_content = bleach.clean(content)
 
         media_data = []
-        media_count = int(form_data.get('media_count', 0))
+        media_count = int(form_data.get('media_co`unt', 0))
 
         async with db.transaction():
             # Insert post

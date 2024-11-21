@@ -15,6 +15,8 @@
 ## 9Jul2024##
 `uvicorn app.main:app --host 0.0.0.0 --port 8080`
 
+## Oct14 2024 
+`uvicorn --host 0.0.0.0 app.main:app --workers 4`
 
 
 ### ngrok for test
@@ -25,4 +27,3 @@ ngrok http port
 ```
 pip freeze > requirements.txt
 ```
-
