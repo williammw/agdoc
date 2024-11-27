@@ -4,7 +4,7 @@ __pycache__/
 # Ignore agdoc-env folder
 agdoc-env/
 
-
+prompt/
 *.pyc
 .env
 # Ignore Python cache directories
