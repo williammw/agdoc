@@ -27,3 +27,6 @@ ngrok http port
 ```
 pip freeze > requirements.txt
 ```
+```
+4 dec 2024 test vercel
+```
