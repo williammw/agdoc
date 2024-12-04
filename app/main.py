@@ -34,7 +34,7 @@ origins = [
     "https://umamiai.netlify.app",
     "ws://localhost:8000/api/v1/ws",
     "https://create-n-deploy.vercel.app",
-    "https://api.x.ai/v1"
+    "https://api.x.ai",
 ]
 
 app.add_middleware(
