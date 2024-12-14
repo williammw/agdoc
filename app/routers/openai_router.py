@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Optional, Union, Literal, Dict, Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -49,6 +50,12 @@ for latex, you should use the following format:
 ```latex
 {latex code}
 ```
+
+for generating tables, please structure the response in this exact format:
+```markdown-table
+{markdown table}
+```
+
 """
 
 @router.post("/chat/stream")

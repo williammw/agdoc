@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Optional, Union, Literal, Dict, Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -31,6 +32,14 @@ for latex, you should use the following format:
 ```latex
 {latex code}
 ```
+
+for generating tables, please structure the response in this exact format:
+```markdown-table
+{markdown table}
+```
+
+
+
 """
 
 
@@ -78,10 +87,17 @@ async def stream_chat(request: ChatRequest):
             stream=True
         )
 
+        # def generate():
+        #     for chunk in stream:
+        #         if chunk.choices[0].delta.content is not None:
+        #             yield f"data: {{'v': {repr(chunk.choices[0].delta.content)}}}\n\n"
+        #     yield "data: [DONE]\n\n"
+        
         def generate():
             for chunk in stream:
                 if chunk.choices[0].delta.content is not None:
-                    yield f"data: {{'v': {repr(chunk.choices[0].delta.content)}}}\n\n"
+                    # Use json.dumps instead of repr
+                    yield f"data: {json.dumps({'v': chunk.choices[0].delta.content})}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
