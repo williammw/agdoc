@@ -60,7 +60,7 @@ class VisionMessage(BaseModel):
 
 class VisionRequest(BaseModel):
     messages: List[VisionMessage]
-    model: str = "grok-vision-beta"
+    model: str = "grok-2-vision-1212"
     max_tokens: Optional[int] = None
 
 
@@ -82,7 +82,7 @@ async def stream_chat(request: ChatRequest):
         ]
 
         stream = client.chat.completions.create(
-            model="grok-beta",
+            model="grok-2-1212",
             messages=messages,
             stream=True
         )

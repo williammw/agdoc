@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, tvibkr_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -71,6 +71,7 @@ router_list = [
     # (recognize_router, "/api/v1/recognize", ["recognition"]),
     # (search_router, "/api/v1/search", ["search"]),
     (ws_router, "/api/v1/ws", ["websocket"]),
+    (twitter_router, "/api/v1/twitter", ["twitter"]),
 ]
 
 for router, prefix, tags in router_list:
