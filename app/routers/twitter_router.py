@@ -11,7 +11,7 @@ from typing import Optional
 
 router = APIRouter(tags=["twitter"])
 
-# Environment variables
+# Environment variables for twitter
 TWITTER_CLIENT_ID = os.getenv("TWITTER_OAUTH2_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
 # Dynamic callback URL based on environment
