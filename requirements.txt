@@ -49,6 +49,7 @@ google-api-core==2.19.1
 google-api-python-client==2.139.0
 google-auth==2.32.0
 google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
 google-cloud-core==2.4.1
 google-cloud-firestore==2.17.0
 google-cloud-storage==2.18.0
@@ -92,6 +93,7 @@ msgpack==1.0.8
 namex==0.0.8
 nest-asyncio==1.6.0
 numpy==1.26.4
+oauthlib==3.2.2
 openai==1.37.1
 opencv-python==4.10.0.84
 opt-einsum==3.3.0
@@ -131,6 +133,7 @@ PyYAML==6.0.1
 pyzmq==26.0.3
 redis==5.1.0b7
 requests==2.32.3
+requests-oauthlib==2.0.0
 rich==13.7.1
 rsa==4.9
 s3transfer==0.10.2
