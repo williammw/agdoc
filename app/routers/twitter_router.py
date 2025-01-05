@@ -5,6 +5,8 @@ import secrets
 import base64
 import hashlib
 import httpx
+from typing import Annotated
+from fastapi import Body
 from typing import Optional
 
 router = APIRouter(tags=["twitter"])
@@ -12,8 +14,9 @@ router = APIRouter(tags=["twitter"])
 # Environment variables
 TWITTER_CLIENT_ID = os.getenv("TWITTER_OAUTH2_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
-# Update this to your frontend callback URL
-CALLBACK_URL = "https://cd37-185-245-239-66.ngrok-free.app/twitter/callback"
+# Dynamic callback URL based on environment
+BASE_URL = os.getenv("BASE_URL", "https://f0fe-185-245-239-66.ngrok-free.app")
+CALLBACK_URL = f"{BASE_URL}/twitter/callback"
 
 def generate_code_verifier(length: int = 64) -> str:
     return secrets.token_urlsafe(length)
@@ -120,10 +123,12 @@ async def get_user_info(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/tweet")
 async def create_tweet(
-    text: str,
-    access_token: str
+    request: Request,  # Add this to get the raw request
+    text: Annotated[str, Body()],  # Change this to use Body
+    access_token: Annotated[str, Body()]  # Change this to use Body
 ):
     """Create a new tweet"""
     try:
@@ -133,14 +138,14 @@ async def create_tweet(
             "Content-Type": "application/json"
         }
         data = {"text": text}
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=data, headers=headers)
             result = response.json()
-            
+
             if response.status_code != 201:
                 raise HTTPException(status_code=400, detail=result)
-                
+
             return result
 
     except Exception as e:

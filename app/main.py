@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router, linkedin_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router, linkedin_router, youtube_router
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -35,7 +35,8 @@ origins = [
     "ws://localhost:8000/api/v1/ws",
     "https://create-n-deploy.vercel.app",
     "https://api.x.ai/v1",
-    "https://cd37-185-245-239-66.ngrok-free.app"
+    "https://cd37-185-245-239-66.ngrok-free.app",
+    "https://www.multivio.com"
 ]
 
 app.add_middleware(
@@ -74,8 +75,8 @@ router_list = [
     (ws_router, "/api/v1/ws", ["websocket"]),
     (twitter_router, "/api/v1/twitter", ["twitter"]),
     (linkedin_router, "/api/v1/linkedin", ["linkedin"]),
+    (youtube_router, "/api/v1/youtube", ["youtube"]),
 ]
-
 for router, prefix, tags in router_list:
     app.include_router(router.router, prefix=prefix, tags=tags)
 
