@@ -36,7 +36,8 @@ origins = [
     "https://create-n-deploy.vercel.app",
     "https://api.x.ai/v1",
     "https://cd37-185-245-239-66.ngrok-free.app",
-    "https://www.multivio.com"
+    "https://www.multivio.com",
+    "https://a164-185-245-239-66.ngrok-free.app"
 ]
 
 app.add_middleware(
