@@ -17,7 +17,7 @@ router = APIRouter(tags=['LinkedIn'])
 
 CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
-REDIRECT_URI = "http://localhost:5173/linkedin/callback"
+REDIRECT_URI = os.getenv("FRONTEND_URL") + "/linkedin/callback"
 
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
