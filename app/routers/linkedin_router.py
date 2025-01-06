@@ -27,7 +27,7 @@ LINKEDIN_ENDPOINTS = {
     "profile": "https://api.linkedin.com/v2/me",
     "profile_picture": "https://api.linkedin.com/v2/me?projection=(id,profilePicture(displayImage~:playableStreams))",
     "share": "https://api.linkedin.com/v2/ugcPosts",
-    "organizations": "https://api.linkedin.com/v2/organizationalEntityAcls?q=roleAssignee",
+    "organizations": "https://api.linkedin.com/v2/organizationalEntityAcls",
     "revoke": "https://www.linkedin.com/oauth/v2/revoke"
 }
 
@@ -47,8 +47,8 @@ async def initialize_linkedin_auth(request: Request):
     auth_params = {
         "response_type": "code",
         "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,  # Always use frontend callback
-        "scope": "openid profile w_member_social email",
+        "redirect_uri": REDIRECT_URI,
+        "scope": "openid profile email w_member_social r_organization_admin w_organization_social r_organization_social rw_organization_admin",
         "state": state
     }
 
@@ -106,28 +106,70 @@ async def linkedin_callback(request: Request):
                         key=lambda x: x.get("data", {}).get("width", 0)
                     ).get("identifiers", [{}])[0].get("identifier")
 
-        # Get organizations
-        org_response = requests.get(LINKEDIN_ENDPOINTS['organizations'], headers=headers)
+        # Get organizations/company pages with detailed info
+        logger.debug("Fetching organizations...")
+        org_response = requests.get(
+            f"{LINKEDIN_ENDPOINTS['organizations']}?q=roleAssignee&role=ADMINISTRATOR&state=APPROVED&count=100",
+            headers=headers
+        )
+        logger.debug(f"Organizations response: {org_response.text}")
+        
         organizations = []
+        company_pages = []
         
         if org_response.ok:
-            for element in org_response.json().get("elements", []):
-                if element.get("role") == "ADMINISTRATOR":
-                    org_id = element.get("organizationalTarget")
-                    if org_id:
-                        org_details = requests.get(
-                            f"https://api.linkedin.com/v2/organizations/{org_id}",
-                            headers=headers
-                        ).json()
-                        organizations.append({
-                            "id": org_id,
-                            "name": org_details.get("localizedName", ""),
-                            "vanityName": org_details.get("vanityName", ""),
-                            "logoUrl": org_details.get("logoV2", {}).get("original", ""),
-                            "type": "Company"
-                        })
+            org_data = org_response.json()
+            logger.debug(f"Found {len(org_data.get('elements', []))} organizations")
+            
+            for element in org_data.get("elements", []):
+                org_id = element.get("organizationalTarget")
+                if not org_id:
+                    continue
 
-        # Construct response
+                logger.debug(f"Fetching details for org {org_id}")
+                # Get detailed organization info
+                org_details_response = requests.get(
+                    f"https://api.linkedin.com/v2/organizations/{org_id}",
+                    headers=headers
+                )
+                
+                if not org_details_response.ok:
+                    logger.error(f"Failed to get org details for {org_id}: {org_details_response.text}")
+                    continue
+
+                org_details = org_details_response.json()
+                logger.debug(f"Organization details: {org_details}")
+
+                # Get organization/page followers
+                followers_response = requests.get(
+                    f"https://api.linkedin.com/v2/networkSizes/{org_id}?edgeType=CompanyFollowedByMember",
+                    headers=headers
+                )
+                follower_count = followers_response.json().get("firstDegreeSize", 0) if followers_response.ok else 0
+
+                page_info = {
+                    "id": org_id,
+                    "name": org_details.get("localizedName", ""),
+                    "vanityName": org_details.get("vanityName", ""),
+                    "description": org_details.get("localizedDescription", ""),
+                    "websiteUrl": org_details.get("localizedWebsite", ""),
+                    "logoUrl": org_details.get("logoV2", {}).get("original", ""),
+                    "industry": org_details.get("localizedIndustry", ""),
+                    "staffCount": org_details.get("staffCount", 0),
+                    "followerCount": follower_count,
+                    "type": "Company",
+                    "role": element.get("role", ""),
+                    "permissions": {
+                        "canPost": element.get("role") in ["ADMINISTRATOR", "CONTENT_ADMIN"],
+                        "canManage": element.get("role") == "ADMINISTRATOR"
+                    }
+                }
+
+                logger.debug(f"Adding page info: {page_info}")
+                organizations.append(page_info)
+                company_pages.append(page_info)
+
+        # Construct response with both profile and pages
         user_profile = {
             "id": user_data.get("sub") or profile_data.get("id"),
             "firstName": user_data.get("given_name", ""),
@@ -142,7 +184,8 @@ async def linkedin_callback(request: Request):
             "profileData": {
                 **user_profile,
                 "accounts": [user_profile, *organizations]
-            }
+            },
+            "companyPages": company_pages
         }
 
     except Exception as e:
