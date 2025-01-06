@@ -44,16 +44,18 @@ async def initialize_linkedin_auth():
     return {"authUrl": auth_url, "state": state}
 
 
-@router.post("/callback")
+@router.get("/callback")
 async def linkedin_callback(request: Request):
     try:
-        data = await request.json()
-        code = data.get("code")
-        logger.debug(f"Received callback with code: {code}")
+        # Get code from query parameters
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        
+        logger.debug(f"Received callback - code: {code}, state: {state}")
 
         if not code:
-            raise HTTPException(
-                status_code=400, detail="Authorization code is required")
+            logger.error("No authorization code received")
+            raise HTTPException(status_code=400, detail="Authorization code is required")
 
         # Exchange code for access token
         token_data = {
