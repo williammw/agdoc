@@ -51,22 +51,28 @@ async def linkedin_callback(request: Request):
         if request.method == "GET":
             code = request.query_params.get("code")
             state = request.query_params.get("state")
+            redirect_uri = request.query_params.get(
+                "redirectUri", REDIRECT_URI)  # Use provided or fallback
         else:
             body = await request.json()
             code = body.get("code")
             state = body.get("state")
-        
-        logger.debug(f"Received callback - method: {request.method}, code: {code}, state: {state}")
+            # Use provided or fallback
+            redirect_uri = body.get("redirectUri", REDIRECT_URI)
+
+        logger.debug(
+            f"Received callback - method: {request.method}, code: {code}, state: {state}, redirect_uri: {redirect_uri}")
 
         if not code:
             logger.error("No authorization code received")
-            raise HTTPException(status_code=400, detail="Authorization code is required")
+            raise HTTPException(
+                status_code=400, detail="Authorization code is required")
 
         # Exchange code for access token
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect_uri,  # Use the provided redirect_uri
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
         }
@@ -252,7 +258,7 @@ async def revoke_access(request: Request):
             error_data = revoke_response.json()
             if error_data.get("error") == "invalid_grant":
                 return {"success": True, "message": "Token already expired or revoked"}
-            
+
             logger.error(
                 f"Token revocation failed: {revoke_response.status_code} - {revoke_response.text}")
             raise HTTPException(
