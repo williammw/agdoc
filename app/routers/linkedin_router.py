@@ -44,14 +44,19 @@ async def initialize_linkedin_auth():
     return {"authUrl": auth_url, "state": state}
 
 
-@router.get("/callback")
+@router.api_route("/callback", methods=["GET", "POST"])
 async def linkedin_callback(request: Request):
     try:
-        # Get code from query parameters
-        code = request.query_params.get("code")
-        state = request.query_params.get("state")
+        # Handle both GET params and POST body
+        if request.method == "GET":
+            code = request.query_params.get("code")
+            state = request.query_params.get("state")
+        else:
+            body = await request.json()
+            code = body.get("code")
+            state = body.get("state")
         
-        logger.debug(f"Received callback - code: {code}, state: {state}")
+        logger.debug(f"Received callback - method: {request.method}, code: {code}, state: {state}")
 
         if not code:
             logger.error("No authorization code received")
