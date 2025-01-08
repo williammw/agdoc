@@ -68,26 +68,42 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
             raise HTTPException(
                 status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
 
+        # First try mo_user_info table
         query = """
-        SELECT id, username, email, auth_provider, created_at, is_active, full_name, last_username_change,
-               bio, avatar_url, phone_number, dob, status, cover_image
-        FROM users 
+        SELECT id, email, username, full_name, plan_type, monthly_post_quota, remaining_posts,
+               language_preference, timezone, notification_preferences, is_active, is_verified,
+               created_at, updated_at, last_login_at
+        FROM mo_user_info 
         WHERE id = :uid
         """
         user = await db.fetch_one(query=query, values={"uid": uid})
 
+        # If not found in mo_user_info, try users table
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+            query = """
+            SELECT id, username, email, auth_provider, created_at, is_active, full_name, 
+                   last_username_change, bio, avatar_url, phone_number, dob, status, cover_image
+            FROM users 
+            WHERE id = :uid
+            """
+            user = await db.fetch_one(query=query, values={"uid": uid})
+
+            # If still not found, return just the Firebase user info
+            if not user:
+                return {
+                    "uid": uid,
+                    "email": firebase_user.email,
+                    "username": firebase_user.display_name or firebase_user.email.split('@')[0] if firebase_user.email else None
+                }
 
         user_dict = dict(user)
         user_dict['uid'] = uid
-        # print("User data from get_current_user:", user_dict)
         return user_dict
     except firebase_auth.UserDisabledError:
         raise HTTPException(
             status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
     except Exception as e:
-        print(f"Error in get_current_user: {str(e)}")
+        logger.error(f"Error in get_current_user: {str(e)}")
         raise HTTPException(
             status_code=401, detail="Invalid authentication credentials")
 
