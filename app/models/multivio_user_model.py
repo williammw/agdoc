@@ -18,15 +18,15 @@ class UserCreate(UserBase):
     id: str  # Firebase UID
 
 class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
     username: Optional[str] = None
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
-    company_name: Optional[str] = None
-    company_size: Optional[str] = None
-    industry: Optional[str] = None
-    language_preference: Optional[str] = None
     timezone: Optional[str] = None
-    notification_preferences: Optional[Dict[str, bool]] = None
+    notification_preferences: Optional[Dict] = None
+    firebase_display_name: Optional[str] = None
+    firebase_photo_url: Optional[str] = None
+    is_email_verified: Optional[bool] = None
 
 class UserPlanUpdate(BaseModel):
     plan_type: str
@@ -49,6 +49,9 @@ class UserInfo(UserBase):
     is_active: bool
     is_verified: bool
     subscription_id: Optional[str] = None
+    firebase_display_name: Optional[str] = None
+    firebase_photo_url: Optional[str] = None
+    is_email_verified: Optional[bool] = None
 
     class Config:
         orm_mode = True
