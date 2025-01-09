@@ -7,6 +7,7 @@ class UserBase(BaseModel):
     username: Optional[str] = None
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
+    country_code: Optional[str] = None  # Added field
     plan_type: str = 'free'
     company_name: Optional[str] = None
     company_size: Optional[str] = None
@@ -22,6 +23,7 @@ class UserUpdate(BaseModel):
     username: Optional[str] = None
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
+    country_code: Optional[str] = None  # Added field
     timezone: Optional[str] = None
     notification_preferences: Optional[Dict] = None
     firebase_display_name: Optional[str] = None

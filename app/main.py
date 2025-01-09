@@ -35,9 +35,9 @@ origins = [
     "ws://localhost:8000/api/v1/ws",
     "https://create-n-deploy.vercel.app",
     "https://api.x.ai/v1",
-    "https://www.multivio.com",
-    "https://*.ngrok-free.app",  # Allow all ngrok subdomains
-    "https://*.ngrok.io"         # Allow all ngrok.io subdomains
+    "https://www.multivio.com",    
+    "https://02b5-185-245-239-66.ngrok-free.app/",  # Allow all ngrok subdomains
+    
 ]
 
 app.add_middleware(

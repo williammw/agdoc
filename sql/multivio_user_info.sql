@@ -72,3 +72,5 @@ ALTER TABLE mo_user_info
 ADD COLUMN firebase_display_name VARCHAR(255),
 ADD COLUMN firebase_photo_url TEXT,
 ADD COLUMN is_email_verified BOOLEAN DEFAULT FALSE;
+
+ALTER TABLE mo_user_info ADD COLUMN country_code VARCHAR(10);

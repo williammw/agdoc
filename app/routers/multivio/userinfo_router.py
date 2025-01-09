@@ -8,26 +8,32 @@ from app.dependencies import get_current_user, get_database
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Optional
 
+
 class UserCreate(BaseModel):
     id: str
     email: EmailStr
     username: Optional[str] = None
     full_name: Optional[str] = None
 
+
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     username: Optional[str] = None
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
+    country_code: Optional[str] = None
     timezone: Optional[str] = None
     notification_preferences: Optional[Dict] = None
+
 
 class NotificationPreferences(BaseModel):
     email: bool = True
     push: bool = True
 
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
 
 @router.get("/users/{user_id}")
 async def get_user(
@@ -47,6 +53,7 @@ async def get_user(
             username,
             full_name,
             phone_number,
+            country_code,
             plan_type,
             monthly_post_quota,
             remaining_posts,
@@ -62,12 +69,12 @@ async def get_user(
         FROM mo_user_info 
         WHERE id = :user_id
         """
-        
+
         result = await db.fetch_one(query=query, values={"user_id": user_id})
-        
+
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
-            
+
         return dict(result)
 
     except HTTPException:
@@ -75,6 +82,7 @@ async def get_user(
     except Exception as e:
         logger.error(f"Error in get_user: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/users")
 async def create_or_update_user(
@@ -111,6 +119,7 @@ async def create_or_update_user(
                 username,
                 full_name,
                 phone_number,
+                country_code,
                 plan_type,
                 monthly_post_quota,
                 remaining_posts,
@@ -128,6 +137,7 @@ async def create_or_update_user(
                 :email,
                 :username,
                 :full_name,
+                NULL,
                 NULL,
                 'free',
                 50,
@@ -158,15 +168,18 @@ async def create_or_update_user(
 
         result = await db.fetch_one(update_query, values)
         if not result:
-            raise HTTPException(status_code=500, detail="Failed to create/update user record")
-        
+            raise HTTPException(
+                status_code=500, detail="Failed to create/update user record")
+
         return dict(result)
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in create_or_update_user: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Internal server error: {str(e)}")
+
 
 @router.put("/users/{user_id}")
 async def update_user(
@@ -180,6 +193,9 @@ async def update_user(
         if user_id != current_user['uid']:
             raise HTTPException(status_code=403, detail="Access denied")
 
+        # Log the incoming data
+        logger.info(f"Updating user {user_id} with data: {user_data.dict()}")
+
         update_query = """
         UPDATE mo_user_info 
         SET 
@@ -187,6 +203,7 @@ async def update_user(
             username = COALESCE(:username, username),
             full_name = COALESCE(:full_name, full_name),
             phone_number = COALESCE(:phone_number, phone_number),
+            country_code = COALESCE(:country_code, country_code),
             timezone = COALESCE(:timezone, timezone),
             notification_preferences = COALESCE(:notification_preferences, notification_preferences),
             updated_at = CURRENT_TIMESTAMP
@@ -200,14 +217,20 @@ async def update_user(
             "username": user_data.username,
             "full_name": user_data.full_name,
             "phone_number": user_data.phone_number,
+            "country_code": user_data.country_code,
             "timezone": user_data.timezone,
             "notification_preferences": json.dumps(user_data.notification_preferences) if user_data.notification_preferences else None
         }
 
+        # Log the SQL values
+        logger.info(f"SQL values: {values}")
+
         result = await db.fetch_one(update_query, values)
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
+        # Log the result
+        logger.info(f"Update result: {dict(result)}")
         return dict(result)
 
     except HTTPException:
@@ -215,6 +238,7 @@ async def update_user(
     except Exception as e:
         logger.error(f"Error in update_user: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/users/{user_id}/api-key")
 async def generate_api_key(
@@ -243,12 +267,13 @@ async def generate_api_key(
         result = await db.fetch_one(update_query, {"id": user_id, "api_key": new_api_key})
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         return dict(result)
 
     except Exception as e:
         logger.error(f"Error generating API key: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.delete("/users/{user_id}/api-key")
 async def revoke_api_key(
@@ -273,12 +298,13 @@ async def revoke_api_key(
         result = await db.fetch_one(update_query, {"id": user_id})
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         return dict(result)
 
     except Exception as e:
         logger.error(f"Error revoking API key: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/users/{user_id}/quota")
 async def get_user_quota(
@@ -299,11 +325,11 @@ async def get_user_quota(
         FROM mo_user_info 
         WHERE id = :user_id
         """
-        
+
         result = await db.fetch_one(query=query, values={"user_id": user_id})
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
-            
+
         return dict(result)
 
     except HTTPException:
