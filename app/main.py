@@ -1,6 +1,7 @@
 from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router, linkedin_router, youtube_router
-from app.routers.multivio import userinfo_router  # Add this import
+from app.routers.multivio import userinfo_router, content_router  # Add this import
+
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
@@ -77,10 +78,13 @@ router_list = [
     (youtube_router.router, "/api/v1/youtube", ["youtube"]),
     # Add the new user info router
     (userinfo_router.router, "/api/v1/multivio/user-info", ["userinfo"]),
+    (content_router.router, "/api/v1/content", ["content"]),
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
 
+from app.routers.multivio.content_router import router as content_router
+app.include_router(content_router, prefix="/api", tags=["content"])
 
 # Global exception handler
 @app.exception_handler(Exception)
