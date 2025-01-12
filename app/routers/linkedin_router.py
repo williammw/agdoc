@@ -17,7 +17,7 @@ router = APIRouter(tags=['LinkedIn'])
 # Configuration
 CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", "http://localhost:5173/linkedin/callback")  # Full callback URL from env
+REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", "https://347b-185-245-239-66.ngrok-free.app/linkedin/callback")  # Full callback URL from env
 
 # LinkedIn API endpoints
 LINKEDIN_ENDPOINTS = {
@@ -126,15 +126,18 @@ async def linkedin_callback(request: Request):
                 if not org_id:
                     continue
 
-                logger.debug(f"Fetching details for org {org_id}")
+                # Extract numeric ID from URN
+                numeric_id = org_id.split(":")[-1] if org_id.startswith("urn:li:organization:") else org_id
+                
+                logger.debug(f"Fetching details for org {numeric_id}")
                 # Get detailed organization info
                 org_details_response = requests.get(
-                    f"https://api.linkedin.com/v2/organizations/{org_id}",
+                    f"https://api.linkedin.com/v2/organizations/{numeric_id}",
                     headers=headers
                 )
                 
                 if not org_details_response.ok:
-                    logger.error(f"Failed to get org details for {org_id}: {org_details_response.text}")
+                    logger.error(f"Failed to get org details for {numeric_id}: {org_details_response.text}")
                     continue
 
                 org_details = org_details_response.json()
@@ -142,13 +145,13 @@ async def linkedin_callback(request: Request):
 
                 # Get organization/page followers
                 followers_response = requests.get(
-                    f"https://api.linkedin.com/v2/networkSizes/{org_id}?edgeType=CompanyFollowedByMember",
+                    f"https://api.linkedin.com/v2/networkSizes/{numeric_id}?edgeType=CompanyFollowedByMember",
                     headers=headers
                 )
                 follower_count = followers_response.json().get("firstDegreeSize", 0) if followers_response.ok else 0
 
                 page_info = {
-                    "id": org_id,
+                    "id": numeric_id,
                     "name": org_details.get("localizedName", ""),
                     "vanityName": org_details.get("vanityName", ""),
                     "description": org_details.get("localizedDescription", ""),
