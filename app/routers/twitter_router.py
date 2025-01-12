@@ -15,7 +15,7 @@ router = APIRouter(tags=["twitter"])
 TWITTER_CLIENT_ID = os.getenv("TWITTER_OAUTH2_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
 # Dynamic callback URL based on environment
-BASE_URL = os.getenv("BASE_URL", "https://f0fe-185-245-239-66.ngrok-free.app")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5173")
 CALLBACK_URL = f"{BASE_URL}/twitter/callback"
 
 def generate_code_verifier(length: int = 64) -> str:

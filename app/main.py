@@ -1,6 +1,7 @@
 from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router, linkedin_router, youtube_router
-from app.routers.multivio import userinfo_router, content_router  # Add this import
+# Add this import
+from app.routers.multivio import userinfo_router, content_router, facebook_router, instagram_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
@@ -27,8 +28,6 @@ logger = logging.getLogger(__name__)
 origins = [
     "http://localhost:5173",  # Vite default port
     "http://localhost:8000",  # FastAPI default port
-    "http://127.0.0.1:5173",  # Alternative localhost
-    "http://127.0.0.1:8000",  # Alternative localhost
     "https://235534.netlify.app",
     "https://umamiverse.netlify.app",
     "https://customer-ljfwh4kunvdrirzl.cloudflarestream.com",
@@ -37,7 +36,9 @@ origins = [
     "https://create-n-deploy.vercel.app",
     "https://api.x.ai/v1",
     "https://www.multivio.com",    
-    "https://02b5-185-245-239-66.ngrok-free.app/",  # Allow all ngrok subdomains
+    # allow all ngrok subdomains
+    "https://*.ngrok-free.app/",
+    "https://347b-185-245-239-66.ngrok-free.app"
     
 ]
 
@@ -79,6 +80,8 @@ router_list = [
     # Add the new user info router
     (userinfo_router.router, "/api/v1/multivio/user-info", ["userinfo"]),
     (content_router.router, "/api/v1/content", ["content"]),
+    (facebook_router.router, "/api/v1/facebook", ["facebook"]),
+    (instagram_router.router, "/api/v1/instagram", ["instagram"]),
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
