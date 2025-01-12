@@ -201,14 +201,40 @@ async def share_post(request: Request):
     if not all(k in data for k in ["accountId", "content", "accessToken"]):
         raise HTTPException(status_code=400, detail="Account ID, content, and access token are required")
 
+    # Modify the content structure based on account type
+    content = data['content']
+    account_type = content['author'].split(':')[2].lower()  # person or organization
+    
+    if account_type == 'person':
+        # For personal accounts, use person URN format
+        post_content = {
+            "author": f"urn:li:person:{data['accountId']}",
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {
+                        "text": content['specificContent']['com.linkedin.ugc.ShareContent']['shareCommentary']['text']
+                    },
+                    "shareMediaCategory": "NONE"
+                }
+            },
+            "visibility": {
+                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+            }
+        }
+    else:
+        # For company accounts, use organization URN format
+        post_content = content
+
     response = requests.post(
         LINKEDIN_ENDPOINTS['share'],
         headers=get_linkedin_headers(data['accessToken'], include_restli=True),
-        json=data['content']
+        json=post_content
     )
 
     if not response.ok:
-        raise HTTPException(status_code=400, detail=f"Failed to post: {response.text}")
+        logger.error(f"Share failed: {response.text}")
+        raise HTTPException(status_code=response.status_code, detail=f"Failed to post: {response.text}")
     return {"success": True}
 
 @router.post("/revoke")
