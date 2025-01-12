@@ -15,7 +15,7 @@ router = APIRouter(tags=["twitter"])
 TWITTER_CLIENT_ID = os.getenv("TWITTER_OAUTH2_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
 # Dynamic callback URL based on environment
-BASE_URL = os.getenv("BASE_URL", "http://localhost:5173")
+BASE_URL = os.getenv("BASE_URL")
 CALLBACK_URL = f"{BASE_URL}/twitter/callback"
 
 def generate_code_verifier(length: int = 64) -> str:
@@ -171,3 +171,7 @@ async def delete_tweet(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# https://twitter.com/i/oauth2/authorize?response_type =code&client_id=MHA1eGFZb2ZfNjlVMndya0NkbTk6MTpjaQ&redirect_uri=https%3A%2F%2Ff0fe-185-245-239-66.ngrok-free.app%2Ftwitter%2Fcallback&scope=tweet.read%20tweet.write%20users.read%20offline.access&state=Yv38ia01r_7P6X3iZJnShAr2qSjPoXxcMb7uRRq6L8g&code_challenge=FQXIvqciwgbuIHfIy9NR6u510cZi99XmTV1zGD--ljs&code_challenge_method=S256
