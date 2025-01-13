@@ -55,18 +55,19 @@ def get_linkedin_headers(access_token: str, include_restli: bool = False) -> dic
 @router.post("/auth")
 async def initialize_linkedin_auth(request: Request):
     try:
-        # Get origin from request headers to determine the correct redirect URI
+        # Get origin from request headers
         origin = request.headers.get("origin", "")
-        logger.debug(f"Request origin: {origin}")
+        logger.info(f"Auth Request Origin: {origin}")
+        logger.info(f"Auth Request Headers: {dict(request.headers)}")
         
         # Determine environment based on origin
         current_env = "production" if "multivio.com" in origin else "development"
         if "localhost" in origin:
             current_env = "local"
             
-        # Use the appropriate redirect URI
         current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
-        logger.debug(f"Using redirect URI for {current_env}: {current_redirect_uri}")
+        logger.info(f"Selected Environment: {current_env}")
+        logger.info(f"Using Redirect URI: {current_redirect_uri}")
         
         state = secrets.token_urlsafe(32)
         auth_params = {
@@ -78,8 +79,8 @@ async def initialize_linkedin_auth(request: Request):
         }
 
         auth_url = f"{LINKEDIN_ENDPOINTS['auth']}?{urlencode(auth_params)}"
-        logger.debug(f"Generated LinkedIn auth URL with redirect_uri: {current_redirect_uri}")
-        return {"authUrl": auth_url, "state": state}
+        logger.info(f"Generated Auth URL: {auth_url}")
+        return {"authUrl": auth_url, "state": state, "redirect_uri": current_redirect_uri}  # Send redirect_uri back
     except Exception as e:
         logger.exception("Error in initialize_linkedin_auth")
         raise HTTPException(status_code=500, detail=str(e))
@@ -87,48 +88,49 @@ async def initialize_linkedin_auth(request: Request):
 @router.api_route("/callback", methods=["GET", "POST"])
 async def linkedin_callback(request: Request):
     try:
-        # Extract code and state from POST body (sent by frontend)
+        # Log request details
+        logger.info("=== LinkedIn Callback Debug ===")
+        logger.info(f"Request Headers: {dict(request.headers)}")
+        
         data = await request.json()
+        logger.info(f"Callback Request Data: {data}")  # Log full request data
+        
         code = data.get("code")
         state = data.get("state")
         
-        # Get origin from request headers to determine the correct redirect URI
+        # Get the redirect_uri that was used in auth
         origin = request.headers.get("origin", "")
-        logger.debug(f"Callback request origin: {origin}")
-        
-        # Determine environment based on origin
         current_env = "production" if "multivio.com" in origin else "development"
         if "localhost" in origin:
             current_env = "local"
-            
-        # Use the appropriate redirect URI
         current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
-        logger.debug(f"Using callback redirect URI for {current_env}: {current_redirect_uri}")
-
-        logger.debug(f"Callback received - code: {code}, state: {state}")
-
-        if not code:
-            raise HTTPException(status_code=400, detail="Authorization code is required")
-
-        # Exchange code for access token
+        
+        logger.info(f"Callback Environment: {current_env}")
+        logger.info(f"Callback Redirect URI: {current_redirect_uri}")
+        
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": current_redirect_uri,  # Must match the auth redirect_uri
+            "redirect_uri": current_redirect_uri,
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
         }
         
-        logger.debug(f"Token request data: {token_data}")
+        logger.info(f"Token Request Data: {token_data}")
         
         token_response = requests.post(
             LINKEDIN_ENDPOINTS['token'],
-            data=token_data
+            data=token_data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
         )
+        
+        logger.info(f"Token Response Status: {token_response.status_code}")
+        logger.info(f"Token Response Body: {token_response.text}")
 
         if not token_response.ok:
-            logger.error(f"Token request failed: {token_response.status_code} - {token_response.text}")
-            raise HTTPException(status_code=400, detail=f"Failed to get access token: {token_response.text}")
+            error_detail = f"Failed to get access token: {token_response.text}"
+            logger.error(error_detail)
+            raise HTTPException(status_code=400, detail=error_detail)
 
         access_token = token_response.json()["access_token"]
         headers = get_linkedin_headers(access_token)
@@ -238,7 +240,10 @@ async def linkedin_callback(request: Request):
 
     except Exception as e:
         logger.exception("Error in LinkedIn callback")
-        raise HTTPException(status_code=400, detail=str(e))
+        error_detail = str(e)
+        if "invalid_request" in error_detail.lower():
+            error_detail += " (This might be due to code expiration or redirect URI mismatch)"
+        raise HTTPException(status_code=400, detail=error_detail)
 
 @router.post("/share")
 async def share_post(request: Request):
