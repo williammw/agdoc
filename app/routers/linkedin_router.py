@@ -17,7 +17,19 @@ router = APIRouter(tags=['LinkedIn'])
 # Configuration
 CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", "https://347b-185-245-239-66.ngrok-free.app/linkedin/callback")  # Full callback URL from env
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+# Define redirect URIs for different environments
+REDIRECT_URIS = {
+    "production": "https://www.multivio.com/linkedin/callback",
+    "development": "https://347b-185-245-239-66.ngrok-free.app/linkedin/callback", 
+    "local": "http://localhost:5173/linkedin/callback"
+}
+
+# Get the appropriate redirect URI based on environment
+REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", REDIRECT_URIS.get(ENVIRONMENT, REDIRECT_URIS["development"]))
+
+logger.info(f"Using LinkedIn Redirect URI: {REDIRECT_URI}")
 
 # LinkedIn API endpoints
 LINKEDIN_ENDPOINTS = {
@@ -42,19 +54,35 @@ def get_linkedin_headers(access_token: str, include_restli: bool = False) -> dic
 
 @router.post("/auth")
 async def initialize_linkedin_auth(request: Request):
-    state = secrets.token_urlsafe(32)
-    
-    auth_params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "scope": "openid profile email w_member_social r_organization_admin w_organization_social r_organization_social rw_organization_admin",
-        "state": state
-    }
+    try:
+        # Get origin from request headers to determine the correct redirect URI
+        origin = request.headers.get("origin", "")
+        logger.debug(f"Request origin: {origin}")
+        
+        # Determine environment based on origin
+        current_env = "production" if "multivio.com" in origin else "development"
+        if "localhost" in origin:
+            current_env = "local"
+            
+        # Use the appropriate redirect URI
+        current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
+        logger.debug(f"Using redirect URI for {current_env}: {current_redirect_uri}")
+        
+        state = secrets.token_urlsafe(32)
+        auth_params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": current_redirect_uri,
+            "scope": "openid profile email w_member_social r_organization_admin w_organization_social r_organization_social rw_organization_admin",
+            "state": state
+        }
 
-    auth_url = f"{LINKEDIN_ENDPOINTS['auth']}?{urlencode(auth_params)}"
-    logger.debug(f"Generated LinkedIn auth URL with redirect_uri: {REDIRECT_URI}")
-    return {"authUrl": auth_url, "state": state}
+        auth_url = f"{LINKEDIN_ENDPOINTS['auth']}?{urlencode(auth_params)}"
+        logger.debug(f"Generated LinkedIn auth URL with redirect_uri: {current_redirect_uri}")
+        return {"authUrl": auth_url, "state": state}
+    except Exception as e:
+        logger.exception("Error in initialize_linkedin_auth")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.api_route("/callback", methods=["GET", "POST"])
 async def linkedin_callback(request: Request):
@@ -63,6 +91,19 @@ async def linkedin_callback(request: Request):
         data = await request.json()
         code = data.get("code")
         state = data.get("state")
+        
+        # Get origin from request headers to determine the correct redirect URI
+        origin = request.headers.get("origin", "")
+        logger.debug(f"Callback request origin: {origin}")
+        
+        # Determine environment based on origin
+        current_env = "production" if "multivio.com" in origin else "development"
+        if "localhost" in origin:
+            current_env = "local"
+            
+        # Use the appropriate redirect URI
+        current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
+        logger.debug(f"Using callback redirect URI for {current_env}: {current_redirect_uri}")
 
         logger.debug(f"Callback received - code: {code}, state: {state}")
 
@@ -70,15 +111,19 @@ async def linkedin_callback(request: Request):
             raise HTTPException(status_code=400, detail="Authorization code is required")
 
         # Exchange code for access token
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": current_redirect_uri,  # Must match the auth redirect_uri
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET
+        }
+        
+        logger.debug(f"Token request data: {token_data}")
+        
         token_response = requests.post(
             LINKEDIN_ENDPOINTS['token'],
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,  # Must match the auth redirect_uri
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET
-            }
+            data=token_data
         )
 
         if not token_response.ok:
