@@ -12,19 +12,18 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+FRONTEND_URL = "http://localhost:5173"
+REDIRECT_URI = f"{FRONTEND_URL}/youtube/callback"
+
 # Define request models
-
-
 class DisconnectRequest(BaseModel):
     account_id: str
-
 
 class PostRequest(BaseModel):
     account_id: str
     content: Dict
 
-
-router = APIRouter( tags=["youtube"])
+router = APIRouter(tags=["youtube"])
 
 SCOPES = [
     'https://www.googleapis.com/auth/youtube.upload',
@@ -33,7 +32,6 @@ SCOPES = [
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile'
 ]
-
 
 def create_client_config():
     return {
@@ -48,31 +46,34 @@ def create_client_config():
         }
     }
 
-
-@router.get("/auth")
-async def auth_youtube():
+@router.post("/auth")
+async def auth_youtube(request: Request):
     try:
-        # Generate a secure state parameter
-        state = secrets.token_urlsafe(16)
+        # Get state from request body
+        body = await request.json()
+        state = body.get('state')
+        redirect_uri = body.get('redirect_uri')
+
+        if not state:
+            raise HTTPException(status_code=400, detail="State parameter is required")
 
         flow = Flow.from_client_config(
             create_client_config(),
             scopes=SCOPES,
-            redirect_uri="http://localhost:5173/youtube/callback"
+            redirect_uri=redirect_uri
         )
 
         authorization_url, _ = flow.authorization_url(
             access_type='offline',
             include_granted_scopes='true',
             state=state,
-            prompt='consent'  # Force consent screen to ensure refresh token
+            prompt='consent'
         )
 
-        return {"url": authorization_url}
+        return {"authUrl": authorization_url}
     except Exception as e:
         print(f"Auth error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @router.get("/callback")
 async def callback(code: str, state: Optional[str] = None):
@@ -83,7 +84,7 @@ async def callback(code: str, state: Optional[str] = None):
         flow = Flow.from_client_config(
             create_client_config(),
             scopes=SCOPES,
-            redirect_uri="http://localhost:5173/youtube/callback"
+            redirect_uri=REDIRECT_URI
         )
 
         # Fetch token with the received code
@@ -107,16 +108,11 @@ async def callback(code: str, state: Optional[str] = None):
             f"Successfully fetched channel info for: {channel['snippet']['title']}")
 
         account_data = {
+            "access_token": credentials.token,
+            "refresh_token": credentials.refresh_token,
             "id": channel['id'],
-            "platform": "youtube",
-            "username": channel['snippet']['title'],
-            "connected": True,
-            "accountType": "Channel",
-            "accessToken": credentials.token,
-            "refreshToken": credentials.refresh_token,
-            "profileImageUrl": channel['snippet'].get('thumbnails', {}).get('default', {}).get('url'),
-            "statistics": channel.get('statistics', {}),
-            "connectedAt": None  # Frontend will set this
+            "title": channel['snippet']['title'],
+            "thumbnail_url": channel['snippet'].get('thumbnails', {}).get('default', {}).get('url')
         }
 
         return account_data
@@ -124,7 +120,6 @@ async def callback(code: str, state: Optional[str] = None):
     except Exception as e:
         print(f"Callback error: {str(e)}")  # Add detailed error logging
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @router.post("/disconnect")
 async def disconnect_youtube(request: DisconnectRequest):
@@ -135,7 +130,6 @@ async def disconnect_youtube(request: DisconnectRequest):
     except Exception as e:
         print(f"Disconnect error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @router.post("/post")
 async def create_post(request: PostRequest):
