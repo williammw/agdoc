@@ -82,7 +82,6 @@ router_list = [
     (content_router.router, "/api/v1/content", ["content"]),
     (facebook_router.router, "/api/v1/facebook", ["facebook"]),
     (instagram_router.router, "/api/v1/instagram", ["instagram"]),
-    (threads_router.router, "/api/v1/threads", ["threads"]),
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
