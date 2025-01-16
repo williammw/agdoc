@@ -46,7 +46,6 @@ async def greeting():
 #     return {"message": "Latest notification", "data": message}
 
 
-# https://cd75-171-22-104-187.ngrok-free.app/api/v1/tvibkr/trade_signal
 @router.post("/trade_signal")
 async def receive_trade_signal(signal: TradeSignal, db: Database = Depends(get_database)):
     query = """

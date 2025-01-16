@@ -173,5 +173,3 @@ async def delete_tweet(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-# https://twitter.com/i/oauth2/authorize?response_type =code&client_id=MHA1eGFZb2ZfNjlVMndya0NkbTk6MTpjaQ&redirect_uri=https%3A%2F%2Ff0fe-185-245-239-66.ngrok-free.app%2Ftwitter%2Fcallback&scope=tweet.read%20tweet.write%20users.read%20offline.access&state=Yv38ia01r_7P6X3iZJnShAr2qSjPoXxcMb7uRRq6L8g&code_challenge=FQXIvqciwgbuIHfIy9NR6u510cZi99XmTV1zGD--ljs&code_challenge_method=S256

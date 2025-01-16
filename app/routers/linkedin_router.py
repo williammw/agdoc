@@ -22,8 +22,8 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # Define redirect URIs for different environments
 REDIRECT_URIS = {
     "production": "https://www.multivio.com/linkedin/callback",
-    "development": "https://347b-185-245-239-66.ngrok-free.app/linkedin/callback", 
-    "local": "http://localhost:5173/linkedin/callback"
+    "development": "https://dev.multivio.com/linkedin/callback",
+    "local": "https://dev.multivio.com/linkedin/callback",
 }
 
 # Get the appropriate redirect URI based on environment
