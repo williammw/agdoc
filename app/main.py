@@ -1,7 +1,7 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, twitter_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router, linkedin_router, youtube_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router
 # Add this import
-from app.routers.multivio import userinfo_router, content_router, facebook_router, instagram_router, threads_router
+from app.routers.multivio import linkedin_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ origins = [
     "https://api.x.ai/v1",
     "https://www.multivio.com",    
     "https://dev.multivio.com",
+    "https://dev.ohmeowkase.com"
    
 ]
 
