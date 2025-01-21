@@ -264,9 +264,9 @@ async def update_folder(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/folders/{folder_id}")
+@router.delete("/{folder_id}")
 async def delete_folder(
-    folder_id: UUID,
+    folder_id: str,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
@@ -298,10 +298,9 @@ async def delete_folder(
         WHERE id = :folder_id 
         AND created_by = :user_id
         AND is_deleted = false
-        RETURNING id
         """
 
-        result = await db.fetch_one(
+        await db.execute(
             delete_query,
             values={
                 "folder_id": folder_id,
@@ -309,13 +308,8 @@ async def delete_folder(
             }
         )
 
-        if not result:
-            raise HTTPException(status_code=404, detail="Folder not found")
-
         return {"success": True}
 
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error in delete_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
