@@ -1,15 +1,35 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import List, Optional, Dict
 from pydantic import BaseModel
 from datetime import datetime
 import logging
 from app.dependencies import get_current_user, get_database
 from databases import Database
-
+import boto3
+import os
+import uuid
+import json
 logger = logging.getLogger(__name__)
 
-# Models
+# Configure R2 client
+s3_client = boto3.client('s3',
+                         endpoint_url=os.getenv('R2_ENDPOINT_URL'),
+                         aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+                         aws_secret_access_key=os.getenv(
+                             'R2_SECRET_ACCESS_KEY'),
+                         region_name='weur')
+bucket_name = 'multivio'
 
+# Note: R2 CORS must be configured in Cloudflare dashboard
+
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
+CDN_DOMAIN = os.getenv("CDN_DOMAIN", "cdn.multivio.com")
+
+ALLOWED_TYPES = {
+    'image': ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
+    'video': ['.mp4', '.webm', '.mov']
+}
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 
 class MediaBase(BaseModel):
     name: str
@@ -43,6 +63,34 @@ class MediaFile(MediaBase):
 
     class Config:
         from_attributes = True
+
+
+class PresignedUrlRequest(BaseModel):
+    filename: str
+    content_type: str
+    folder_id: Optional[str] = None
+
+
+def configure_r2_cors():
+    cors_configuration = {
+        'CORSRules': [{
+            'AllowedHeaders': ['*'],
+            'AllowedMethods': ['GET', 'PUT', 'HEAD'],
+            'AllowedOrigins': ['https://dev.multivio.com', 'http://localhost:5173'],
+            'ExposeHeaders': ['ETag'],
+            'MaxAgeSeconds': 3000
+        }]
+    }
+
+    try:
+        s3_client.put_bucket_cors(
+            Bucket=bucket_name,
+            CORSConfiguration=cors_configuration
+        )
+        print("Successfully configured CORS on R2 bucket")
+    except Exception as e:
+        print(f"Error configuring CORS: {str(e)}")
+
 
 
 router = APIRouter()
@@ -229,9 +277,9 @@ async def update_file(
 
         update_parts.append("updated_at = CURRENT_TIMESTAMP")
         update_query = f"""
-        UPDATE mo_assets 
+        UPDATE mo_assets
         SET {", ".join(update_parts)}
-        WHERE id = :file_id 
+        WHERE id = :file_id
         AND created_by = :user_id
         AND is_deleted = false
         RETURNING *
@@ -367,3 +415,164 @@ async def move_files(
     except Exception as e:
         logger.error(f"Error in move_files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/upload/presigned")
+async def get_presigned_url(
+    request: PresignedUrlRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    try:
+        # Generate unique key
+        timestamp = datetime.now().strftime('%Y/%m/%d')
+        asset_id = str(uuid.uuid4())
+        ext = os.path.splitext(request.filename)[1].lower()
+        key = f"uploads/{current_user['uid']}/{timestamp}/{asset_id}{ext}"
+
+        try:
+            # Generate presigned URL for PUT
+            presigned_url = s3_client.generate_presigned_url(
+                ClientMethod='put_object',
+                Params={
+                    'Bucket': bucket_name,
+                    'Key': key,
+                    'ContentType': request.content_type
+                },
+                ExpiresIn=3600
+            )
+
+            logger.info(f"Generated presigned URL: {presigned_url}")
+
+            # Insert record
+            query = """
+                INSERT INTO mo_assets (
+                    id, name, type, url, content_type, original_name,
+                    file_size, folder_id, created_by, processing_status,
+                    is_deleted, created_at, updated_at
+                ) VALUES (
+                    :id, :name, :type, :url, :content_type, :original_name,
+                    :file_size, :folder_id, :created_by, :processing_status,
+                    false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+            """
+
+            values = {
+                "id": asset_id,
+                "name": request.filename,
+                "type": request.content_type.split('/')[0],
+                "url": f"https://{CDN_DOMAIN}/{key}",
+                "content_type": request.content_type,
+                "original_name": request.filename,
+                "file_size": 0,
+                "folder_id": request.folder_id,
+                "created_by": current_user["uid"],
+                "processing_status": 'pending'
+            }
+
+            await db.execute(query, values)
+
+            return {
+                "url": presigned_url,
+                "asset_id": asset_id
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to generate presigned URL: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate upload URL: {str(e)}"
+            )
+
+    except Exception as e:
+        logger.error(f"Error in get_presigned_url: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_media_file(asset_id: str, key: str, content_type: str, db: Database = Depends(get_database)):
+    try:
+        # Download from R2
+        local_path = f"/tmp/{os.path.basename(key)}"
+        s3_client.download_file(bucket_name, key, local_path)
+
+        metadata = {}
+        thumbnail_key = None
+
+        if content_type.startswith('image/'):
+            # Process image
+            metadata = process_image(local_path)
+            thumbnail_key = generate_image_thumbnail(local_path, key)
+        elif content_type.startswith('video/'):
+            # Process video
+            metadata = process_video(local_path)
+            thumbnail_key = generate_video_thumbnail(local_path, key)
+
+        # Update asset with metadata
+        await db.execute("""
+            UPDATE mo_assets 
+            SET processing_status = 'completed',
+                metadata = $1,
+                thumbnail_url = $2
+            WHERE id = $3
+            """,
+                         json.dumps(metadata),
+                         f"https://{CDN_DOMAIN}/{thumbnail_key}" if thumbnail_key else None,
+                         asset_id
+                         )
+
+    except Exception as e:
+        # Update asset with error
+        await db.execute("""
+            UPDATE mo_assets 
+            SET processing_status = 'failed',
+                processing_error = $1
+            WHERE id = $2
+            """,
+                         str(e), asset_id
+                         )
+    finally:
+        # Cleanup
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+@router.get("/test-r2-cors")
+async def test_r2_cors():
+    try:
+        # Get current CORS configuration
+        cors = s3_client.get_bucket_cors(Bucket=bucket_name)
+        return {"current_cors_config": cors}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
+
+
+# class PresignedURLResponse(BaseModel):
+#     url: str
+#     fields: dict
+
+
+# @router.get("/upload/get-presigned-url")
+# async def get_presigned_url(filename: str, contentType: Optional[str] = None) -> PresignedURLResponse:
+#     try:
+#         # Generate a unique key for the file
+#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#         key = f"uploads/{timestamp}_{filename}"
+
+#         # Generate presigned POST URL
+#         presigned_data = s3_client.generate_presigned_post(
+#             Bucket=bucket_name,
+#             Key=key,
+#             Fields={
+#                 'Content-Type': contentType or 'application/octet-stream'
+#             },
+#             Conditions=[
+#                 {'Content-Type': contentType or 'application/octet-stream'},
+#                 ['content-length-range', 0, 10485760],  # Up to 10MB
+#             ],
+#             ExpiresIn=3600  # URL expires in 1 hour
+#         )
+
+#         return PresignedURLResponse(url=presigned_data['url'], fields=presigned_data['fields'])
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
