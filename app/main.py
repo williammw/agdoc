@@ -36,10 +36,11 @@ origins = [
     "https://create-n-deploy.vercel.app",
     "https://api.x.ai/v1",
     "https://www.multivio.com",    
+    "https://multivio.com",
     "https://dev.multivio.com",
     "https://dev.ohmeowkase.com",
-    "https://5f8d2b54c46c795fe5d5e6209e3bbbf5.r2.cloudflarestorage.com"
-   
+    "https://5f8d2b54c46c795fe5d5e6209e3bbbf5.r2.cloudflarestorage.com",
+    "https://jellyfish-app-ds6sv.ondigitalocean.app"
 ]
 
 app.add_middleware(
