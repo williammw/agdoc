@@ -10,35 +10,33 @@ from databases import Database
 logger = logging.getLogger(__name__)
 
 # Models
-
-
 class FolderBase(BaseModel):
     name: str
-    parent_id: Optional[str] = None  # Changed from UUID to str
-
-
-
-
+    parent_id: Optional[str] = None
 
 class FolderCreate(FolderBase):
     pass
-
 
 class FolderUpdate(FolderBase):
     name: Optional[str] = None
     parent_id: Optional[UUID] = None
 
+class FolderPosition(BaseModel):
+    id: str
+    position: int
+
+class FolderPositionUpdate(BaseModel):
+    positions: List[FolderPosition]
 
 class Folder(FolderBase):
-    id: str                # Changed from UUID to str
-    created_by: str        # Changed from UUID to str
+    id: str
+    created_by: str
     created_at: datetime
     updated_at: datetime
+    position: int = 0
     is_deleted: bool = False
 
-
 router = APIRouter()
-
 
 @router.get("", response_model=List[Folder])
 async def get_folders(
@@ -56,7 +54,7 @@ async def get_folders(
         WHERE f.created_by = :user_id 
         AND f.is_deleted = false
         GROUP BY f.id
-        ORDER BY f.created_at DESC
+        ORDER BY f.position ASC, f.created_at DESC
         """
 
         folders = await db.fetch_all(
@@ -70,6 +68,60 @@ async def get_folders(
         logger.error(f"Error in get_folders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.put("/positions")
+async def update_folder_positions(
+    positions: FolderPositionUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Update multiple folder positions"""
+    try:
+        # Verify all folders exist and belong to user
+        folder_ids = [p.id for p in positions.positions]
+        verify_query = """
+        SELECT id FROM mo_folders 
+        WHERE id = ANY(:folder_ids)
+        AND created_by = :user_id 
+        AND is_deleted = false
+        """
+        existing_folders = await db.fetch_all(
+            query=verify_query,
+            values={
+                "folder_ids": folder_ids,
+                "user_id": current_user["uid"]
+            }
+        )
+        
+        if len(existing_folders) != len(folder_ids):
+            raise HTTPException(status_code=404, detail="One or more folders not found")
+
+        # Update positions using a transaction
+        async with db.transaction():
+            for position in positions.positions:
+                update_query = """
+                UPDATE mo_folders 
+                SET 
+                    position = :position,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :folder_id 
+                AND created_by = :user_id
+                AND is_deleted = false
+                """
+                
+                await db.execute(
+                    update_query,
+                    values={
+                        "position": position.position,
+                        "folder_id": position.id,
+                        "user_id": current_user["uid"]
+                    }
+                )
+
+        return {"success": True}
+
+    except Exception as e:
+        logger.error(f"Error in update_folder_positions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/folders/{folder_id}", response_model=Folder)
 async def get_folder(
@@ -110,12 +162,6 @@ async def get_folder(
         logger.error(f"Error in get_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-class FolderCreate(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
-
-
 @router.post("")
 async def create_folder(
     folder: FolderCreate,
@@ -124,6 +170,19 @@ async def create_folder(
 ):
     """Create a new folder"""
     try:
+        # Get highest position
+        max_position_query = """
+        SELECT COALESCE(MAX(position), -1) as max_position
+        FROM mo_folders
+        WHERE created_by = :user_id
+        AND is_deleted = false
+        """
+        result = await db.fetch_one(
+            query=max_position_query,
+            values={"user_id": current_user["uid"]}
+        )
+        next_position = result['max_position'] + 1
+
         # Validate parent folder exists if specified
         if folder.parent_id:
             parent_query = """
@@ -152,6 +211,7 @@ async def create_folder(
             created_by,
             created_at,
             updated_at,
+            position,
             is_deleted
         ) VALUES (
             gen_random_uuid(),
@@ -160,6 +220,7 @@ async def create_folder(
             :user_id,
             CURRENT_TIMESTAMP,
             CURRENT_TIMESTAMP,
+            :position,
             false
         ) RETURNING *
         """
@@ -167,7 +228,8 @@ async def create_folder(
         values = {
             "name": folder.name,
             "parent_id": folder.parent_id,
-            "user_id": current_user["uid"]
+            "user_id": current_user["uid"],
+            "position": next_position
         }
 
         result = await db.fetch_one(query=query, values=values)
@@ -176,6 +238,7 @@ async def create_folder(
             "id": result["id"],
             "name": result["name"],
             "parentId": result["parent_id"],
+            "position": result["position"],
             "createdBy": result["created_by"],
             "createdAt": result["created_at"],
             "updatedAt": result["updated_at"]
@@ -184,7 +247,6 @@ async def create_folder(
     except Exception as e:
         logger.error(f"Error in create_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.put("/folders/{folder_id}", response_model=Folder)
 async def update_folder(
@@ -262,7 +324,6 @@ async def update_folder(
     except Exception as e:
         logger.error(f"Error in update_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.delete("/{folder_id}")
 async def delete_folder(

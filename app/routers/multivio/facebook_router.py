@@ -14,6 +14,7 @@ import json
 from app.services.facebook import FacebookAPI
 import httpx
 from enum import Enum
+from typing import Optional
 
 
 class PrivacyType(str, Enum):
@@ -596,4 +597,198 @@ async def upload_photos(
     except Exception as e:
         logger.error(f"Error in upload_photos: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/auth/exchange-token", response_model=dict)
+async def exchange_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Exchange short-lived token for long-lived token"""
+    try:
+        data = await request.json()
+        short_lived_token = data.get("access_token")
+        
+        if not short_lived_token:
+            raise HTTPException(status_code=400, detail="Access token required")
+
+        # Exchange token
+        params = {
+            "grant_type": "fb_exchange_token",
+            "client_id": FACEBOOK_APP_ID,
+            "client_secret": FACEBOOK_APP_SECRET,
+            "fb_exchange_token": short_lived_token
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://graph.facebook.com/{FACEBOOK_API_VERSION}/oauth/access_token",
+                params=params
+            )
+            
+            if response.status_code != 200:
+                error_data = response.json()
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_data.get("error", {}).get("message", "Token exchange failed")
+                )
+
+            token_data = response.json()
+            return token_data
+
+    except Exception as e:
+        logger.error(f"Error exchanging token: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/auth/refresh-token", response_model=dict)
+async def refresh_page_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Refresh page access token"""
+    try:
+        data = await request.json()
+        page_id = data.get("page_id")
+        
+        if not page_id:
+            raise HTTPException(status_code=400, detail="Page ID required")
+
+        # Get current token from database
+        query = """
+        SELECT access_token, platform_account_id
+        FROM mo_social_accounts 
+        WHERE platform_account_id = :page_id 
+        AND user_id = :user_id 
+        AND platform = 'facebook'
+        """
+        
+        account = await db.fetch_one(
+            query=query,
+            values={
+                "page_id": page_id,
+                "user_id": current_user["uid"]
+            }
+        )
+
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        # Get new page access token
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://graph.facebook.com/{FACEBOOK_API_VERSION}/{page_id}",
+                params={
+                    "fields": "access_token",
+                    "access_token": account["access_token"]
+                }
+            )
+            
+            if response.status_code != 200:
+                error_data = response.json()
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_data.get("error", {}).get("message", "Token refresh failed")
+                )
+
+            token_data = response.json()
+            new_token = token_data.get("access_token")
+
+            if not new_token:
+                raise HTTPException(status_code=400, detail="No new token received")
+
+            # Update token in database
+            expires_at = datetime.now(timezone.utc) + timedelta(days=60)
+            
+            update_query = """
+            UPDATE mo_social_accounts 
+            SET access_token = :access_token,
+                expires_at = :expires_at,
+                updated_at = :updated_at
+            WHERE platform_account_id = :page_id 
+            AND user_id = :user_id 
+            AND platform = 'facebook'
+            """
+
+            await db.execute(
+                query=update_query,
+                values={
+                    "access_token": new_token,
+                    "expires_at": expires_at,
+                    "updated_at": datetime.now(timezone.utc),
+                    "page_id": page_id,
+                    "user_id": current_user["uid"]
+                }
+            )
+
+            return {
+                "access_token": new_token,
+                "expires_in": 60 * 24 * 60 * 60  # 60 days in seconds
+            }
+
+    except Exception as e:
+        logger.error(f"Error refreshing token: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/auth/validate-token", response_model=dict)
+async def validate_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Validate and refresh token if needed"""
+    try:
+        data = await request.json()
+        account_id = data.get("account_id")
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID required")
+
+        # Get account from database
+        query = """
+        SELECT 
+            access_token,
+            platform_account_id,
+            expires_at
+        FROM mo_social_accounts 
+        WHERE id = :account_id 
+        AND user_id = :user_id 
+        AND platform = 'facebook'
+        """
+        
+        account = await db.fetch_one(
+            query=query,
+            values={
+                "account_id": account_id,
+                "user_id": current_user["uid"]
+            }
+        )
+
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        # Check if token needs refresh (24 hours before expiry)
+        expires_at = account["expires_at"]
+        buffer_time = timedelta(hours=24)
+        
+        if expires_at - buffer_time <= datetime.now(timezone.utc):
+            # Refresh token
+            refresh_response = await refresh_page_token(
+                request=request,
+                current_user=current_user,
+                db=db
+            )
+            return refresh_response
+        
+        return {
+            "access_token": account["access_token"],
+            "expires_in": int((expires_at - datetime.now(timezone.utc)).total_seconds())
+        }
+
+    except Exception as e:
+        logger.error(f"Error validating token: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
