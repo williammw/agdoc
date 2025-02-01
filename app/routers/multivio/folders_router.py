@@ -248,34 +248,43 @@ async def create_folder(
         logger.error(f"Error in create_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.put("/folders/{folder_id}", response_model=Folder)
+
+@router.put("/modify/{folder_id}", response_model=Folder)
 async def update_folder(
-    folder_id: UUID,
+    folder_id: str,
     folder: FolderUpdate,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
     """Update a folder"""
     try:
+        # Debug log
+        logger.debug(f"Updating folder: {folder_id} with data: {folder}")
+
         # Verify folder exists and belongs to user
         verify_query = """
-        SELECT id FROM mo_folders 
+        SELECT * FROM mo_folders 
         WHERE id = :folder_id 
         AND created_by = :user_id 
         AND is_deleted = false
         """
-        exists = await db.fetch_one(
+        existing_folder = await db.fetch_one(
             query=verify_query,
             values={
                 "folder_id": folder_id,
                 "user_id": current_user["uid"]
             }
         )
-        if not exists:
+        if not existing_folder:
             raise HTTPException(status_code=404, detail="Folder not found")
 
         # Verify parent folder if specified
         if folder.parent_id:
+            # Prevent setting parent to self
+            if str(folder.parent_id) == folder_id:
+                raise HTTPException(
+                    status_code=400, detail="Folder cannot be its own parent")
+
             parent_query = """
             SELECT id FROM mo_folders 
             WHERE id = :parent_id 
@@ -285,7 +294,7 @@ async def update_folder(
             parent = await db.fetch_one(
                 query=parent_query,
                 values={
-                    "parent_id": folder.parent_id,
+                    "parent_id": str(folder.parent_id),
                     "user_id": current_user["uid"]
                 }
             )
@@ -293,25 +302,31 @@ async def update_folder(
                 raise HTTPException(
                     status_code=404, detail="Parent folder not found")
 
-        # Update the folder
-        update_query = """
+        # Build update query dynamically based on provided fields
+        update_parts = []
+        values = {
+            "folder_id": folder_id,
+            "user_id": current_user["uid"]
+        }
+
+        if folder.name is not None:
+            update_parts.append("name = :name")
+            values["name"] = folder.name
+
+        if folder.parent_id is not None:
+            update_parts.append("parent_id = :parent_id")
+            values["parent_id"] = str(folder.parent_id)
+
+        update_parts.append("updated_at = CURRENT_TIMESTAMP")
+
+        update_query = f"""
         UPDATE mo_folders 
-        SET 
-            name = COALESCE(:name, name),
-            parent_id = COALESCE(:parent_id, parent_id),
-            updated_at = CURRENT_TIMESTAMP
+        SET {', '.join(update_parts)}
         WHERE id = :folder_id 
         AND created_by = :user_id
         AND is_deleted = false
         RETURNING *
         """
-
-        values = {
-            "folder_id": folder_id,
-            "user_id": current_user["uid"],
-            "name": folder.name,
-            "parent_id": folder.parent_id
-        }
 
         result = await db.fetch_one(update_query, values)
         if not result:
@@ -374,3 +389,29 @@ async def delete_folder(
     except Exception as e:
         logger.error(f"Error in delete_folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/upload/{file_id}")
+async def delete_file(file_id: str, current_user: dict = Depends(get_current_user), db: Database = Depends(get_database)):
+    try:
+        # First check if file exists and belongs to user
+        file = await db.fetch_one(
+            "SELECT id FROM mo_assets WHERE id = $1 AND created_by = $2 AND is_deleted = false",
+            (file_id, current_user["id"])  # Pass parameters as a tuple
+        )
+
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # Then update is_deleted
+        await db.execute(
+            "UPDATE mo_assets SET is_deleted = true WHERE id = $1 AND created_by = $2",
+            (file_id, current_user["id"])  # Pass parameters as a tuple
+        )
+
+        return {"success": True}
+    except Exception as e:
+        print(f"Delete error: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete file: {str(e)}")
+

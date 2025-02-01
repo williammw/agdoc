@@ -301,13 +301,12 @@ async def update_file(
 
 @router.delete("/files")
 async def delete_files(
-    file_ids: List[str],
+    file_ids: List[str] = Body(...),
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Soft delete multiple files"""
+    """Delete multiple files"""
     try:
-        # Verify files exist and belong to user
         verify_query = """
         SELECT id FROM mo_assets
         WHERE id = ANY(:file_ids)
@@ -320,27 +319,18 @@ async def delete_files(
         )
 
         if len(files) != len(file_ids):
-            raise HTTPException(
-                status_code=404, detail="One or more files not found")
-
-        # Soft delete the files
-        delete_query = """
-        UPDATE mo_assets
-        SET 
-            is_deleted = true,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ANY(:file_ids)
-        AND created_by = :user_id
-        AND is_deleted = false
-        """
+            raise HTTPException(status_code=404, detail="One or more files not found")
 
         await db.execute(
-            delete_query,
+            """
+            UPDATE mo_assets
+            SET is_deleted = true, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ANY(:file_ids) AND created_by = :user_id
+            """,
             {"file_ids": file_ids, "user_id": current_user["uid"]}
         )
 
         return {"success": True}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -348,15 +338,20 @@ async def delete_files(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/files/move")
+@router.post("/move-files")
 async def move_files(
-    file_ids: List[str],
-    folder_id: Optional[str] = None,
+    payload: dict = Body(...),  # This will parse the request body
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
     """Move files to a different folder"""
     try:
+        file_ids = payload.get("fileIds", [])
+        folder_id = payload.get("folderId")
+
+        if not file_ids:
+            raise HTTPException(status_code=400, detail="No files specified")
+
         # Verify files exist and belong to user
         verify_query = """
         SELECT id FROM mo_assets
@@ -417,7 +412,6 @@ async def move_files(
         logger.error(f"Error in move_files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/upload/presigned")
 async def get_presigned_url(
     request: PresignedUrlRequest,
@@ -475,7 +469,8 @@ async def get_presigned_url(
 
             return {
                 "url": presigned_url,
-                "asset_id": asset_id
+                "asset_id": asset_id,
+                "public_url": f"https://{CDN_DOMAIN}/{key}"
             }
 
         except Exception as e:
@@ -488,7 +483,6 @@ async def get_presigned_url(
     except Exception as e:
         logger.error(f"Error in get_presigned_url: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 async def process_media_file(asset_id: str, key: str, content_type: str, db: Database = Depends(get_database)):
     try:
@@ -516,10 +510,10 @@ async def process_media_file(asset_id: str, key: str, content_type: str, db: Dat
                 thumbnail_url = $2
             WHERE id = $3
             """,
-                         json.dumps(metadata),
-                         f"https://{CDN_DOMAIN}/{thumbnail_key}" if thumbnail_key else None,
-                         asset_id
-                         )
+                json.dumps(metadata),
+                f"https://{CDN_DOMAIN}/{thumbnail_key}" if thumbnail_key else None,
+                asset_id
+                )
 
     except Exception as e:
         # Update asset with error
@@ -529,8 +523,8 @@ async def process_media_file(asset_id: str, key: str, content_type: str, db: Dat
                 processing_error = $1
             WHERE id = $2
             """,
-                         str(e), asset_id
-                         )
+                str(e), asset_id
+                )
     finally:
         # Cleanup
         if os.path.exists(local_path):
@@ -547,33 +541,38 @@ async def test_r2_cors():
         return {"error": str(e), "type": type(e).__name__}
 
 
-# class PresignedURLResponse(BaseModel):
-#     url: str
-#     fields: dict
 
 
-# @router.get("/upload/get-presigned-url")
-# async def get_presigned_url(filename: str, contentType: Optional[str] = None) -> PresignedURLResponse:
-#     try:
-#         # Generate a unique key for the file
-#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#         key = f"uploads/{timestamp}_{filename}"
+@router.delete("/files/{file_id}")
+async def delete_file(
+    file_id: str, 
+    current_user: dict = Depends(get_current_user), 
+    db: Database = Depends(get_database)
+):
+    """Delete a single file"""
+    try:
+        # Verify file exists and belongs to user
+        file = await db.fetch_one(
+            "SELECT id FROM mo_assets WHERE id = :file_id AND created_by = :user_id AND is_deleted = false",
+            {"file_id": file_id, "user_id": current_user["uid"]}
+        )
 
-#         # Generate presigned POST URL
-#         presigned_data = s3_client.generate_presigned_post(
-#             Bucket=bucket_name,
-#             Key=key,
-#             Fields={
-#                 'Content-Type': contentType or 'application/octet-stream'
-#             },
-#             Conditions=[
-#                 {'Content-Type': contentType or 'application/octet-stream'},
-#                 ['content-length-range', 0, 10485760],  # Up to 10MB
-#             ],
-#             ExpiresIn=3600  # URL expires in 1 hour
-#         )
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
 
-#         return PresignedURLResponse(url=presigned_data['url'], fields=presigned_data['fields'])
+        # Soft delete
+        await db.execute(
+            """
+            UPDATE mo_assets 
+            SET is_deleted = true, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = :file_id AND created_by = :user_id
+            """,
+            {"file_id": file_id, "user_id": current_user["uid"]}
+        )
 
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

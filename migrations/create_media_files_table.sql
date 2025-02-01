@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS mo_media_files (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    content_type VARCHAR(255) NOT NULL,
+    url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    folder_id UUID REFERENCES mo_folders(id),
+    size BIGINT,
+    width INTEGER,
+    height INTEGER,
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    processing_status VARCHAR(50) DEFAULT 'pending',
+    processing_error TEXT,
+    metadata JSONB DEFAULT '{}',
+    usage_count INTEGER DEFAULT 0,
+    is_deleted BOOLEAN DEFAULT false
+);
