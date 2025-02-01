@@ -64,6 +64,16 @@ class InstagramPostRequest(BaseModel):
     hide_likes: bool = Field(default=False)
     hide_comments: bool = Field(default=False)
 
+class CarouselPostRequest(BaseModel):
+    """Request model for carousel posts with media URLs"""
+    account_id: str
+    media_urls: List[str] = Field(...,
+                                  description="List of media URLs to include in carousel")
+    caption: str
+    location: Optional[str] = None
+    hide_likes: bool = Field(default=False)
+    hide_comments: bool = Field(default=False)
+
 
 class InstagramDisconnectRequest(BaseModel):
     account_id: str
@@ -100,6 +110,11 @@ logger.info(f"FACEBOOK_APP_ID present: {bool(FACEBOOK_APP_ID)}")
 logger.info(f"FACEBOOK_APP_SECRET present: {bool(FACEBOOK_APP_SECRET)}")
 logger.info(f"FRONTEND_URL: {FRONTEND_URL}")
 
+
+async def get_media_type(url: str) -> str:
+    """Determine if a URL points to an image or video."""
+    video_extensions = ('.mp4', '.mov', '.avi')
+    return 'VIDEO' if any(url.lower().endswith(ext) for ext in video_extensions) else 'IMAGE'
 
 @router.post("/auth/init", response_model=OAuthInitResponse)
 async def instagram_auth_init(
@@ -856,81 +871,143 @@ async def check_token_status(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+# Then add the new endpoint:
+
 @router.post("/posts/carousel")
 async def create_carousel_post(
-    request: InstagramPostRequest,
+    request: CarouselPostRequest,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Create a carousel post on Instagram"""
+    """Create a carousel post on Instagram using media URLs"""
     try:
         # Get account info
-        query = """
-        SELECT access_token, platform_account_id
-        FROM mo_social_accounts 
-        WHERE id = :account_id AND user_id = :user_id AND platform = 'instagram'
-        """
-        account = await db.fetch_one(
-            query=query,
-            values={
-                "account_id": request.account_id,
-                "user_id": current_user["uid"]
-            }
-        )
+        account = await get_instagram_account(db, request.account_id, current_user["uid"])
 
-        if not account:
+        # First, determine media types and validate
+        logger.info(
+            f"Creating containers for {len(request.media_urls)} media items")
+        media_types = [await get_media_type(url) for url in request.media_urls]
+
+        # Ensure all media types are the same
+        unique_types = set(media_types)
+        if len(unique_types) > 1:
             raise HTTPException(
-                status_code=404, detail="Instagram account not found")
+                status_code=400,
+                detail="Instagram carousel posts must contain either all images or all videos. Mixed media types are not supported."
+            )
 
-        async with httpx.AsyncClient() as client:
-            # Create carousel container
-            container_url = f"{INSTAGRAM_GRAPH_URL}/{account['platform_account_id']}/media"
+        media_type = media_types[0]  # All items are the same type
+        logger.info(f"Carousel media type: {media_type}")
 
-            container_data = {
+        async with httpx.AsyncClient(timeout=httpx.Timeout(UPLOAD_TIMEOUT)) as client:
+            container_ids = []
+
+            # Create containers for each media URL
+            for media_url in request.media_urls:
+                try:
+                    container_url = f"{INSTAGRAM_GRAPH_URL}/{account['platform_account_id']}/media"
+
+                    # Set up container data based on media type
+                    container_data = {
+                        "access_token": account["access_token"],
+                        "media_type": media_type
+                    }
+
+                    if media_type == "IMAGE":
+                        container_data["image_url"] = media_url
+                    else:  # VIDEO
+                        container_data["video_url"] = media_url
+
+                    container_response = await client.post(container_url, data=container_data)
+                    if container_response.status_code != 200:
+                        error_data = container_response.json()
+                        raise HTTPException(
+                            status_code=container_response.status_code,
+                            detail=f"Failed to create container for {media_url}: {error_data.get('error', {}).get('message', 'Unknown error')}"
+                        )
+
+                    container_id = container_response.json()["id"]
+                    container_ids.append(container_id)
+                    logger.info(
+                        f"Created container {container_id} for URL {media_url}")
+
+                    # If it's a video, wait for processing
+                    if media_type == "VIDEO":
+                        await check_media_status(client, container_id, account["access_token"])
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to create container for URL {media_url}: {str(e)}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to process media: {str(e)}"
+                    )
+
+            # Create the carousel container
+            carousel_url = f"{INSTAGRAM_GRAPH_URL}/{account['platform_account_id']}/media"
+
+            carousel_data = {
+                "media_type": "CAROUSEL",
                 "caption": request.caption,
                 "access_token": account["access_token"],
-                "media_type": "CAROUSEL",
-                "children": request.media_ids
+                "children": ",".join(container_ids)
             }
 
             if request.location:
-                container_data["location"] = request.location
+                carousel_data["location"] = request.location
 
-            container_response = await client.post(container_url, data=container_data)
+            # Create and publish carousel with retry logic
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    # Create carousel container
+                    carousel_response = await client.post(carousel_url, data=carousel_data)
+                    carousel_response.raise_for_status()
+                    creation_id = carousel_response.json()["id"]
+                    logger.info(
+                        f"Created carousel container with ID: {creation_id}")
 
-            if container_response.status_code != 200:
-                error_data = container_response.json()
-                raise HTTPException(
-                    status_code=container_response.status_code,
-                    detail=error_data.get("error", {}).get(
-                        "message", "Failed to create carousel")
-                )
+                    # For video carousels, wait for processing
+                    if media_type == "VIDEO":
+                        await check_media_status(client, creation_id, account["access_token"])
 
-            creation_id = container_response.json()["id"]
+                    # Publish the carousel
+                    publish_url = f"{INSTAGRAM_GRAPH_URL}/{account['platform_account_id']}/media_publish"
+                    publish_data = {
+                        "creation_id": creation_id,
+                        "access_token": account["access_token"]
+                    }
 
-            # Publish the carousel
-            publish_url = f"{INSTAGRAM_GRAPH_URL}/{account['platform_account_id']}/media_publish"
-            publish_data = {
-                "creation_id": creation_id,
-                "access_token": account["access_token"]
-            }
+                    publish_response = await client.post(publish_url, data=publish_data)
+                    publish_response.raise_for_status()
 
-            publish_response = await client.post(publish_url, data=publish_data)
+                    return publish_response.json()
 
-            if publish_response.status_code != 200:
-                error_data = publish_response.json()
-                raise HTTPException(
-                    status_code=publish_response.status_code,
-                    detail=error_data.get("error", {}).get(
-                        "message", "Failed to publish carousel")
-                )
+                except httpx.HTTPError as e:
+                    if attempt == max_attempts - 1:  # Last attempt
+                        error_data = e.response.json() if hasattr(e, 'response') else {}
+                        error_message = error_data.get("error", {}).get(
+                            "message", "Failed to publish carousel")
+                        logger.error(
+                            f"Carousel publishing failed: {error_message}")
+                        raise HTTPException(
+                            status_code=e.response.status_code if hasattr(
+                                e, 'response') else 500,
+                            detail=error_message
+                        )
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-            return publish_response.json()
-
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Error in create_carousel_post: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 @router.post("/auth/disconnect", response_model=InstagramDisconnectResponse)
