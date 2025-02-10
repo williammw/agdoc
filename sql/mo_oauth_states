@@ -1,0 +1,9 @@
+-- Should already exist based on Instagram implementation
+CREATE TABLE IF NOT EXISTS mo_oauth_states (
+    state VARCHAR(255) PRIMARY KEY,
+    platform VARCHAR(50) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    metadata JSONB,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE
+);
