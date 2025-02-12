@@ -33,8 +33,16 @@ class TokenData(BaseModel):
     username: Optional[str] = None
 
 
+# Update the database dependency to use yield
 async def get_database():
-    return database
+    """
+    Dependency that yields the database instance
+    """
+    try:
+        yield database
+    except Exception as e:
+        logger.error(f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 # v1
 # async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):

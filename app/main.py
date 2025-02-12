@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, rag_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, grok_router, openai_router
 # Add this import
 from app.routers.multivio import linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router
 
@@ -17,12 +17,15 @@ import logging
 # os.environ["KMP_INIT_AT_FORK"] = "FALSE"
 
 
+
 # Load environment variables from .env file
 load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=app_lifespan, debug=True)
 logger = logging.getLogger(__name__)
+
+
 
 # CORS configuration
 origins = [
@@ -66,7 +69,7 @@ router_list = [
     (auth2_router.router, "/api/v2/auth", ["auth"]),
     (chat_router.router, "/api/v1", ["chats"]),
     (cv_router.router, "/api/v1/cv", ["cv"]),
-    (rag_router.router, "/api/v1/rag", ["rag"]),
+    # (rag_router.router, "/api/v1/rag", ["rag"]),
     (live_stream_router.router, "/api/v1/live-stream", ["live-stream"]),
     (users_router.router, "/api/v1/users", ["users"]),
     (posts_router.router, "/api/v1/posts", ["posts"]),
@@ -110,6 +113,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         content={"detail": exc.detail},
     )
+
+
 
 @app.get("/")
 async def greeting():

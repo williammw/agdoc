@@ -54,3 +54,10 @@ CREATE INDEX idx_content_version_content_id ON mo_content_version(content_id, fi
 CREATE INDEX idx_social_post_content_id ON mo_social_post(content_id, firebase_uid);
 CREATE INDEX idx_social_post_platform ON mo_social_post(platform);
 CREATE INDEX idx_social_post_status ON mo_social_post(post_status);
+
+
+ALTER TABLE mo_social_accounts
+ADD COLUMN oauth1_token TEXT,
+ADD COLUMN oauth1_token_secret TEXT;
+
+CREATE INDEX idx_social_accounts_oauth1 ON mo_social_accounts(oauth1_token) WHERE oauth1_token IS NOT NULL;

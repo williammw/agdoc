@@ -3,7 +3,11 @@ CREATE TABLE IF NOT EXISTS mo_oauth_states (
     state VARCHAR(255) PRIMARY KEY,
     platform VARCHAR(50) NOT NULL,
     user_id VARCHAR(255) NOT NULL,
+    code_verifier TEXT,
     metadata JSONB,
     expires_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE
 );
+
+-- Add code_verifier column if it doesn't exist
+ALTER TABLE mo_oauth_states ADD COLUMN IF NOT EXISTS code_verifier TEXT;
