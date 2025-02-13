@@ -12,6 +12,7 @@ from app.models.models import User
 from datetime import datetime, timedelta
 import os
 import logging
+import traceback
 
 from fastapi import Depends, HTTPException, status
 
@@ -42,7 +43,11 @@ async def get_database():
         yield database
     except Exception as e:
         logger.error(f"Database error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Database error")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database connection error: {str(e)}"
+        )
 
 # v1
 # async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):

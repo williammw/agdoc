@@ -1,7 +1,7 @@
 import logging
 import secrets
 import httpx
-from fastapi import APIRouter, HTTPException, Depends, Request, Header
+from fastapi import APIRouter, HTTPException, Depends, Request, Header, File, UploadFile, Form
 from databases import Database
 from datetime import datetime, timezone, timedelta
 from app.dependencies import get_current_user, get_database
@@ -9,6 +9,19 @@ from typing import Optional
 import os
 import json
 import traceback
+import base64
+import hashlib
+from pydantic import BaseModel, Field, field_validator
+from typing import List
+
+import mimetypes
+import math
+from typing import Optional, List, Dict, Any
+import asyncio
+import httpx
+import requests
+import time
+
 
 router = APIRouter(tags=["twitter"])
 logger = logging.getLogger(__name__)
@@ -19,7 +32,16 @@ TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
 TWITTER_API_V2 = "https://api.x.com/2"
 CALLBACK_URL = os.getenv("TWITTER_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
-TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
+# TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
+TWITTER_UPLOAD_API = "https://api.x.com/2/media/upload"
+# Add these constants
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for uploads
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB for images
+MAX_VIDEO_SIZE = 15 * 1024 * 1024  # 15MB for videos
+ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif'}
+ALLOWED_VIDEO_TYPES = {'video/mp4'}
+
+
 
 
 @router.post("/auth/init")
@@ -506,8 +528,370 @@ async def disconnect_twitter_account(
             raise e
         raise HTTPException(status_code=500, detail=str(e))
 
-# Utility functions
 
+class MediaUploadResponse(BaseModel):
+    media_id: str
+    expires_after_secs: Optional[int]
+    processing_info: Optional[Dict[str, Any]]
+
+
+async def check_media_processing(
+    client: httpx.AsyncClient,
+    media_id: str,
+    access_token: str,
+    timeout: int = 30
+) -> bool:
+    """Check media processing status with timeout"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = await client.get(
+                TWITTER_UPLOAD_API,
+                params={
+                    "command": "STATUS",
+                    "media_id": media_id
+                },
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to check media status"
+                )
+
+            data = response.json()
+            processing_info = data.get("processing_info", {})
+
+            if processing_info.get("state") == "succeeded":
+                return True
+            elif processing_info.get("state") == "failed":
+                error = processing_info.get("error", {})
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Media processing failed: {error.get('message', 'Unknown error')}"
+                )
+
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Error checking media status: {str(e)}")
+            raise
+
+    raise HTTPException(
+        status_code=408,
+        detail="Media processing timeout"
+    )
+
+
+@router.post("/media/upload", response_model=MediaUploadResponse)
+async def upload_media(
+    file: UploadFile = File(...),
+    access_token: str = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Upload media using chunked upload for Twitter"""
+    try:
+        # Validate file type
+        content_type = file.content_type or mimetypes.guess_type(file.filename)[
+            0]
+        if not content_type:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not determine file type"
+            )
+
+        is_video = content_type in ALLOWED_VIDEO_TYPES
+        is_image = content_type in ALLOWED_IMAGE_TYPES
+
+        if not (is_video or is_image):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Only JPEG, PNG, GIF, and MP4 are supported"
+            )
+
+        # Read file into memory and check size
+        file_content = await file.read()
+        file_size = len(file_content)
+
+        if is_image and file_size > MAX_IMAGE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail="Image file too large. Maximum size is 5MB"
+            )
+        elif is_video and file_size > MAX_VIDEO_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail="Video file too large. Maximum size is 15MB"
+            )
+
+        async with httpx.AsyncClient() as client:
+            # INIT - Initialize upload
+            init_data = {
+                "command": "INIT",
+                "total_bytes": file_size,
+                "media_type": content_type,
+                "media_category": "tweet_video" if is_video else "tweet_image"
+            }
+
+            init_response = await client.post(
+                TWITTER_UPLOAD_API,
+                data=init_data,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+            if init_response.status_code != 200:
+                raise HTTPException(
+                    status_code=init_response.status_code,
+                    detail="Failed to initialize media upload"
+                )
+
+            media_id = init_response.json()["media_id_string"]
+
+            # APPEND - Upload chunks
+            chunk_size = CHUNK_SIZE
+            chunks = math.ceil(file_size / chunk_size)
+
+            for i in range(chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, file_size)
+                chunk = file_content[start:end]
+
+                append_data = {
+                    "command": "APPEND",
+                    "media_id": media_id,
+                    "segment_index": i
+                }
+
+                files = {
+                    "media": chunk
+                }
+
+                append_response = await client.post(
+                    TWITTER_UPLOAD_API,
+                    data=append_data,
+                    files=files,
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+
+                if append_response.status_code != 200:
+                    raise HTTPException(
+                        status_code=append_response.status_code,
+                        detail=f"Failed to upload chunk {i + 1}/{chunks}"
+                    )
+
+            # FINALIZE - Complete upload
+            finalize_data = {
+                "command": "FINALIZE",
+                "media_id": media_id
+            }
+
+            finalize_response = await client.post(
+                TWITTER_UPLOAD_API,
+                data=finalize_data,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+            if finalize_response.status_code != 200:
+                raise HTTPException(
+                    status_code=finalize_response.status_code,
+                    detail="Failed to finalize media upload"
+                )
+
+            result = finalize_response.json()
+
+            # For videos, wait for processing
+            if is_video and "processing_info" in result:
+                await check_media_processing(client, media_id, access_token)
+
+            return MediaUploadResponse(
+                media_id=media_id,
+                expires_after_secs=result.get("expires_after_secs"),
+                processing_info=result.get("processing_info")
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading media: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload media: {str(e)}"
+        )
+
+
+class TweetRequest(BaseModel):
+    text: str
+    media_ids: Optional[List[str]] = Field(default=[])
+    is_thread: Optional[bool] = Field(default=False)
+    thread_texts: Optional[List[str]] = Field(default=[])
+    reply_settings: Optional[str] = Field(default="mentionedUsers")
+    access_token: str
+
+    @field_validator('media_ids')
+    def validate_media_ids(cls, v):
+        if len(v) > 4:
+            raise ValueError("Maximum 4 media items allowed per tweet")
+        return v
+
+
+@router.post("/tweets")
+async def create_tweet(
+    tweet_data: TweetRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Create a new tweet with media support"""
+    try:
+        # Validate access token first
+        try:
+            async with httpx.AsyncClient() as client:
+                auth_check = await client.get(
+                    f"{TWITTER_API_V2}/users/me",
+                    headers={"Authorization": f"Bearer {tweet_data.access_token}"}
+                )
+                if auth_check.status_code != 200:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Invalid or expired access token"
+                    )
+        except httpx.RequestError as e:
+            logger.error(f"Token validation error: {str(e)}")
+            raise HTTPException(
+                status_code=401,
+                detail=f"Failed to validate token: {str(e)}"
+            )
+
+        # Prepare tweet payload
+        payload = {
+            "text": tweet_data.text
+        }
+
+        # Add media if present
+        if tweet_data.media_ids:
+            payload["media"] = {
+                "media_ids": tweet_data.media_ids
+            }
+
+        if tweet_data.reply_settings:
+            payload["reply_settings"] = tweet_data.reply_settings
+
+        # Log the payload for debugging
+        logger.info(f"Creating tweet with payload: {payload}")
+
+        # Create the tweet
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{TWITTER_API_V2}/tweets",
+                headers={
+                    "Authorization": f"Bearer {tweet_data.access_token}",
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            )
+
+            if response.status_code != 201:
+                error_data = response.json()
+                logger.error(f"Twitter API error: {error_data}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=error_data.get("errors", [{}])[0].get(
+                        "message", "Failed to create tweet")
+                )
+
+            result = response.json()
+
+            # Store tweet in database
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO mo_tweets (
+                        user_id,
+                        tweet_id,
+                        content,
+                        media_ids,
+                        created_at
+                    ) VALUES (
+                        :user_id,
+                        :tweet_id,
+                        :content,
+                        :media_ids,
+                        CURRENT_TIMESTAMP
+                    )
+                    """,
+                    {
+                        "user_id": current_user["uid"],
+                        "tweet_id": result["data"]["id"],
+                        "content": tweet_data.text,
+                        "media_ids": json.dumps(tweet_data.media_ids)
+                    }
+                )
+            except Exception as db_error:
+                logger.error(f"Database error: {str(db_error)}")
+                # Return success even if database storage fails
+                return result
+
+            return result
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error creating tweet: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create tweet: {str(e)}"
+        )
+
+
+@router.get("/auth/validate-token/{account_id}")
+async def validate_token(
+    account_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Validate user's Twitter token"""
+    try:
+        query = """
+        SELECT access_token
+        FROM mo_social_accounts 
+        WHERE id = :account_id 
+        AND user_id = :user_id 
+        AND platform = 'twitter'
+        """
+
+        account = await db.fetch_one(
+            query=query,
+            values={
+                "account_id": account_id,
+                "user_id": current_user["uid"]
+            }
+        )
+
+        if not account:
+            return {"valid": False, "error": "Account not found"}
+
+        # Test the token
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{TWITTER_API_V2}/users/me",
+                headers={"Authorization": f"Bearer {account['access_token']}"}
+            )
+
+            if response.status_code != 200:
+                return {"valid": False, "error": "Invalid or expired token"}
+
+            return {
+                "valid": True,
+                "access_token": account["access_token"]
+            }
+
+    except Exception as e:
+        logger.error(f"Error validating token: {str(e)}")
+        return {
+            "valid": False,
+            "error": f"Token validation failed: {str(e)}"
+        }
 
 def generate_code_challenge(code_verifier: str) -> str:
     """Generate PKCE code challenge from verifier"""
@@ -516,3 +900,6 @@ def generate_code_challenge(code_verifier: str) -> str:
 
     sha256_hash = hashlib.sha256(code_verifier.encode()).digest()
     return base64.urlsafe_b64encode(sha256_hash).decode().rstrip("=")
+
+
+
