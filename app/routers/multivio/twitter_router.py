@@ -21,6 +21,7 @@ CALLBACK_URL = os.getenv("TWITTER_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
 TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
 
+
 @router.post("/auth/init")
 async def init_oauth(
     current_user: dict = Depends(get_current_user),
@@ -98,204 +99,227 @@ async def oauth_callback(
     db: Database = Depends(get_database)
 ):
     """Handle Twitter OAuth callback"""
-    try:
-        # Log incoming request data
-        data = await request.json()
-        logger.info(f"Received callback data: {data}")
-        code = data.get("code")
-        state = data.get("state")
+    async with db.transaction():
+        try:
+            # Log incoming request data
+            data = await request.json()
+            logger.info(f"Received callback data: {data}")
+            code = data.get("code")
+            state = data.get("state")
 
-        if not code or not state:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing code or state parameter"
-            )
-
-        # Verify state and get stored data
-        logger.info(f"Verifying state: {state}")
-        query = """
-        SELECT 
-            state, user_id, code_verifier, 
-            expires_at AT TIME ZONE 'UTC' as expires_at
-        FROM mo_oauth_states 
-        WHERE state = :state 
-        AND platform = 'twitter'
-        """
-
-        stored_data = await db.fetch_one(query=query, values={"state": state})
-        logger.info(f"Retrieved stored data: {stored_data}")
-
-        if not stored_data:
-            raise HTTPException(status_code=400, detail="Invalid state")
-
-        # Convert expires_at to timezone-aware datetime if it isn't already
-        expires_at = stored_data["expires_at"]
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-        if expires_at < datetime.now(timezone.utc):
-            raise HTTPException(status_code=400, detail="State expired")
-
-        if stored_data["user_id"] != current_user["uid"]:
-            raise HTTPException(status_code=400, detail="User mismatch")
-
-        # Check for already processed code
-        account_query = """
-        SELECT id FROM mo_social_accounts 
-        WHERE user_id = :user_id 
-        AND platform = 'twitter'
-        AND metadata->>'oauth_code' = :code
-        """
-        
-        existing_account = await db.fetch_one(
-            query=account_query,
-            values={
-                "user_id": current_user["uid"],
-                "code": code
-            }
-        )
-
-        if existing_account:
-            return {
-                "message": "Account already connected",
-                "success": True
-            }
-
-        # Exchange code for tokens
-        token_url = f"{TWITTER_API_V2}/oauth2/token"
-        token_data = {
-            'code': code,
-            'grant_type': 'authorization_code',
-            'client_id': TWITTER_CLIENT_ID,
-            'redirect_uri': CALLBACK_URL,
-            'code_verifier': stored_data["code_verifier"]
-        }
-
-        logger.info(f"Exchanging code for token with data: {token_data}")
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(
-                token_url,
-                data=token_data,
-                auth=(TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET)
-            )
-
-            if token_response.status_code != 200:
-                error_data = token_response.json()
-                logger.error(f"Token exchange failed: {error_data}")
+            if not code or not state:
                 raise HTTPException(
-                    status_code=token_response.status_code,
-                    detail=f"Failed to exchange code for token: {error_data.get('error_description', '')}"
+                    status_code=400,
+                    detail="Missing code or state parameter"
                 )
 
-            tokens = token_response.json()
-            logger.info("Successfully obtained tokens")
+            # Verify state and get stored data
+            logger.info(f"Verifying state: {state}")
+            query = """
+            SELECT 
+                state, user_id, code_verifier, 
+                expires_at AT TIME ZONE 'UTC' as expires_at
+            FROM mo_oauth_states 
+            WHERE state = :state 
+            AND platform = 'twitter'
+            FOR UPDATE
+            """
 
-            # Get user info
-            user_response = await client.get(
-                f"{TWITTER_API_V2}/users/me",
-                headers={
-                    "Authorization": f"Bearer {tokens['access_token']}",
-                },
-                params={
-                    "user.fields": "profile_image_url,verified,public_metrics"
+            stored_data = await db.fetch_one(query=query, values={"state": state})
+            logger.info(f"Retrieved stored data: {stored_data}")
+
+            if not stored_data:
+                raise HTTPException(status_code=400, detail="Invalid state")
+
+            # Convert expires_at to timezone-aware datetime if it isn't already
+            expires_at = stored_data["expires_at"]
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+            if expires_at < datetime.now(timezone.utc):
+                # Clean up expired state
+                await db.execute(
+                    "DELETE FROM mo_oauth_states WHERE state = :state",
+                    {"state": state}
+                )
+                raise HTTPException(status_code=400, detail="State expired")
+
+            if stored_data["user_id"] != current_user["uid"]:
+                raise HTTPException(status_code=400, detail="User mismatch")
+
+            # Check for already processed code
+            account_query = """
+            SELECT id FROM mo_social_accounts 
+            WHERE user_id = :user_id 
+            AND platform = 'twitter'
+            AND metadata->>'oauth_code' = :code
+            FOR UPDATE
+            """
+
+            existing_account = await db.fetch_one(
+                account_query,
+                values={
+                    "user_id": current_user["uid"],
+                    "code": code
                 }
             )
 
-            if user_response.status_code != 200:
-                error_data = user_response.json()
-                logger.error(f"Failed to get user info: {error_data}")
-                raise HTTPException(
-                    status_code=user_response.status_code,
-                    detail="Failed to get user info"
+            if existing_account:
+                # Clean up used state
+                await db.execute(
+                    "DELETE FROM mo_oauth_states WHERE state = :state",
+                    {"state": state}
+                )
+                return {
+                    "message": "Account already connected",
+                    "success": True
+                }
+
+            # Exchange code for tokens
+            token_url = f"{TWITTER_API_V2}/oauth2/token"
+            token_data = {
+                'code': code,
+                'grant_type': 'authorization_code',
+                'client_id': TWITTER_CLIENT_ID,
+                'redirect_uri': CALLBACK_URL,
+                'code_verifier': stored_data["code_verifier"]
+            }
+
+            logger.info(f"Exchanging code for token with data: {token_data}")
+            async with httpx.AsyncClient() as client:
+                token_response = await client.post(
+                    token_url,
+                    data=token_data,
+                    auth=(TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET)
                 )
 
-            user_data = user_response.json()["data"]
-            logger.info(f"Retrieved user data: {user_data}")
+                if token_response.status_code != 200:
+                    error_data = token_response.json()
+                    logger.error(f"Token exchange failed: {error_data}")
+                    # Clean up state on error
+                    await db.execute(
+                        "DELETE FROM mo_oauth_states WHERE state = :state",
+                        {"state": state}
+                    )
+                    raise HTTPException(
+                        status_code=token_response.status_code,
+                        detail=f"Failed to exchange code for token: {error_data.get('error_description', '')}"
+                    )
 
-            # Store in database
-            now = datetime.now(timezone.utc)
-            expires_at = now + timedelta(seconds=tokens['expires_in'])
+                tokens = token_response.json()
+                logger.info("Successfully obtained tokens")
 
-            # Store account in database
-            query = """
-            INSERT INTO mo_social_accounts (
-                user_id,
-                platform,
-                platform_account_id,
-                username,
-                profile_picture_url,
-                access_token,
-                refresh_token,
-                expires_at,
-                metadata,
-                created_at,
-                updated_at
-            ) VALUES (
-                :user_id,
-                'twitter',
-                :platform_account_id,
-                :username,
-                :profile_picture_url,
-                :access_token,
-                :refresh_token,
-                :expires_at,
-                :metadata,
-                :created_at,
-                :created_at
+                # Get user info
+                user_response = await client.get(
+                    f"{TWITTER_API_V2}/users/me",
+                    headers={
+                        "Authorization": f"Bearer {tokens['access_token']}",
+                    },
+                    params={
+                        "user.fields": "profile_image_url,verified,public_metrics"
+                    }
+                )
+
+                if user_response.status_code != 200:
+                    error_data = user_response.json()
+                    logger.error(f"Failed to get user info: {error_data}")
+                    # Clean up state on error
+                    await db.execute(
+                        "DELETE FROM mo_oauth_states WHERE state = :state",
+                        {"state": state}
+                    )
+                    raise HTTPException(
+                        status_code=user_response.status_code,
+                        detail="Failed to get user info"
+                    )
+
+                user_data = user_response.json()["data"]
+                logger.info(f"Retrieved user data: {user_data}")
+
+                # Store in database
+                now = datetime.now(timezone.utc)
+                expires_at = now + timedelta(seconds=tokens['expires_in'])
+
+                # Store account in database
+                query = """
+                INSERT INTO mo_social_accounts (
+                    user_id,
+                    platform,
+                    platform_account_id,
+                    username,
+                    profile_picture_url,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    metadata,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    :user_id,
+                    'twitter',
+                    :platform_account_id,
+                    :username,
+                    :profile_picture_url,
+                    :access_token,
+                    :refresh_token,
+                    :expires_at,
+                    :metadata,
+                    :created_at,
+                    :created_at
+                )
+                ON CONFLICT (platform, user_id, platform_account_id)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    profile_picture_url = EXCLUDED.profile_picture_url,
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    expires_at = EXCLUDED.expires_at,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = EXCLUDED.created_at
+                """
+
+                values = {
+                    "user_id": current_user["uid"],
+                    "platform_account_id": user_data["id"],
+                    "username": user_data["username"],
+                    "profile_picture_url": user_data.get("profile_image_url"),
+                    "access_token": tokens["access_token"],
+                    "refresh_token": tokens.get("refresh_token"),
+                    "expires_at": expires_at,
+                    "metadata": json.dumps({
+                        "verified": user_data.get("verified", False),
+                        "metrics": user_data.get("public_metrics", {}),
+                        "oauth_code": code  # Track processed codes
+                    }),
+                    "created_at": now
+                }
+
+                await db.execute(query=query, values=values)
+                logger.info("Successfully stored account data")
+
+                # Clean up used state AFTER successful processing
+                await db.execute(
+                    "DELETE FROM mo_oauth_states WHERE state = :state",
+                    {"state": state}
+                )
+
+                return {
+                    "access_token": tokens["access_token"],
+                    "refresh_token": tokens.get("refresh_token"),
+                    "expires_in": tokens["expires_in"]
+                }
+
+        except Exception as e:
+            logger.error(f"Error in oauth_callback: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+            if isinstance(e, HTTPException):
+                raise e
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process callback: {str(e)}"
             )
-            ON CONFLICT (platform, user_id, platform_account_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                profile_picture_url = EXCLUDED.profile_picture_url,
-                access_token = EXCLUDED.access_token,
-                refresh_token = EXCLUDED.refresh_token,
-                expires_at = EXCLUDED.expires_at,
-                metadata = EXCLUDED.metadata,
-                updated_at = EXCLUDED.created_at
-            """
-
-            values = {
-                "user_id": current_user["uid"],
-                "platform_account_id": user_data["id"],
-                "username": user_data["username"],
-                "profile_picture_url": user_data.get("profile_image_url"),
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens.get("refresh_token"),
-                "expires_at": expires_at,
-                "metadata": json.dumps({
-                    "verified": user_data.get("verified", False),
-                    "metrics": user_data.get("public_metrics", {}),
-                    "oauth_code": code  # Track processed codes
-                }),
-                "created_at": now
-            }
-
-            await db.execute(query=query, values=values)
-            logger.info("Successfully stored account data")
-
-            # Clean up oauth state
-            await db.execute(
-                "DELETE FROM mo_oauth_states WHERE state = :state",
-                {"state": state}
-            )
-
-            return {
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens.get("refresh_token"),
-                "expires_in": tokens["expires_in"]
-            }
-
-    except Exception as e:
-        logger.error(f"Error in oauth_callback: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-
-        if isinstance(e, HTTPException):
-            raise e
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process callback: {str(e)}"
-        )
 
 
 @router.get("/user")
