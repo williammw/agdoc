@@ -1,6 +1,7 @@
 import logging
 import secrets
 import httpx
+from httpx import HTTPStatusError, ConnectTimeout, ConnectError, ReadTimeout
 from fastapi import APIRouter, HTTPException, Depends, Request, Header, File, UploadFile, Form
 from databases import Database
 from datetime import datetime, timezone, timedelta
@@ -12,7 +13,7 @@ import traceback
 import base64
 import hashlib
 from pydantic import BaseModel, Field, field_validator
-from typing import List
+from typing import List, Dict, Any, Union
 
 import mimetypes
 import math
@@ -21,7 +22,11 @@ import asyncio
 import httpx
 import requests
 import time
-
+import random
+import urllib.parse
+import re
+import base64
+import logging
 
 router = APIRouter(tags=["twitter"])
 logger = logging.getLogger(__name__)
@@ -29,57 +34,65 @@ logger = logging.getLogger(__name__)
 # Constants
 TWITTER_CLIENT_ID = os.getenv("TWITTER_OAUTH2_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_OAUTH2_CLIENT_SECRET")
+TWITTER_AUTH_URL = "https://x.com/i/oauth2/authorize"
+TWITTER_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 TWITTER_API_V2 = "https://api.x.com/2"
+TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
 CALLBACK_URL = os.getenv("TWITTER_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
-# TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
-TWITTER_UPLOAD_API = "https://api.x.com/2/media/upload"
 # Add these constants
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for uploads
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB for images
 MAX_VIDEO_SIZE = 15 * 1024 * 1024  # 15MB for videos
 ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif'}
 ALLOWED_VIDEO_TYPES = {'video/mp4'}
+MAX_RETRIES = 3  # Reduced from 5 to 3
+INITIAL_RETRY_DELAY = 5  # Increased from 2 to 5 seconds
+MAX_RETRY_DELAY = 15  # Reduced from 32 to 15 seconds
+
+# Cache settings
+USER_CACHE = {}  # Simple in-memory cache/auth
+CACHE_TTL = 300  # 5 minutes in seconds
 
 
+def generate_pkce_pair():
+    """Generate PKCE code verifier and challenge"""
+    code_verifier = secrets.token_urlsafe(32)
+    code_verifier_bytes = code_verifier.encode('ascii')
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier_bytes).digest()
+    ).decode('ascii').rstrip('=')
+    return code_verifier, code_challenge
 
+
+@router.get("/amiworks")
+async def amiworks():
+    return {"message": "amiwosrks"}
 
 @router.post("/auth/init")
 async def init_oauth(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Initialize Twitter OAuth flow"""
+    """Initialize OAuth 2.0 flow with PKCE"""
     try:
         if not TWITTER_CLIENT_ID:
             raise HTTPException(
                 status_code=500, detail="Twitter Client ID not configured")
 
-        # Generate state and PKCE values
+        # Generate PKCE values
+        code_verifier, code_challenge = generate_pkce_pair()
         state = secrets.token_urlsafe(32)
-        code_verifier = secrets.token_urlsafe(64)
-        code_challenge = generate_code_challenge(code_verifier)
 
         # Store state and code_verifier
         now = datetime.now(timezone.utc)
         query = """
         INSERT INTO mo_oauth_states (
-            state,
-            platform,
-            user_id,
-            code_verifier,
-            expires_at,
-            created_at
+            state, platform, user_id, code_verifier, expires_at, created_at
         ) VALUES (
-            :state,
-            'twitter',
-            :user_id,
-            :code_verifier,
-            :expires_at,
-            :created_at
+            :state, 'twitter', :user_id, :code_verifier, :expires_at, :created_at
         )
         """
-
         values = {
             "state": state,
             "user_id": current_user["uid"],
@@ -87,11 +100,10 @@ async def init_oauth(
             "expires_at": now + timedelta(minutes=10),
             "created_at": now
         }
-
         await db.execute(query=query, values=values)
 
-        # Generate OAuth URL
-        params = {
+        # Construct authorization URL
+        auth_params = {
             'response_type': 'code',
             'client_id': TWITTER_CLIENT_ID,
             'redirect_uri': CALLBACK_URL,
@@ -101,12 +113,11 @@ async def init_oauth(
             'code_challenge_method': 'S256'
         }
 
-        auth_url = f"https://twitter.com/i/oauth2/authorize?{httpx.QueryParams(params)}"
+        authorization_url = f"{TWITTER_AUTH_URL}?{urllib.parse.urlencode(auth_params)}"
 
         return {
-            "auth_url": auth_url,
-            "state": state,
-            "code_verifier": code_verifier
+            "authUrl": authorization_url,
+            "state": state
         }
 
     except Exception as e:
@@ -120,228 +131,70 @@ async def oauth_callback(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Handle Twitter OAuth callback"""
-    async with db.transaction():
-        try:
-            # Log incoming request data
-            data = await request.json()
-            logger.info(f"Received callback data: {data}")
-            code = data.get("code")
-            state = data.get("state")
+    """Handle OAuth callback and exchange code for token"""
+    try:
+        # Add logging to debug database connection
+        logger.info("Database connection object: %s", db)
+        
+        data = await request.json()
+        code = data.get("code")
+        code_verifier = data.get("code_verifier")
+        state = data.get("state")
 
-            if not code or not state:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Missing code or state parameter"
-                )
-
-            # Verify state and get stored data
-            logger.info(f"Verifying state: {state}")
-            query = """
-            SELECT 
-                state, user_id, code_verifier, 
-                expires_at AT TIME ZONE 'UTC' as expires_at
-            FROM mo_oauth_states 
-            WHERE state = :state 
-            AND platform = 'twitter'
-            FOR UPDATE
-            """
-
-            stored_data = await db.fetch_one(query=query, values={"state": state})
-            logger.info(f"Retrieved stored data: {stored_data}")
-
-            if not stored_data:
-                raise HTTPException(status_code=400, detail="Invalid state")
-
-            # Convert expires_at to timezone-aware datetime if it isn't already
-            expires_at = stored_data["expires_at"]
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-            if expires_at < datetime.now(timezone.utc):
-                # Clean up expired state
-                await db.execute(
-                    "DELETE FROM mo_oauth_states WHERE state = :state",
-                    {"state": state}
-                )
-                raise HTTPException(status_code=400, detail="State expired")
-
-            if stored_data["user_id"] != current_user["uid"]:
-                raise HTTPException(status_code=400, detail="User mismatch")
-
-            # Check for already processed code
-            account_query = """
-            SELECT id FROM mo_social_accounts 
-            WHERE user_id = :user_id 
-            AND platform = 'twitter'
-            AND metadata->>'oauth_code' = :code
-            FOR UPDATE
-            """
-
-            existing_account = await db.fetch_one(
-                account_query,
-                values={
-                    "user_id": current_user["uid"],
-                    "code": code
-                }
-            )
-
-            if existing_account:
-                # Clean up used state
-                await db.execute(
-                    "DELETE FROM mo_oauth_states WHERE state = :state",
-                    {"state": state}
-                )
-                return {
-                    "message": "Account already connected",
-                    "success": True
-                }
-
-            # Exchange code for tokens
-            token_url = f"{TWITTER_API_V2}/oauth2/token"
-            token_data = {
-                'code': code,
-                'grant_type': 'authorization_code',
-                'client_id': TWITTER_CLIENT_ID,
-                'redirect_uri': CALLBACK_URL,
-                'code_verifier': stored_data["code_verifier"]
-            }
-
-            logger.info(f"Exchanging code for token with data: {token_data}")
-            async with httpx.AsyncClient() as client:
-                token_response = await client.post(
-                    token_url,
-                    data=token_data,
-                    auth=(TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET)
-                )
-
-                if token_response.status_code != 200:
-                    error_data = token_response.json()
-                    logger.error(f"Token exchange failed: {error_data}")
-                    # Clean up state on error
-                    await db.execute(
-                        "DELETE FROM mo_oauth_states WHERE state = :state",
-                        {"state": state}
-                    )
-                    raise HTTPException(
-                        status_code=token_response.status_code,
-                        detail=f"Failed to exchange code for token: {error_data.get('error_description', '')}"
-                    )
-
-                tokens = token_response.json()
-                logger.info("Successfully obtained tokens")
-
-                # Get user info
-                user_response = await client.get(
-                    f"{TWITTER_API_V2}/users/me",
-                    headers={
-                        "Authorization": f"Bearer {tokens['access_token']}",
-                    },
-                    params={
-                        "user.fields": "profile_image_url,verified,public_metrics"
-                    }
-                )
-
-                if user_response.status_code != 200:
-                    error_data = user_response.json()
-                    logger.error(f"Failed to get user info: {error_data}")
-                    # Clean up state on error
-                    await db.execute(
-                        "DELETE FROM mo_oauth_states WHERE state = :state",
-                        {"state": state}
-                    )
-                    raise HTTPException(
-                        status_code=user_response.status_code,
-                        detail="Failed to get user info"
-                    )
-
-                user_data = user_response.json()["data"]
-                logger.info(f"Retrieved user data: {user_data}")
-
-                # Store in database
-                now = datetime.now(timezone.utc)
-                expires_at = now + timedelta(seconds=tokens['expires_in'])
-
-                # Store account in database
-                query = """
-                INSERT INTO mo_social_accounts (
-                    user_id,
-                    platform,
-                    platform_account_id,
-                    username,
-                    profile_picture_url,
-                    access_token,
-                    refresh_token,
-                    expires_at,
-                    metadata,
-                    created_at,
-                    updated_at
-                ) VALUES (
-                    :user_id,
-                    'twitter',
-                    :platform_account_id,
-                    :username,
-                    :profile_picture_url,
-                    :access_token,
-                    :refresh_token,
-                    :expires_at,
-                    :metadata,
-                    :created_at,
-                    :created_at
-                )
-                ON CONFLICT (platform, user_id, platform_account_id)
-                DO UPDATE SET
-                    username = EXCLUDED.username,
-                    profile_picture_url = EXCLUDED.profile_picture_url,
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    expires_at = EXCLUDED.expires_at,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = EXCLUDED.created_at
-                """
-
-                values = {
-                    "user_id": current_user["uid"],
-                    "platform_account_id": user_data["id"],
-                    "username": user_data["username"],
-                    "profile_picture_url": user_data.get("profile_image_url"),
-                    "access_token": tokens["access_token"],
-                    "refresh_token": tokens.get("refresh_token"),
-                    "expires_at": expires_at,
-                    "metadata": json.dumps({
-                        "verified": user_data.get("verified", False),
-                        "metrics": user_data.get("public_metrics", {}),
-                        "oauth_code": code  # Track processed codes
-                    }),
-                    "created_at": now
-                }
-
-                await db.execute(query=query, values=values)
-                logger.info("Successfully stored account data")
-
-                # Clean up used state AFTER successful processing
-                await db.execute(
-                    "DELETE FROM mo_oauth_states WHERE state = :state",
-                    {"state": state}
-                )
-
-                return {
-                    "access_token": tokens["access_token"],
-                    "refresh_token": tokens.get("refresh_token"),
-                    "expires_in": tokens["expires_in"]
-                }
-
-        except Exception as e:
-            logger.error(f"Error in oauth_callback: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-
-            if isinstance(e, HTTPException):
-                raise e
-
+        if not all([code, code_verifier, state]):
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process callback: {str(e)}"
+                status_code=400,
+                detail="Missing required parameters"
             )
+
+        # Exchange code for token
+        token_data = await exchange_code(
+            code=code,
+            code_verifier=code_verifier,
+            client_id=TWITTER_CLIENT_ID,
+            client_secret=TWITTER_CLIENT_SECRET
+        )
+
+        # Try to get user info, but don't fail if rate limited
+        try:
+            user_info = await get_user_info(token_data["access_token"])
+            # Store in database if we got user info
+            account_id = await store_tokens(user_info, token_data, db, current_user["uid"])
+            logger.info(f"Successfully stored Twitter account with ID: {account_id}")
+            
+            # Return combined response
+            return {
+                "access_token": token_data["access_token"],
+                "token_type": token_data.get("token_type", "bearer"),
+                "expires_in": token_data.get("expires_in", 7200),
+                "scope": token_data.get("scope", ""),
+                "refresh_token": token_data.get("refresh_token"),
+                "account_id": account_id,
+                "user_info": user_info["data"]
+            }
+            
+        except HTTPException as he:
+            if he.status_code == 429 or he.status_code == 503:
+                # If rate limited, just return the token
+                # The frontend can fetch user info later
+                logger.warning("Rate limited during user info fetch, returning token only")
+                return {
+                    "access_token": token_data["access_token"],
+                    "token_type": token_data.get("token_type", "bearer"),
+                    "expires_in": token_data.get("expires_in", 7200),
+                    "scope": token_data.get("scope", ""),
+                    "refresh_token": token_data.get("refresh_token"),
+                    "rate_limited": True
+                }
+            raise
+
+    except Exception as e:
+        logger.error(f"Error in oauth_callback: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
 @router.get("/user")
@@ -351,6 +204,12 @@ async def get_twitter_user(
 ):
     """Get Twitter user profile and connected accounts"""
     try:
+        # Check cache first
+        cache_key = f"twitter_user_{current_user['uid']}"
+        cached_data = USER_CACHE.get(cache_key)
+        if cached_data and cached_data['expires_at'] > time.time():
+            return cached_data['data']
+
         query = """
         SELECT
             id,
@@ -383,10 +242,18 @@ async def get_twitter_user(
                 account_dict["metadata"] = json.loads(account_dict["metadata"])
             account_list.append(account_dict)
 
-        return {
+        response_data = {
             "connected": True,
             "accounts": account_list
         }
+
+        # Cache the response
+        USER_CACHE[cache_key] = {
+            'data': response_data,
+            'expires_at': time.time() + CACHE_TTL
+        }
+
+        return response_data
 
     except Exception as e:
         logger.error(f"Error in get_twitter_user: {str(e)}")
@@ -410,27 +277,22 @@ async def get_current_user_profile(
         access_token = authorization.split(' ')[1]
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{TWITTER_API_V2}/users/me",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "x-twitter-client-id": TWITTER_CLIENT_ID
-                },
-                params={
-                    "user.fields": "id,name,username,profile_image_url,verified,public_metrics"
-                }
-            )
-
-            if response.status_code != 200:
-                error_data = response.json()
-                logger.error(f"Twitter API error: {error_data}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=error_data.get("error", {}).get(
-                        "message", "Failed to fetch user profile")
+            async def fetch_user_profile():
+                response = await client.get(
+                    f"{TWITTER_API_V2}/users/me",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "MultivioApp/1.0.0"
+                    },
+                    params={
+                        "user.fields": "id,name,username,profile_image_url,verified,public_metrics,description,entities,pinned_tweet_id,protected,url,withheld"
+                    }
                 )
+                response.raise_for_status()
+                return response.json()
 
-            user_data = response.json()
+            user_data = await retry_with_backoff(fetch_user_profile)
 
             # Get the Twitter account from database
             query = """
@@ -900,6 +762,269 @@ def generate_code_challenge(code_verifier: str) -> str:
 
     sha256_hash = hashlib.sha256(code_verifier.encode()).digest()
     return base64.urlsafe_b64encode(sha256_hash).decode().rstrip("=")
+
+async def retry_with_backoff(func, max_retries=2, initial_delay=5):
+    """Improved retry with better backoff strategy"""
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except HTTPStatusError as e:
+            last_error = e
+            if e.response.status_code == 429:
+                # Let the main function handle rate limits
+                raise
+            elif e.response.status_code >= 500:
+                if attempt == max_retries - 1:
+                    raise
+                retry_after = min(
+                    initial_delay * (2 ** attempt),
+                    MAX_RETRY_DELAY
+                )
+                logger.warning(f"Server error (attempt {attempt + 1}/{max_retries}). Retrying after {retry_after} seconds...")
+                await asyncio.sleep(retry_after)
+                continue
+            raise
+        except (ConnectError, ConnectTimeout, ReadTimeout) as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                raise
+            retry_after = min(
+                initial_delay * (2 ** attempt),
+                MAX_RETRY_DELAY
+            )
+            logger.warning(f"Network error (attempt {attempt + 1}/{max_retries}). Retrying after {retry_after} seconds...")
+            await asyncio.sleep(retry_after)
+            continue
+    
+    raise last_error
+
+async def exchange_code(
+    code: str,
+    code_verifier: str,
+    client_id: str,
+    client_secret: str
+) -> dict:
+    """Exchange authorization code for access token"""
+    try:
+        # Create Basic Auth header
+        auth_string = f"{client_id}:{client_secret}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                TWITTER_TOKEN_URL,
+                data={
+                    'code': code,
+                    'grant_type': 'authorization_code',
+                    'redirect_uri': CALLBACK_URL,
+                    'code_verifier': code_verifier
+                },
+                headers={
+                    'Authorization': f'Basic {auth_b64}',
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            )
+            
+            logger.info(f"Token exchange response: {response.status_code}")
+            logger.info(f"Response headers: {dict(response.headers)}")
+            
+            if response.status_code != 200:
+                error_data = response.json()
+                logger.error(f"Token exchange error: {error_data}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=error_data.get('error_description', 'Failed to exchange code for token')
+                )
+            
+            return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"Network error during token exchange: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Error communicating with Twitter API: {str(e)}"
+        )
+
+async def get_user_info(access_token: str) -> dict:
+    async def fetch_user_info():
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{TWITTER_API_V2}/users/me",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "MultivioApp/1.0.0",
+                    "Accept": "application/json"
+                },
+                params={
+                    "user.fields": "id,name,username,profile_image_url,verified,public_metrics,description"
+                }
+            )
+            
+            # Log EVERYTHING about the response
+            logger.info(f"Response Status: {response.status_code}")
+            logger.info(f"Response Headers: {dict(response.headers)}")
+            logger.info(f"Response Body: {response.text}")
+            
+            if response.status_code == 429:
+                error_body = response.json()
+                logger.error(f"Full error response: {error_body}")
+                
+                # Check if this is really a rate limit or another issue
+                if 'errors' in error_body:
+                    for error in error_body['errors']:
+                        logger.error(f"Twitter Error: {error}")
+                
+                reset_time = int(response.headers.get('x-rate-limit-reset', 0))
+                current_time = int(time.time())
+                wait_time = max(reset_time - current_time, 1)
+                
+                logger.warning(
+                    f"Rate limit details:\n"
+                    f"Current time: {current_time}\n"
+                    f"Reset time: {reset_time}\n"
+                    f"Wait time: {wait_time}\n"
+                    f"Headers: {dict(response.headers)}"
+                )
+                
+                if wait_time > MAX_RETRY_DELAY:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"Rate limit exceeded. Try again in {wait_time} seconds"
+                    )
+                
+                await asyncio.sleep(wait_time)
+                return await fetch_user_info()
+            
+            response.raise_for_status()
+            return response.json()
+
+    try:
+        return await retry_with_backoff(
+            fetch_user_info,
+            max_retries=1,  # Reduce to 1 retry since we're investigating
+            initial_delay=5
+        )
+    except Exception as e:
+        logger.error(f"Failed to get user info: {str(e)}")
+        if isinstance(e, httpx.HTTPStatusError):
+            logger.error(f"HTTP Error Response: {e.response.text}")
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to get user info. Please try again later."
+        )
+
+async def store_tokens(user_info: dict, token_data: dict, db: Database, current_user_id: str):
+    """Store tokens and user info in database"""
+    try:
+        logger.info(f"Starting store_tokens for user {current_user_id}")
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=token_data.get('expires_in', 7200))
+        
+        # Prepare metadata
+        metadata = {
+            "verified": user_info["data"].get("verified", False),
+            "metrics": user_info["data"].get("public_metrics", {})
+        }
+        
+        logger.info(f"Prepared metadata: {json.dumps(metadata)}")
+        
+        # Upsert the social account
+        query = """
+        INSERT INTO mo_social_accounts (
+            user_id,
+            platform,
+            platform_account_id,
+            username,
+            profile_picture_url,
+            access_token,
+            refresh_token,
+            expires_at,
+            metadata,
+            created_at,
+            updated_at,
+            media_type,
+            media_count,
+            oauth1_token,
+            oauth1_token_secret
+        ) VALUES (
+            :user_id,
+            'twitter',
+            :platform_account_id,
+            :username,
+            :profile_picture_url,
+            :access_token,
+            :refresh_token,
+            :expires_at,
+            :metadata,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP,
+            NULL,
+            0,
+            NULL,
+            NULL
+        )
+        ON CONFLICT (user_id, platform, platform_account_id) 
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            profile_picture_url = EXCLUDED.profile_picture_url,
+            access_token = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token,
+            expires_at = EXCLUDED.expires_at,
+            metadata = EXCLUDED.metadata,
+            updated_at = CURRENT_TIMESTAMP,
+            media_count = EXCLUDED.media_count
+        RETURNING id
+        """
+        
+        values = {
+            "user_id": current_user_id,
+            "platform_account_id": user_info["data"]["id"],
+            "username": user_info["data"]["username"],
+            "profile_picture_url": user_info["data"].get("profile_image_url"),
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+            "expires_at": expires_at,
+            "metadata": json.dumps(metadata)
+        }
+        
+        logger.info(f"Executing upsert with values: {json.dumps({k: v[:10] + '...' if k in ['access_token', 'refresh_token'] and v else v for k, v in values.items()})}")
+        
+        result = await db.fetch_one(query=query, values=values)
+        logger.info(f"Store tokens result: {result}")
+        
+        if not result:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to store or update social account"
+            )
+            
+        return result['id']
+        
+    except Exception as e:
+        logger.error(f"Error storing tokens: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store tokens: {str(e)}"
+        )
+
+# Add this before the user.me call
+async def validate_token(token: str) -> bool:
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                "https://api.x.com/2/oauth2/token/info",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            logger.info(f"Token validation response: {response.status_code}")
+            logger.info(f"Token info: {response.text}")
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return False
 
 
 

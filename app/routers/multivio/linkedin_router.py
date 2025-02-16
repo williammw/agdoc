@@ -1,11 +1,22 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import requests
 from urllib.parse import urlencode
 import os
 from dotenv import load_dotenv
 import secrets
+from app.dependencies import get_current_user, get_database
 import logging
+import time
+import traceback
+import json
+from typing import Optional, List
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from uuid import UUID, uuid4
+from databases import Database
+from enum import Enum
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -23,296 +34,477 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 REDIRECT_URIS = {
     "production": "https://www.multivio.com/linkedin/callback",
     "development": "https://dev.multivio.com/linkedin/callback",
-    "local": "https://dev.multivio.com/linkedin/callback",
+    "local": "https://dev.multivio.com/linkedin/callback"
 }
 
 # Get the appropriate redirect URI based on environment
-REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", REDIRECT_URIS.get(ENVIRONMENT, REDIRECT_URIS["development"]))
+REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", REDIRECT_URIS.get(
+    ENVIRONMENT, REDIRECT_URIS["development"]))
 
 logger.info(f"Using LinkedIn Redirect URI: {REDIRECT_URI}")
 
 # LinkedIn API endpoints
-LINKEDIN_ENDPOINTS = {
-    "auth": "https://www.linkedin.com/oauth/v2/authorization",
-    "token": "https://www.linkedin.com/oauth/v2/accessToken",
-    "user_info": "https://api.linkedin.com/v2/userinfo",
-    "profile": "https://api.linkedin.com/v2/me",
-    "profile_picture": "https://api.linkedin.com/v2/me?projection=(id,profilePicture(displayImage~:playableStreams))",
-    "share": "https://api.linkedin.com/v2/ugcPosts",
-    "organizations": "https://api.linkedin.com/v2/organizationalEntityAcls",
-    "revoke": "https://www.linkedin.com/oauth/v2/revoke"
+API_BASE = "https://api.linkedin.com/v2"
+AUTH_BASE = "https://www.linkedin.com/oauth/v2"
+
+ENDPOINTS = {
+    "auth": f"{AUTH_BASE}/authorization",
+    "token": f"{AUTH_BASE}/accessToken",
+    "profile": f"{API_BASE}/me",
+    "email": f"{API_BASE}/emailAddress?q=members&projection=(elements*(handle~))",
+    "share": f"{API_BASE}/ugcPosts",
+    "organizations": f"{API_BASE}/organizationalEntityAcls?q=roleAssignee",
+    "organization_details": f"{API_BASE}/organization/"
 }
 
-def get_linkedin_headers(access_token: str, include_restli: bool = False) -> dict:
-    headers = {"Authorization": f"Bearer {access_token}"}
-    if include_restli:
-        headers.update({
-            "Content-Type": "application/json",
-            "X-Restli-Protocol-Version": "2.0.0"
-        })
-    return headers
+# LinkedIn API scopes
+LINKEDIN_SCOPES = {
+    "basic": [
+        "openid",              # Use name and photo
+        "profile",             # Use name and photo
+        "email",              # Use primary email
+        "r_basicprofile",     # Basic profile info
+    ],
+    "social": [
+        "w_member_social",     # Create posts on behalf of member
+        "r_organization_social", # Read org posts
+        "w_organization_social", # Create org posts
+    ],
+    "organization": [
+        "r_organization_admin",  # Read org pages and analytics
+        "rw_organization_admin", # Manage org pages
+    ],
+    "advertising": [
+        "r_ads",               # Read ad accounts
+        "rw_ads",              # Manage ad accounts
+        "r_ads_reporting",     # Read ad reporting
+    ],
+    "connections": [
+        "r_1st_connections_size", # Number of connections
+    ]
+}
 
-@router.post("/auth")
-async def initialize_linkedin_auth(request: Request):
+# Choose the scopes you need
+REQUIRED_SCOPES = [
+    *LINKEDIN_SCOPES["basic"],
+    *LINKEDIN_SCOPES["social"],
+    *LINKEDIN_SCOPES["organization"]
+]
+
+# Add this enum class
+class SocialPlatform(str, Enum):
+    LINKEDIN = "linkedin"
+    FACEBOOK = "facebook"
+    TWITTER = "twitter"
+    INSTAGRAM = "instagram"
+    YOUTUBE = "youtube"
+    TIKTOK = "tiktok"
+    THREADS = "threads"
+
+# Models
+class TokenResponse(BaseModel):
+    access_token: str
+    expires_in: int
+    refresh_token: Optional[str] = None
+
+class UserProfile(BaseModel):
+    id: str
+    firstName: str
+    lastName: str
+    profilePicture: Optional[str] = None
+    email: Optional[str] = None
+
+class SharePost(BaseModel):
+    text: str
+    visibility: str = "PUBLIC"
+    article_url: Optional[str] = None
+
+class ArticleMetadata(BaseModel):
+    url: str
+
+class OAuthState(BaseModel):
+    state: str
+    platform: SocialPlatform = SocialPlatform.LINKEDIN
+    user_id: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    expires_at: datetime
+    code_verifier: str = ""
+
+class SocialAccount(BaseModel):
+    id: Optional[UUID] = None
+    user_id: str
+    platform: SocialPlatform = SocialPlatform.LINKEDIN
+    platform_account_id: str
+    username: str
+    profile_picture_url: Optional[str] = None
+    access_token: str
+    refresh_token: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    metadata: Optional[dict] = None
+    media_type: Optional[str] = None
+    media_count: Optional[int] = 0
+
+# State management for CSRF protection
+active_states = {}
+
+def generate_state():
+    state = secrets.token_urlsafe(32)
+    active_states[state] = time.time()
+    return state
+
+def validate_state(state: str) -> bool:
+    timestamp = active_states.get(state)
+    if not timestamp:
+        return False
+    # Remove expired states (older than 1 hour)
+    current_time = time.time()
+    active_states.clear()
+    return (current_time - timestamp) < 3600
+
+@router.get("/auth/init")
+async def linkedin_auth(
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Initialize LinkedIn OAuth flow"""
+    state = generate_state()
+    expires_at = datetime.utcnow() + timedelta(hours=1)
+    
+    # Store state in database
+    oauth_state = OAuthState(
+        state=state,
+        platform=SocialPlatform.LINKEDIN,
+        user_id=current_user["id"],
+        expires_at=expires_at
+    )
+    
+    await db.execute(
+        """
+        INSERT INTO mo_oauth_states (state, platform, user_id, created_at, expires_at, code_verifier)
+        VALUES (:state, :platform, :user_id, :created_at, :expires_at, :code_verifier)
+        """,
+        oauth_state.dict()
+    )
+
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
+        "scope": " ".join(REQUIRED_SCOPES)
+    }
+    auth_url = f"{ENDPOINTS['auth']}?{urlencode(params)}"
+    return {"url": auth_url}
+
+@router.get("/callback")
+async def linkedin_callback(
+    code: str, 
+    state: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Handle LinkedIn OAuth callback"""
     try:
-        # Get origin from request headers
-        origin = request.headers.get("origin", "")
-        logger.info(f"Auth Request Origin: {origin}")
-        logger.info(f"Auth Request Headers: {dict(request.headers)}")
+        # Verify state from database
+        stored_state = await db.fetch_one(
+            """
+            SELECT * FROM mo_oauth_states 
+            WHERE state = :state AND platform = 'linkedin' AND user_id = :user_id
+            AND expires_at > NOW()
+            """,
+            {"state": state, "user_id": current_user["id"]}
+        )
         
-        # Determine environment based on origin
-        current_env = "production" if "multivio.com" in origin else "development"
-        if "localhost" in origin:
-            current_env = "local"
-            
-        current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
-        logger.info(f"Selected Environment: {current_env}")
-        logger.info(f"Using Redirect URI: {current_redirect_uri}")
-        
-        state = secrets.token_urlsafe(32)
-        auth_params = {
-            "response_type": "code",
-            "client_id": CLIENT_ID,
-            "redirect_uri": current_redirect_uri,
-            "scope": "openid profile email w_member_social r_organization_admin w_organization_social r_organization_social rw_organization_admin",
-            "state": state
-        }
+        if not stored_state:
+            raise HTTPException(status_code=400, detail="Invalid or expired state")
 
-        auth_url = f"{LINKEDIN_ENDPOINTS['auth']}?{urlencode(auth_params)}"
-        logger.info(f"Generated Auth URL: {auth_url}")
-        return {"authUrl": auth_url, "state": state, "redirect_uri": current_redirect_uri}  # Send redirect_uri back
-    except Exception as e:
-        logger.exception("Error in initialize_linkedin_auth")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.api_route("/callback", methods=["GET", "POST"])
-async def linkedin_callback(request: Request):
-    try:
-        # Log request details
-        logger.info("=== LinkedIn Callback Debug ===")
-        logger.info(f"Request Headers: {dict(request.headers)}")
-        
-        data = await request.json()
-        logger.info(f"Callback Request Data: {data}")  # Log full request data
-        
-        code = data.get("code")
-        state = data.get("state")
-        
-        # Get the redirect_uri that was used in auth
-        origin = request.headers.get("origin", "")
-        current_env = "production" if "multivio.com" in origin else "development"
-        if "localhost" in origin:
-            current_env = "local"
-        current_redirect_uri = REDIRECT_URIS.get(current_env, REDIRECT_URI)
-        
-        logger.info(f"Callback Environment: {current_env}")
-        logger.info(f"Callback Redirect URI: {current_redirect_uri}")
-        
-        token_data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": current_redirect_uri,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET
-        }
-        
-        logger.info(f"Token Request Data: {token_data}")
-        
+        # Exchange code for access token
         token_response = requests.post(
-            LINKEDIN_ENDPOINTS['token'],
-            data=token_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            ENDPOINTS["token"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET
+            }
         )
         
-        logger.info(f"Token Response Status: {token_response.status_code}")
-        logger.info(f"Token Response Body: {token_response.text}")
-
         if not token_response.ok:
-            error_detail = f"Failed to get access token: {token_response.text}"
-            logger.error(error_detail)
-            raise HTTPException(status_code=400, detail=error_detail)
-
-        access_token = token_response.json()["access_token"]
-        headers = get_linkedin_headers(access_token)
-
-        # Get user info and profile data
-        user_data = requests.get(LINKEDIN_ENDPOINTS['user_info'], headers=headers).json()
-        profile_data = requests.get(LINKEDIN_ENDPOINTS['profile'], headers=headers).json()
-        
-        # Get profile picture
-        picture_response = requests.get(LINKEDIN_ENDPOINTS['profile_picture'], headers=headers)
-        profile_picture_url = user_data.get('picture')
-
-        if not profile_picture_url and picture_response.ok:
-            picture_data = picture_response.json()
-            if "profilePicture" in picture_data:
-                elements = picture_data["profilePicture"].get("displayImage~", {}).get("elements", [])
-                if elements:
-                    profile_picture_url = max(
-                        elements,
-                        key=lambda x: x.get("data", {}).get("width", 0)
-                    ).get("identifiers", [{}])[0].get("identifier")
-
-        # Get organizations/company pages with detailed info
-        logger.debug("Fetching organizations...")
-        org_response = requests.get(
-            f"{LINKEDIN_ENDPOINTS['organizations']}?q=roleAssignee&role=ADMINISTRATOR&state=APPROVED&count=100",
-            headers=headers
-        )
-        logger.debug(f"Organizations response: {org_response.text}")
-        
-        organizations = []
-        company_pages = []
-        
-        if org_response.ok:
-            org_data = org_response.json()
-            logger.debug(f"Found {len(org_data.get('elements', []))} organizations")
+            error_data = token_response.json()
+            error_msg = error_data.get('error_description', error_data.get('error', 'Unknown error'))
+            logger.error(f"Token exchange error: {error_msg}")
+            raise HTTPException(
+                status_code=token_response.status_code,
+                detail=f"LinkedIn API error: {error_msg}"
+            )
             
-            for element in org_data.get("elements", []):
-                org_id = element.get("organizationalTarget")
-                if not org_id:
-                    continue
+        token_data = token_response.json()
+        headers = {"Authorization": f"Bearer {token_data['access_token']}"}
 
-                # Extract numeric ID from URN
-                numeric_id = org_id.split(":")[-1] if org_id.startswith("urn:li:organization:") else org_id
-                
-                logger.debug(f"Fetching details for org {numeric_id}")
-                # Get detailed organization info
-                org_details_response = requests.get(
-                    f"https://api.linkedin.com/v2/organizations/{numeric_id}",
-                    headers=headers
+        # Get user profile
+        profile_response = requests.get(ENDPOINTS["profile"], headers=headers)
+        profile_data = profile_response.json()
+        logger.debug(f"LinkedIn profile data: {json.dumps(profile_data, indent=2)}")
+
+        # Get email
+        email_response = requests.get(ENDPOINTS["email"], headers=headers)
+        email_data = email_response.json()
+        logger.debug(f"LinkedIn email data: {json.dumps(email_data, indent=2)}")
+        email = email_data.get("elements", [{}])[0].get("handle~", {}).get("emailAddress")
+
+        logger.debug(f"Creating social account with data: {profile_data}")
+
+        # Create the account
+        social_account = SocialAccount(
+            user_id=current_user["id"],
+            platform_account_id=profile_data["id"],
+            username=f"{profile_data['firstName']['localized']['en_US']} {profile_data['lastName']['localized']['en_US']}",
+            profile_picture_url=None,
+            access_token=token_data["access_token"],
+            refresh_token=token_data.get("refresh_token"),
+            expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"]),
+            metadata={
+                "firstName": profile_data["firstName"]["localized"]["en_US"],
+                "lastName": profile_data["lastName"]["localized"]["en_US"],
+                "email": email
+            }
+        )
+
+        logger.debug(f"Created social account object: {social_account.dict()}")
+
+        # Try to get profile picture
+        try:
+            picture_response = requests.get(
+                f"{API_BASE}/me?projection=(id,profilePicture(displayImage~:playableStreams))",
+                headers=headers
+            )
+            if picture_response.ok:
+                picture_data = picture_response.json()
+                picture_elements = (
+                    picture_data.get("profilePicture", {})
+                    .get("displayImage~", {})
+                    .get("elements", [])
                 )
-                
-                if not org_details_response.ok:
-                    logger.error(f"Failed to get org details for {numeric_id}: {org_details_response.text}")
-                    continue
+                if picture_elements:
+                    picture_elements.sort(
+                        key=lambda x: x.get("data", {}).get("width", 0),
+                        reverse=True
+                    )
+                    social_account.profile_picture_url = picture_elements[0]["identifiers"][0]["identifier"]
+        except:
+            pass
 
-                org_details = org_details_response.json()
-                logger.debug(f"Organization details: {org_details}")
+        # Upsert account in database
+        account_data = social_account.dict(exclude={'id'})
+        # Convert metadata to JSON string just before database operation
+        if account_data.get('metadata'):
+            account_data['metadata'] = json.dumps(account_data['metadata'])
+            
+        logger.debug(f"Account data for database: {account_data}")
 
-                # Get organization/page followers
-                followers_response = requests.get(
-                    f"https://api.linkedin.com/v2/networkSizes/{numeric_id}?edgeType=CompanyFollowedByMember",
-                    headers=headers
-                )
-                follower_count = followers_response.json().get("firstDegreeSize", 0) if followers_response.ok else 0
+        query = """
+        INSERT INTO mo_social_accounts (
+            user_id,
+            platform,
+            platform_account_id,
+            username,
+            profile_picture_url,
+            access_token,
+            refresh_token,
+            expires_at,
+            metadata,
+            media_type,
+            media_count,
+            created_at,
+            updated_at
+        ) VALUES (
+            :user_id,
+            :platform,
+            :platform_account_id,
+            :username,
+            :profile_picture_url,
+            :access_token,
+            :refresh_token,
+            :expires_at,
+            :metadata,
+            :media_type,
+            :media_count,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (user_id, platform, platform_account_id) 
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            profile_picture_url = EXCLUDED.profile_picture_url,
+            access_token = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token,
+            expires_at = EXCLUDED.expires_at,
+            metadata = EXCLUDED.metadata,
+            media_type = EXCLUDED.media_type,
+            media_count = EXCLUDED.media_count,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id, user_id, platform, platform_account_id, username, profile_picture_url,
+                  access_token, refresh_token, expires_at, metadata, media_type, media_count
+        """
 
-                page_info = {
-                    "id": numeric_id,
-                    "name": org_details.get("localizedName", ""),
-                    "vanityName": org_details.get("vanityName", ""),
-                    "description": org_details.get("localizedDescription", ""),
-                    "websiteUrl": org_details.get("localizedWebsite", ""),
-                    "logoUrl": org_details.get("logoV2", {}).get("original", ""),
-                    "industry": org_details.get("localizedIndustry", ""),
-                    "staffCount": org_details.get("staffCount", 0),
-                    "followerCount": follower_count,
-                    "type": "Company",
-                    "role": element.get("role", ""),
-                    "permissions": {
-                        "canPost": element.get("role") in ["ADMINISTRATOR", "CONTENT_ADMIN"],
-                        "canManage": element.get("role") == "ADMINISTRATOR"
-                    }
-                }
+        created_account = await db.fetch_one(query=query, values=account_data)
 
-                logger.debug(f"Adding page info: {page_info}")
-                organizations.append(page_info)
-                company_pages.append(page_info)
+        if not created_account:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create or update social account"
+            )
 
-        # Construct response with both profile and pages
-        user_profile = {
-            "id": user_data.get("sub") or profile_data.get("id"),
-            "firstName": user_data.get("given_name", ""),
-            "lastName": user_data.get("family_name", ""),
-            "email": user_data.get("email"),
-            "profilePicture": profile_picture_url,
-            "type": "Personal"
-        }
+        # Update the social_account with the returned data
+        social_account.id = created_account["id"]
 
-        return {
-            "accessToken": access_token,
-            "profileData": {
-                **user_profile,
-                "accounts": [user_profile, *organizations]
-            },
-            "companyPages": company_pages
-        }
+        # Clean up used state
+        await db.execute(
+            "DELETE FROM mo_oauth_states WHERE state = :state",
+            {"state": state}
+        )
+
+        return social_account.dict()
 
     except Exception as e:
-        logger.exception("Error in LinkedIn callback")
-        error_detail = str(e)
-        if "invalid_request" in error_detail.lower():
-            error_detail += " (This might be due to code expiration or redirect URI mismatch)"
-        raise HTTPException(status_code=400, detail=error_detail)
+        logger.error(f"LinkedIn callback error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to complete LinkedIn authentication: {str(e)}"
+        )
+
 
 @router.post("/share")
-async def share_post(request: Request):
-    data = await request.json()
-    if not all(k in data for k in ["accountId", "content", "accessToken"]):
-        raise HTTPException(status_code=400, detail="Account ID, content, and access token are required")
+async def share_post(
+    post: SharePost,
+    account_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Share a post on LinkedIn"""
+    try:
+        # Get user's LinkedIn account
+        query = """
+        SELECT access_token, platform_account_id
+        FROM mo_social_accounts 
+        WHERE id = :account_id AND user_id = :user_id AND platform = 'linkedin'
+        """
+        values = {
+            "account_id": account_id,
+            "user_id": current_user["id"]
+        }
+        
+        account = await db.fetch_one(query=query, values=values)
+        
+        if not account:
+            raise HTTPException(status_code=404, detail="LinkedIn account not found")
 
-    # Modify the content structure based on account type
-    content = data['content']
-    account_type = content['author'].split(':')[2].lower()  # person or organization
-    
-    if account_type == 'person':
-        # For personal accounts, use person URN format
-        post_content = {
-            "author": f"urn:li:person:{data['accountId']}",
+        headers = {"Authorization": f"Bearer {account['access_token']}"}
+
+        post_data = {
+            "author": f"urn:li:person:{account['platform_account_id']}",
             "lifecycleState": "PUBLISHED",
             "specificContent": {
                 "com.linkedin.ugc.ShareContent": {
                     "shareCommentary": {
-                        "text": content['specificContent']['com.linkedin.ugc.ShareContent']['shareCommentary']['text']
+                        "text": post.text
                     },
                     "shareMediaCategory": "NONE"
                 }
             },
             "visibility": {
-                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+                "com.linkedin.ugc.MemberNetworkVisibility": post.visibility
             }
         }
-    else:
-        # For company accounts, use organization URN format
-        post_content = content
 
-    response = requests.post(
-        LINKEDIN_ENDPOINTS['share'],
-        headers=get_linkedin_headers(data['accessToken'], include_restli=True),
-        json=post_content
-    )
+        if post.article_url:
+            post_data["specificContent"]["com.linkedin.ugc.ShareContent"].update({
+                "shareMediaCategory": "ARTICLE",
+                "media": [{
+                    "status": "READY",
+                    "originalUrl": post.article_url
+                }]
+            })
 
-    if not response.ok:
-        logger.error(f"Share failed: {response.text}")
-        raise HTTPException(status_code=response.status_code, detail=f"Failed to post: {response.text}")
-    return {"success": True}
-
-@router.post("/revoke")
-async def revoke_access(request: Request):
-    try:
-        data = await request.json()
-        access_token = data.get("accessToken")
-        
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Access token is required")
-
-        revoke_response = requests.post(
-            LINKEDIN_ENDPOINTS['revoke'],
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "token": access_token
-            }
+        response = requests.post(
+            ENDPOINTS["share"],
+            headers=headers,
+            json=post_data
         )
 
-        if not revoke_response.ok:
-            error = revoke_response.json()
-            if error.get("error") == "invalid_grant":
-                return {"success": True, "message": "Token already expired or revoked"}
-            raise HTTPException(status_code=400, detail=f"Failed to revoke token: {revoke_response.text}")
+        if response.status_code != 201:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"LinkedIn API error: {response.text}"
+            )
 
-        return {"success": True, "message": "Token successfully revoked"}
+        return {"status": "success", "post_id": response.headers.get("x-restli-id")}
+
     except Exception as e:
-        logger.exception("Error in revoke_access")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"LinkedIn API error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Failed to share post")
+
+
+@router.post("/article/metadata")
+async def get_article_metadata(article: ArticleMetadata):
+    """Get metadata for an article URL"""
+    try:
+        # Use requests to fetch the article page
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(article.url, headers=headers, timeout=5)
+        response.raise_for_status()
+
+        # Parse the HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Extract metadata
+        metadata = {
+            "url": article.url,
+            "title": None,
+            "description": None,
+            "thumbnailUrl": None
+        }
+
+        # Try Open Graph tags first
+        og_title = soup.find("meta", property="og:title")
+        og_desc = soup.find("meta", property="og:description")
+        og_image = soup.find("meta", property="og:image")
+
+        # Fallback to standard meta tags
+        title_tag = soup.find("title")
+        desc_tag = soup.find("meta", attrs={"name": "description"})
+
+        # Set values with fallbacks
+        metadata["title"] = (
+            og_title.get("content") if og_title else
+            title_tag.string if title_tag else
+            None
+        )
+        metadata["description"] = (
+            og_desc.get("content") if og_desc else
+            desc_tag.get("content") if desc_tag else
+            None
+        )
+        metadata["thumbnailUrl"] = og_image.get(
+            "content") if og_image else None
+
+        return JSONResponse(content=metadata)
+
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch article metadata: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to fetch article metadata: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error processing article metadata: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process article metadata"
+        )
