@@ -48,13 +48,11 @@ API_BASE = "https://api.linkedin.com/v2"
 AUTH_BASE = "https://www.linkedin.com/oauth/v2"
 
 ENDPOINTS = {
-    "auth": f"{AUTH_BASE}/authorization",
-    "token": f"{AUTH_BASE}/accessToken",
-    "profile": f"{API_BASE}/me",
-    "email": f"{API_BASE}/emailAddress?q=members&projection=(elements*(handle~))",
-    "share": f"{API_BASE}/ugcPosts",
-    "organizations": f"{API_BASE}/organizationalEntityAcls?q=roleAssignee",
-    "organization_details": f"{API_BASE}/organization/"
+    "auth": "https://www.linkedin.com/oauth/v2/authorization",
+    "token": "https://www.linkedin.com/oauth/v2/accessToken",
+    "profile": "https://api.linkedin.com/v2/me",
+    "email": "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
+    "share": "https://api.linkedin.com/v2/ugcPosts"
 }
 
 # LinkedIn API scopes
@@ -167,34 +165,48 @@ async def linkedin_auth(
     db: Database = Depends(get_database)
 ):
     """Initialize LinkedIn OAuth flow"""
-    state = generate_state()
-    expires_at = datetime.utcnow() + timedelta(hours=1)
-    
-    # Store state in database
-    oauth_state = OAuthState(
-        state=state,
-        platform=SocialPlatform.LINKEDIN,
-        user_id=current_user["id"],
-        expires_at=expires_at
-    )
-    
-    await db.execute(
-        """
-        INSERT INTO mo_oauth_states (state, platform, user_id, created_at, expires_at, code_verifier)
-        VALUES (:state, :platform, :user_id, :created_at, :expires_at, :code_verifier)
-        """,
-        oauth_state.dict()
-    )
+    try:
+        state = generate_state()
+        expires_at = datetime.utcnow() + timedelta(hours=1)
+        
+        # Store state in database
+        await db.execute(
+            """
+            INSERT INTO mo_oauth_states (state, platform, user_id, created_at, expires_at)
+            VALUES (:state, :platform, :user_id, :created_at, :expires_at)
+            """,
+            {
+                "state": state,
+                "platform": "linkedin",
+                "user_id": current_user["id"],
+                "created_at": datetime.utcnow(),
+                "expires_at": expires_at
+            }
+        )
 
-    params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "state": state,
-        "scope": " ".join(REQUIRED_SCOPES)
-    }
-    auth_url = f"{ENDPOINTS['auth']}?{urlencode(params)}"
-    return {"url": auth_url}
+        # Construct auth URL
+        params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "state": state,
+            "scope": " ".join(REQUIRED_SCOPES)
+        }
+        
+        auth_url = f"{ENDPOINTS['auth']}?{urlencode(params)}"
+        logger.debug(f"Generated LinkedIn auth URL: {auth_url}")
+        
+        return {
+            "url": auth_url,
+            "state": state
+        }
+    except Exception as e:
+        logger.error(f"Error initializing LinkedIn auth: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to initialize LinkedIn authentication"
+        )
 
 @router.get("/callback")
 async def linkedin_callback(
@@ -205,6 +217,9 @@ async def linkedin_callback(
 ):
     """Handle LinkedIn OAuth callback"""
     try:
+        logger.debug(f"Received callback with code: {code[:10]}... and state: {state}")
+        logger.debug(f"Current user: {current_user}")
+        
         # Verify state from database
         stored_state = await db.fetch_one(
             """
@@ -215,7 +230,10 @@ async def linkedin_callback(
             {"state": state, "user_id": current_user["id"]}
         )
         
+        logger.debug(f"Stored state: {stored_state}")
+        
         if not stored_state:
+            logger.error(f"No stored state found for state={state} and user_id={current_user['id']}")
             raise HTTPException(status_code=400, detail="Invalid or expired state")
 
         # Exchange code for access token
@@ -376,10 +394,10 @@ async def linkedin_callback(
         )
 
 
-@router.post("/share")
+@router.post("/share/{account_id}")
 async def share_post(
     post: SharePost,
-    account_id: str,
+    account_id: UUID,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
@@ -401,7 +419,11 @@ async def share_post(
         if not account:
             raise HTTPException(status_code=404, detail="LinkedIn account not found")
 
-        headers = {"Authorization": f"Bearer {account['access_token']}"}
+        headers = {
+            "Authorization": f"Bearer {account['access_token']}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0"
+        }
 
         post_data = {
             "author": f"urn:li:person:{account['platform_account_id']}",
@@ -428,20 +450,38 @@ async def share_post(
                 }]
             })
 
+        logger.debug(f"Sending post data to LinkedIn: {json.dumps(post_data, indent=2)}")
+        
         response = requests.post(
             ENDPOINTS["share"],
             headers=headers,
             json=post_data
         )
 
-        if response.status_code != 201:
+        if not response.ok:
+            error_text = response.text
+            try:
+                error_json = response.json()
+                error_text = json.dumps(error_json, indent=2)
+            except:
+                pass
+            logger.error(f"LinkedIn API error response: {error_text}")
             raise HTTPException(
                 status_code=response.status_code,
-                detail=f"LinkedIn API error: {response.text}"
+                detail=f"LinkedIn API error: {error_text}"
             )
 
-        return {"status": "success", "post_id": response.headers.get("x-restli-id")}
+        post_id = response.headers.get("x-restli-id")
+        logger.debug(f"Successfully created LinkedIn post with ID: {post_id}")
 
+        return {
+            "status": "success",
+            "post_id": post_id,
+            "message": "Post shared successfully"
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"LinkedIn API error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
@@ -507,4 +547,197 @@ async def get_article_metadata(article: ArticleMetadata):
         raise HTTPException(
             status_code=500,
             detail="Failed to process article metadata"
+        )
+
+
+# Add to linkedin_router.py
+@router.post("/refresh")
+async def refresh_token(
+    refresh_token: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    # Get new tokens from LinkedIn
+    new_tokens = get_new_tokens(refresh_token)
+
+    # Update DB
+    await db.execute("""
+        UPDATE mo_social_accounts 
+        SET 
+            access_token = :access_token,
+            refresh_token = :refresh_token,
+            expires_at = :expires_at
+        WHERE user_id = :user_id AND platform = 'linkedin'
+    """, {
+        "access_token": new_tokens["access_token"],
+        "refresh_token": new_tokens["refresh_token"],
+        "expires_at": datetime.utcnow() + timedelta(seconds=new_tokens["expires_in"]),
+        "user_id": current_user["id"]
+    })
+
+    return new_tokens
+
+
+async def get_new_tokens(refresh_token: str) -> dict:
+    """Get new access token using refresh token from LinkedIn"""
+    try:
+        response = requests.post(
+            ENDPOINTS["token"],
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET
+            }
+        )
+
+        if not response.ok:
+            error_data = response.json()
+            error_msg = error_data.get(
+                'error_description', error_data.get('error', 'Unknown error'))
+            logger.error(f"Token refresh error: {error_msg}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"LinkedIn API error: {error_msg}"
+            )
+
+        token_data = response.json()
+        return {
+            "access_token": token_data["access_token"],
+            # LinkedIn might not always return new refresh token
+            "refresh_token": token_data.get("refresh_token"),
+            "expires_in": token_data["expires_in"]
+        }
+
+    except requests.RequestException as e:
+        logger.error(f"Failed to refresh LinkedIn token: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to refresh token: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error refreshing token: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to refresh token"
+        )
+
+@router.post("/disconnect/{account_id}")
+async def disconnect_account(
+    account_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Disconnect a LinkedIn account"""
+    try:
+        logger.debug(f"Disconnecting LinkedIn account {account_id} for user {current_user['id']}")
+        
+        # First, get the account to verify ownership and get access token
+        account = await db.fetch_one(
+            """
+            SELECT access_token, platform_account_id 
+            FROM mo_social_accounts 
+            WHERE id = :account_id 
+            AND user_id = :user_id 
+            AND platform = 'linkedin'
+            """,
+            {
+                "account_id": account_id,
+                "user_id": current_user["id"]
+            }
+        )
+
+        if not account:
+            raise HTTPException(
+                status_code=404,
+                detail="LinkedIn account not found or you don't have permission to disconnect it"
+            )
+
+        # Optionally revoke access token with LinkedIn
+        try:
+            headers = {"Authorization": f"Bearer {account['access_token']}"}
+            revoke_response = requests.get(
+                "https://www.linkedin.com/oauth/v2/revoke",
+                headers=headers
+            )
+            if not revoke_response.ok:
+                logger.warning(f"Failed to revoke LinkedIn token: {revoke_response.text}")
+        except Exception as e:
+            logger.warning(f"Error revoking LinkedIn token: {str(e)}")
+
+        # Delete the account from our database
+        await db.execute(
+            """
+            DELETE FROM mo_social_accounts 
+            WHERE id = :account_id 
+            AND user_id = :user_id 
+            AND platform = 'linkedin'
+            """,
+            {
+                "account_id": account_id,
+                "user_id": current_user["id"]
+            }
+        )
+
+        return {"status": "success", "message": "Account disconnected successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error disconnecting LinkedIn account: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to disconnect LinkedIn account: {str(e)}"
+        )
+
+@router.get("/user")
+async def get_user_accounts(
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Get user's connected LinkedIn accounts"""
+    try:
+        # Get all LinkedIn accounts for the user
+        query = """
+        SELECT 
+            id, user_id, platform, platform_account_id, username, 
+            profile_picture_url, access_token, refresh_token, 
+            expires_at, metadata, media_type, media_count
+        FROM mo_social_accounts 
+        WHERE user_id = :user_id AND platform = 'linkedin'
+        """
+        accounts = await db.fetch_all(query, {"user_id": current_user["id"]})
+        
+        # Convert accounts to list of SocialAccount models
+        account_list = []
+        for acc in accounts:
+            # Parse metadata if it exists
+            metadata = json.loads(acc["metadata"]) if acc["metadata"] else None
+            
+            account = SocialAccount(
+                id=acc["id"],
+                user_id=acc["user_id"],
+                platform=acc["platform"],
+                platform_account_id=acc["platform_account_id"],
+                username=acc["username"],
+                profile_picture_url=acc["profile_picture_url"],
+                access_token=acc["access_token"],
+                refresh_token=acc["refresh_token"],
+                expires_at=acc["expires_at"],
+                metadata=metadata,
+                media_type=acc["media_type"],
+                media_count=acc["media_count"]
+            )
+            account_list.append(account)
+
+        return {"accounts": [acc.dict() for acc in account_list]}
+
+    except Exception as e:
+        logger.error(f"Error fetching LinkedIn accounts: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch LinkedIn accounts: {str(e)}"
         )
