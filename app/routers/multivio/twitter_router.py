@@ -217,6 +217,7 @@ async def get_twitter_user(
             username,
             profile_picture_url,
             access_token,
+            refresh_token,
             expires_at,
             metadata
         FROM mo_social_accounts
@@ -238,6 +239,20 @@ async def get_twitter_user(
         account_list = []
         for account in accounts:
             account_dict = dict(account)
+            
+            # Check if token needs refresh
+            now = datetime.now(timezone.utc)
+            is_expired = account["expires_at"] and account["expires_at"] <= now + timedelta(minutes=5)
+            
+            if is_expired and account["refresh_token"]:
+                try:
+                    # Refresh the token
+                    refresh_result = await refresh_token(account["id"], current_user, db)
+                    account_dict["access_token"] = refresh_result["access_token"]
+                except Exception as e:
+                    logger.error(f"Token refresh failed for account {account['id']}: {str(e)}")
+                    # Continue with old token if refresh fails
+            
             if account_dict["metadata"]:
                 account_dict["metadata"] = json.loads(account_dict["metadata"])
             account_list.append(account_dict)
@@ -712,10 +727,10 @@ async def validate_token(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Validate user's Twitter token"""
+    """Validate user's Twitter token and refresh if expired"""
     try:
         query = """
-        SELECT access_token
+        SELECT access_token, refresh_token, expires_at
         FROM mo_social_accounts 
         WHERE id = :account_id 
         AND user_id = :user_id 
@@ -733,19 +748,44 @@ async def validate_token(
         if not account:
             return {"valid": False, "error": "Account not found"}
 
-        # Test the token
+        # Check if token is expired or about to expire (within 5 minutes)
+        now = datetime.now(timezone.utc)
+        is_expired = account["expires_at"] and account["expires_at"] <= now + timedelta(minutes=5)
+
+        if is_expired and account["refresh_token"]:
+            try:
+                # Refresh the token
+                refresh_result = await refresh_token(account_id, current_user, db)
+                return {
+                    "valid": True,
+                    "access_token": refresh_result["access_token"]
+                }
+            except Exception as e:
+                logger.error(f"Token refresh failed: {str(e)}")
+                return {"valid": False, "error": "Token refresh failed"}
+
+        # Test the current token if not expired
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{TWITTER_API_V2}/users/me",
                 headers={"Authorization": f"Bearer {account['access_token']}"}
             )
 
-            if response.status_code != 200:
-                return {"valid": False, "error": "Invalid or expired token"}
+            if response.status_code != 200 and account["refresh_token"]:
+                try:
+                    # Token invalid but we have refresh token, try refreshing
+                    refresh_result = await refresh_token(account_id, current_user, db)
+                    return {
+                        "valid": True,
+                        "access_token": refresh_result["access_token"]
+                    }
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {str(e)}")
+                    return {"valid": False, "error": "Token refresh failed"}
 
             return {
-                "valid": True,
-                "access_token": account["access_token"]
+                "valid": response.status_code == 200,
+                "access_token": account["access_token"] if response.status_code == 200 else None
             }
 
     except Exception as e:
@@ -923,10 +963,12 @@ async def store_tokens(user_info: dict, token_data: dict, db: Database, current_
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=token_data.get('expires_in', 7200))
         
-        # Prepare metadata
+        # Prepare metadata - Convert datetime to ISO format string
         metadata = {
             "verified": user_info["data"].get("verified", False),
-            "metrics": user_info["data"].get("public_metrics", {})
+            "metrics": user_info["data"].get("public_metrics", {}),
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat()
         }
         
         logger.info(f"Prepared metadata: {json.dumps(metadata)}")
@@ -986,11 +1028,18 @@ async def store_tokens(user_info: dict, token_data: dict, db: Database, current_
             "profile_picture_url": user_info["data"].get("profile_image_url"),
             "access_token": token_data["access_token"],
             "refresh_token": token_data.get("refresh_token"),
-            "expires_at": expires_at,
-            "metadata": json.dumps(metadata)
+            "expires_at": expires_at,  # This is a datetime object which SQLAlchemy can handle
+            "metadata": json.dumps(metadata)  # Now metadata is properly JSON serializable
         }
         
-        logger.info(f"Executing upsert with values: {json.dumps({k: v[:10] + '...' if k in ['access_token', 'refresh_token'] and v else v for k, v in values.items()})}")
+        # Create a safe copy of values for logging
+        log_values = {
+            **values,
+            'expires_at': expires_at.isoformat(),  # Convert datetime to string for logging
+            'access_token': values['access_token'][:10] + '...' if values['access_token'] else None,
+            'refresh_token': values['refresh_token'][:10] + '...' if values['refresh_token'] else None
+        }
+        logger.info(f"Executing upsert with values: {json.dumps(log_values)}")
         
         result = await db.fetch_one(query=query, values=values)
         logger.info(f"Store tokens result: {result}")
@@ -1025,6 +1074,114 @@ async def validate_token(token: str) -> bool:
         except Exception as e:
             logger.error(f"Token validation error: {e}")
             return False
+
+@router.post("/auth/refresh-token/{account_id}")
+async def refresh_token(
+    account_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Refresh Twitter OAuth2.0 access token"""
+    try:
+        # Get the refresh token from database
+        query = """
+        SELECT refresh_token
+        FROM mo_social_accounts 
+        WHERE id = :account_id 
+        AND user_id = :user_id 
+        AND platform = 'twitter'
+        """
+
+        account = await db.fetch_one(
+            query=query,
+            values={
+                "account_id": account_id,
+                "user_id": current_user["uid"]
+            }
+        )
+
+        if not account or not account["refresh_token"]:
+            raise HTTPException(
+                status_code=400,
+                detail="No refresh token found for this account"
+            )
+
+        # Create Basic Auth header
+        auth_string = f"{TWITTER_CLIENT_ID}:{TWITTER_CLIENT_SECRET}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+
+        # Exchange refresh token for new access token
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                TWITTER_TOKEN_URL,
+                data={
+                    'grant_type': 'refresh_token',
+                    'refresh_token': account["refresh_token"]
+                },
+                headers={
+                    'Authorization': f'Basic {auth_b64}',
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            )
+
+            if response.status_code != 200:
+                error_data = response.json()
+                logger.error(f"Token refresh error: {error_data}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=error_data.get('error_description', 'Failed to refresh token')
+                )
+
+            token_data = response.json()
+            now = datetime.now(timezone.utc)
+            expires_at = now + timedelta(seconds=token_data.get('expires_in', 7200))
+
+            # Update tokens in database
+            update_query = """
+            UPDATE mo_social_accounts
+            SET 
+                access_token = :access_token,
+                refresh_token = :refresh_token,
+                expires_at = :expires_at,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :account_id
+            AND user_id = :user_id
+            RETURNING id
+            """
+
+            result = await db.fetch_one(
+                query=update_query,
+                values={
+                    "account_id": account_id,
+                    "user_id": current_user["uid"],
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data.get("refresh_token", account["refresh_token"]),
+                    "expires_at": expires_at
+                }
+            )
+
+            if not result:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to update tokens"
+                )
+
+            return {
+                "access_token": token_data["access_token"],
+                "token_type": token_data.get("token_type", "bearer"),
+                "expires_in": token_data.get("expires_in", 7200)
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error refreshing token: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to refresh token: {str(e)}"
+        )
 
 
 

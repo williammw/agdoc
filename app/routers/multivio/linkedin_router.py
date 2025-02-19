@@ -450,7 +450,7 @@ async def share_post(
                 }]
             })
 
-        logger.debug(f"Sending post data to LinkedIn: {json.dumps(post_data, indent=2)}")
+        # logger.debug(f"Sending post data to LinkedIn: {json.dumps(post_data, indent=2)}")
         
         response = requests.post(
             ENDPOINTS["share"],
