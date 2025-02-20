@@ -499,7 +499,7 @@ async def create_post(
         detail="YouTube doesn't support text-only posts. Please use YouTube Studio to upload videos."
     )
 
-@router.get("/user/me")
+@router.get("/user")
 async def get_user_accounts(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
