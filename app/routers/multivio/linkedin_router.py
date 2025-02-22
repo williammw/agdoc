@@ -52,7 +52,9 @@ ENDPOINTS = {
     "token": "https://www.linkedin.com/oauth/v2/accessToken",
     "profile": "https://api.linkedin.com/v2/me",
     "email": "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
-    "share": "https://api.linkedin.com/v2/ugcPosts"
+    "share": "https://api.linkedin.com/v2/ugcPosts",
+    "organizations": "https://api.linkedin.com/v2/organizationalEntityAcls?q=roleAssignee",
+    "organization_details": "https://api.linkedin.com/v2/organizations/{id}"
 }
 
 # LinkedIn API scopes
@@ -66,7 +68,7 @@ LINKEDIN_SCOPES = {
     "social": [
         "w_member_social",     # Create posts on behalf of member
         "r_organization_social", # Read org posts
-        "w_organization_social", # Create org posts
+        "w_organization_social", # Create org pw_organization_socialosts
     ],
     "organization": [
         "r_organization_admin",  # Read org pages and analytics
@@ -263,12 +265,35 @@ async def linkedin_callback(
         # Get user profile
         profile_response = requests.get(ENDPOINTS["profile"], headers=headers)
         profile_data = profile_response.json()
-        logger.debug(f"LinkedIn profile data: {json.dumps(profile_data, indent=2)}")
-
+        
         # Get email
         email_response = requests.get(ENDPOINTS["email"], headers=headers)
         email_data = email_response.json()
-        logger.debug(f"LinkedIn email data: {json.dumps(email_data, indent=2)}")
+
+        # Get organization data
+        org_response = requests.get(ENDPOINTS["organizations"], headers=headers)
+        org_data = org_response.json()
+        logger.info(f"Organization Data: {json.dumps(org_data, indent=2)}")
+
+        # Get detailed organization info
+        org_details = []
+        for org in org_data.get("elements", []):
+            org_id = org["organizationalTarget"].split(":")[-1]  # Extract ID from URN
+            org_detail_response = requests.get(
+                ENDPOINTS["organization_details"].format(id=org_id),
+                headers=headers
+            )
+            if org_detail_response.ok:
+                org_details.append(org_detail_response.json())
+        
+        logger.info(f"Organization Details: {json.dumps(org_details, indent=2)}")
+
+        # Add these logging statements:
+        logger.info("LinkedIn Authorization Response Data:")
+        logger.info(f"Token Data: {json.dumps(token_data, indent=2)}")
+        logger.info(f"Profile Data: {json.dumps(profile_data, indent=2)}")
+        logger.info(f"Email Data: {json.dumps(email_data, indent=2)}")
+
         email = email_data.get("elements", [{}])[0].get("handle~", {}).get("emailAddress")
 
         logger.debug(f"Creating social account with data: {profile_data}")
@@ -285,7 +310,9 @@ async def linkedin_callback(
             metadata={
                 "firstName": profile_data["firstName"]["localized"]["en_US"],
                 "lastName": profile_data["lastName"]["localized"]["en_US"],
-                "email": email
+                "email": email,
+                "organizations": org_data.get("elements", []),
+                "organization_details": org_details
             }
         )
 
@@ -662,7 +689,7 @@ async def disconnect_account(
                 headers=headers
             )
             if not revoke_response.ok:
-                logger.warning(f"Failed to revoke LinkedIn token: {revoke_response.text}")
+                logger.warning(f"Failed to revoke LinkedIn token:")
         except Exception as e:
             logger.warning(f"Error revoking LinkedIn token: {str(e)}")
 
