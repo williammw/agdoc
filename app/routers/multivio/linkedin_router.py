@@ -118,6 +118,7 @@ class SharePost(BaseModel):
     text: str
     visibility: str = "PUBLIC"
     article_url: Optional[str] = None
+    organization_id: Optional[str] = None
 
 class ArticleMetadata(BaseModel):
     url: str
@@ -432,7 +433,7 @@ async def share_post(
     try:
         # Get user's LinkedIn account
         query = """
-        SELECT access_token, platform_account_id
+        SELECT access_token, platform_account_id, metadata
         FROM mo_social_accounts 
         WHERE id = :account_id AND user_id = :user_id AND platform = 'linkedin'
         """
@@ -452,8 +453,8 @@ async def share_post(
             "X-Restli-Protocol-Version": "2.0.0"
         }
 
+        # Base post data
         post_data = {
-            "author": f"urn:li:person:{account['platform_account_id']}",
             "lifecycleState": "PUBLISHED",
             "specificContent": {
                 "com.linkedin.ugc.ShareContent": {
@@ -468,6 +469,28 @@ async def share_post(
             }
         }
 
+        # Set author based on whether it's an organization post
+        if post.organization_id:
+            # Verify user has permission to post as this organization
+            metadata = json.loads(account['metadata']) if account['metadata'] else {}
+            org_roles = metadata.get('organizations', [])
+            has_permission = False
+            for org_role in org_roles:
+                if (org_role['organizationalTarget'] == f"urn:li:organization:{post.organization_id}" 
+                    and org_role['role'] in ['ADMINISTRATOR', 'OWNER']):
+                    has_permission = True
+                    break
+            
+            if not has_permission:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You don't have permission to post as this organization"
+                )
+            
+            post_data["author"] = f"urn:li:organization:{post.organization_id}"
+        else:
+            post_data["author"] = f"urn:li:person:{account['platform_account_id']}"
+
         if post.article_url:
             post_data["specificContent"]["com.linkedin.ugc.ShareContent"].update({
                 "shareMediaCategory": "ARTICLE",
@@ -477,8 +500,6 @@ async def share_post(
                 }]
             })
 
-        # logger.debug(f"Sending post data to LinkedIn: {json.dumps(post_data, indent=2)}")
-        
         response = requests.post(
             ENDPOINTS["share"],
             headers=headers,
