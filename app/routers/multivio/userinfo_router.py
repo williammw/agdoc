@@ -337,3 +337,59 @@ async def get_user_quota(
     except Exception as e:
         logger.error(f"Error in get_user_quota: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/accounts")
+async def get_all_social_accounts(
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Get all social media accounts in a single call"""
+    try:
+        query = """
+        SELECT 
+            id,
+            platform,
+            platform_account_id,
+            username,
+            profile_picture_url,
+            access_token,
+            expires_at,
+            metadata
+        FROM mo_social_accounts 
+        WHERE user_id = :user_id
+        ORDER BY platform, updated_at DESC
+        """
+
+        accounts = await db.fetch_all(
+            query=query,
+            values={"user_id": current_user["uid"]}
+        )
+
+        result = {
+            "twitter": [],
+            "facebook": [],
+            "instagram": [],
+            "linkedin": [],
+            "youtube": [],
+            "threads": []
+        }
+
+        if accounts:
+            for account in accounts:
+                account_dict = dict(account)
+                if account_dict["metadata"]:
+                    try:
+                        account_dict["metadata"] = json.loads(
+                            account_dict["metadata"])
+                    except json.JSONDecodeError:
+                        account_dict["metadata"] = {}
+
+                platform = account_dict["platform"]
+                if platform in result:
+                    result[platform].append(account_dict)
+
+        return result
+    except Exception as e:
+        logger.error(f"Error in get_all_social_accounts: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

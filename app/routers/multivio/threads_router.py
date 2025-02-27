@@ -44,6 +44,9 @@ class TokenResponse(BaseModel):
     expires_in: Optional[int]
     token_type: Optional[str]
 
+class DisconnectRequest(BaseModel):
+    account_id: str
+
 router = APIRouter( tags=["threads"])
 
 @router.get("/landing")
@@ -97,6 +100,7 @@ async def threads_auth_init(
         logger.error(f"Error in threads_auth_init: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/auth/callback")
 async def threads_auth_callback(
     request: Request,
@@ -110,21 +114,51 @@ async def threads_auth_callback(
         state = data.get("state")
 
         if not code or not state:
-            raise HTTPException(status_code=400, detail="Missing code or state")
+            raise HTTPException(
+                status_code=400, detail="Missing code or state")
+
+        # First check if this code has already been used successfully
+        account_check = await db.fetch_one(
+            """
+            SELECT id FROM mo_social_accounts 
+            WHERE user_id = :user_id 
+            AND platform = 'threads' 
+            AND metadata->>'auth_code' = :code
+            """,
+            values={
+                "user_id": current_user["uid"],
+                "code": code
+            }
+        )
+
+        # If we already have an account with this code, return success
+        if account_check:
+            return {
+                "success": True,
+                "message": "Account already connected"
+            }
 
         # Verify state
-        query = """
-        SELECT user_id, expires_at 
-        FROM mo_oauth_states 
-        WHERE state = :state AND platform = 'threads'
-        """
-        state_record = await db.fetch_one(query=query, values={"state": state})
+        state_record = await db.fetch_one(
+            """
+            SELECT user_id, expires_at 
+            FROM mo_oauth_states 
+            WHERE state = :state AND platform = 'threads'
+            FOR UPDATE
+            """,
+            values={"state": state}
+        )
 
         if not state_record:
+            logger.warning(f"State not found: {state}")
             raise HTTPException(status_code=400, detail="Invalid state")
+
         if state_record["expires_at"] < datetime.now(timezone.utc):
+            logger.warning(f"State expired: {state}")
             raise HTTPException(status_code=400, detail="State expired")
+
         if state_record["user_id"] != current_user["uid"]:
+            logger.warning(f"User mismatch for state: {state}")
             raise HTTPException(status_code=400, detail="User mismatch")
 
         async with httpx.AsyncClient() as client:
@@ -139,26 +173,20 @@ async def threads_auth_callback(
                     'code': code
                 }
             )
-            
+
             if token_response.status_code != 200:
                 error_data = token_response.json()
                 logger.error(f"Token exchange failed: {error_data}")
-                error_message = error_data.get("error", {}).get("message", "Failed to exchange code for token")
-                raise HTTPException(status_code=400, detail=error_message)
-                
-            token_data = token_response.json()
-            
-            # Ensure user_id is properly formatted as string
-            try:
-                platform_account_id = str(token_data.get('user_id', ''))[:50]  # Limit to 50 chars
-                if not platform_account_id:
-                    raise ValueError("Empty user_id received from Threads")
-            except (TypeError, ValueError) as e:
-                logger.error(f"Error formatting user_id: {str(e)}")
-                raise HTTPException(status_code=400, detail="Invalid user ID received from Threads")
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_data.get("error", {}).get(
+                        "message", "Failed to exchange code")
+                )
 
-            # Get user info from Threads using the SAME client session
-            logger.info(f"Fetching user info for platform_account_id: {platform_account_id}")
+            token_data = token_response.json()
+            platform_account_id = str(token_data.get('user_id', ''))
+
+            # Get user info
             user_info_response = await client.get(
                 f"{THREADS_API_URL}/{platform_account_id}",
                 params={
@@ -167,63 +195,78 @@ async def threads_auth_callback(
                 }
             )
 
-            logger.info(f"User info response status: {user_info_response.status_code}")
-            logger.info(f"User info raw response: {user_info_response.text}")
-
             if user_info_response.status_code != 200:
-                logger.error(f"Failed to get user info: {user_info_response.text}")
-                raise HTTPException(status_code=400, detail="Failed to get user info from Threads")
+                logger.error(
+                    f"Failed to get user info: {user_info_response.text}")
+                raise HTTPException(
+                    status_code=400, detail="Failed to get user info")
 
             user_info = user_info_response.json()
 
-            # Store in database
-            now = datetime.now(timezone.utc)
-            expires_at = now + timedelta(seconds=token_data.get('expires_in', 3600))
-
-            query = """
-            INSERT INTO mo_social_accounts (
-                user_id, platform, platform_account_id, username, profile_picture_url,
-                access_token, expires_at, metadata, created_at, updated_at
-            ) VALUES (
-                :user_id, 'threads', :platform_account_id, :username, :profile_picture_url,
-                :access_token, :expires_at, :metadata, :created_at, :created_at
-            ) ON CONFLICT (platform, user_id, platform_account_id) 
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                profile_picture_url = EXCLUDED.profile_picture_url,
-                access_token = EXCLUDED.access_token,
-                expires_at = EXCLUDED.expires_at,
-                metadata = EXCLUDED.metadata,
-                updated_at = EXCLUDED.created_at
-            """
-
-            await db.execute(query=query, values={
-                "user_id": current_user["uid"],
-                "platform_account_id": platform_account_id,
-                "username": user_info.get('username', ''),
-                "profile_picture_url": user_info.get('threads_profile_picture_url', ''),
-                "access_token": token_data['access_token'],
-                "expires_at": expires_at,
-                "metadata": json.dumps({
-                    "name": user_info.get('name', ''),
-                    "biography": user_info.get('threads_biography', ''),
-                    "raw_response": user_info
-                }),
-                "created_at": now
-            })
-
-            return TokenResponse(
-                access_token=token_data['access_token'],
-                user_id=platform_account_id,
-                expires_in=token_data.get('expires_in'),
-                token_type=token_data.get('token_type')
+            # Delete state after successful use
+            await db.execute(
+                "DELETE FROM mo_oauth_states WHERE state = :state AND platform = 'threads'",
+                values={"state": state}
             )
 
-    except HTTPException:
-        raise
+            # Store account
+            now = datetime.now(timezone.utc)
+            expires_at = now + \
+                timedelta(seconds=token_data.get('expires_in', 3600))
+
+            metadata = {
+                "name": user_info.get('name', ''),
+                "biography": user_info.get('threads_biography', ''),
+                "raw_response": user_info,
+                "auth_code": code,  # Store code to prevent reuse
+                "connected_at": now.isoformat()
+            }
+
+            # Use transaction for the account update
+            async with db.transaction():
+                await db.execute(
+                    """
+                    INSERT INTO mo_social_accounts (
+                        user_id, platform, platform_account_id, username,
+                        profile_picture_url, access_token, expires_at,
+                        metadata, created_at, updated_at
+                    ) VALUES (
+                        :user_id, 'threads', :platform_account_id, :username,
+                        :profile_picture_url, :access_token, :expires_at,
+                        :metadata, :now, :now
+                    ) ON CONFLICT (platform, user_id, platform_account_id) 
+                    DO UPDATE SET
+                        username = EXCLUDED.username,
+                        profile_picture_url = EXCLUDED.profile_picture_url,
+                        access_token = EXCLUDED.access_token,
+                        expires_at = EXCLUDED.expires_at,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    values={
+                        "user_id": current_user["uid"],
+                        "platform_account_id": platform_account_id,
+                        "username": user_info.get('username', ''),
+                        "profile_picture_url": user_info.get('threads_profile_picture_url', ''),
+                        "access_token": token_data['access_token'],
+                        "expires_at": expires_at,
+                        "metadata": json.dumps(metadata),
+                        "now": now
+                    }
+                )
+
+            return {
+                "access_token": token_data['access_token'],
+                "user_id": platform_account_id,
+                "expires_in": token_data.get('expires_in'),
+                "token_type": token_data.get('token_type')
+            }
+
     except Exception as e:
         logger.error(f"Error in threads_auth_callback: {str(e)}")
         logger.error(traceback.format_exc())
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/auth/refresh")
@@ -299,6 +342,7 @@ async def threads_callback(
         # Return success page that closes itself
         html_content = """
         <!DOCTYPE html>
+        
         <html>
         <body>
             <script>
@@ -324,69 +368,105 @@ async def threads_callback(
         """
         return HTMLResponse(content=html_content)
 
-@router.get("/user/me")
+@router.get("/user")
 async def get_threads_user(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Get connected Threads accounts for the current user"""
+    """Get Threads user profile and connected accounts"""
     try:
-        # Get the authorization header
+        # Get auth header but don't validate it (already done by get_current_user)
         auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+        logger.info(f"Processing request with auth header: {auth_header[:20]}...")
 
-        # Extract Firebase token (not Threads token)
-        firebase_token = auth_header.split(' ')[1]
+        query = """
+        SELECT 
+            id,
+            platform_account_id,
+            username,
+            profile_picture_url,
+            access_token,
+            expires_at AT TIME ZONE 'UTC' as expires_at,
+            metadata
+        FROM mo_social_accounts 
+        WHERE user_id = :user_id 
+        AND platform = 'threads'
+        """
+
+        accounts = await db.fetch_all(
+            query=query,
+            values={"user_id": current_user["uid"]}
+        )
+
+        if not accounts:
+            return {
+                "connected": False,
+                "accounts": []
+            }
+
+        account_list = []
+        for account in accounts:
+            account_dict = dict(account)
+            if account_dict["metadata"]:
+                try:
+                    account_dict["metadata"] = json.loads(account_dict["metadata"])
+                except json.JSONDecodeError:
+                    account_dict["metadata"] = {}
+            
+            # Convert datetime to ISO format string
+            if account_dict.get("expires_at"):
+                account_dict["expires_at"] = account_dict["expires_at"].isoformat()
+
+            account_list.append(account_dict)
+
+        return {
+            "connected": True,
+            "accounts": account_list
+        }
+
+    except Exception as e:
+        logger.error(f"Error in get_threads_user: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
+@router.post("/auth/disconnect")
+async def disconnect_threads(
+    request: DisconnectRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Disconnect a Threads account"""
+    try:
+        # Delete the account from database
+        query = """
+        DELETE FROM mo_social_accounts 
+        WHERE id = :account_id 
+        AND user_id = :user_id 
+        AND platform = 'threads'
+        RETURNING id
+        """
         
-        # Verify Firebase token and get user info
-        try:
-            # This should be handled by get_current_user dependency
-            if not current_user or not current_user.get("uid"):
-                raise HTTPException(status_code=401, detail="Invalid authentication")
-            
-            query = """
-            SELECT 
-                id,
-                platform_account_id,
-                username,
-                profile_picture_url,
-                access_token,
-                expires_at,
-                metadata,
-                created_at,
-                updated_at
-            FROM mo_social_accounts 
-            WHERE user_id = :user_id AND platform = 'threads'
-            """
-            
-            accounts = await db.fetch_all(query=query, values={"user_id": current_user["uid"]})
-            
-            if not accounts:
-                return []
-                
-            return [
-                {
-                    "id": str(account["id"]),
-                    "platform_account_id": account["platform_account_id"],
-                    "username": account["username"],
-                    "profile_picture_url": account["profile_picture_url"],
-                    "metadata": json.loads(account["metadata"]) if account["metadata"] else {},
-                    "created_at": account["created_at"].isoformat() if account["created_at"] else None,
-                    "updated_at": account["updated_at"].isoformat() if account["updated_at"] else None
-                }
-                for account in accounts
-            ]
+        result = await db.fetch_one(
+            query=query, 
+            values={
+                "account_id": request.account_id,
+                "user_id": current_user["uid"]
+            }
+        )
 
-        except Exception as e:
-            logger.error(f"Error verifying Firebase token: {str(e)}")
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        if not result:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        return {"success": True}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in get_threads_user: {str(e)}")
+        logger.error(f"Error in disconnect_threads: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
