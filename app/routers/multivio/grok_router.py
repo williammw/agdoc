@@ -11,6 +11,7 @@ import httpx
 import logging
 import asyncio
 from datetime import datetime, timezone
+import re
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -23,19 +24,71 @@ GROK_API_KEY = os.getenv("XAI_API_KEY")  # Using existing XAI_API_KEY env var
 GROK_API_BASE_URL = os.getenv("GROK_API_BASE_URL", "https://api.x.ai/v1")
 
 # Model constants
-DEFAULT_GROK_MODEL = "grok-2-1212"
-AVAILABLE_MODELS = ["grok-2-1212", "grok-2-vision-1212"]
+DEFAULT_GROK_MODEL = "grok-2-1212"  # Updated to use grok-1 which is more widely supported
+AVAILABLE_MODELS = ["grok-2-1212", "grok-2-vision-1212"]  # Updated model list
 
 # Default system prompt
 DEFAULT_SYSTEM_PROMPT = """
-You are a helpful assistant.
+You are a helpful assistant for a social media management tool.
 For generated content, you should use markdown format.
-For LaTeX, you should use the following format:
+
+When asked to create posts for specific platforms like Facebook, Instagram, or Threads,
+YOU MUST ALWAYS CALL the toggle_platform function to select those platforms.
+NEVER write toggle_platform as text in your response.
+NEVER wrap toggle_platform in code blocks, backticks, or markdown formatting.
+ALWAYS invoke it as a function.
+
+The toggle_platform function accepts an array of platform names. Valid platforms are:
+- facebook
+- instagram
+- threads
+- twitter
+- linkedin
+- tiktok
+- youtube
+
+IMPORTANT: You MUST call the toggle_platform function using the exact format:
+toggle_platform({"platforms": ["platform1", "platform2"]})
+
+For example, to select Instagram and Facebook, call:
+toggle_platform({"platforms": ["instagram", "facebook"]})
+
+MAKE SURE to include the closing parenthesis and brace in your function call.
+The COMPLETE and CORRECT format is: toggle_platform({"platforms": ["platform1", "platform2"]})
+
+For content creation:
+1. First understand what platforms the user wants to post to
+2. Call the toggle_platform function with those platforms
+3. Then provide platform-specific content for EACH platform separately
+
+IMPORTANT: When providing content for multiple platforms, clearly separate each platform's content using headers:
+
+## Twitter Post
+[Twitter-specific content here]
+
+## Threads Post
+[Threads-specific content here]
+
+And so on for each platform. Make sure to adapt the content to each platform's specific characteristics:
+- Twitter: Keep content concise (280 characters max)
+- Threads: Can be longer form content with proper formatting
+- Instagram: More visual focus, use emojis appropriately
+- Facebook: Can be longer with more detailed text
+- LinkedIn: Professional tone, industry-relevant
+- TikTok: Casual, trendy, engaging
+- YouTube: Descriptive with appropriate keywords
+
+For LaTeX, use the following format:
 ```latex
 {latex code}
+```
+
 For generating tables, please structure the response in this exact format:
 {markdown table}
+
+Remember to ALWAYS use the toggle_platform function when the user wants to create content for specific platforms.
 """
+
 class Message(BaseModel):
   role: str
   content: str
@@ -118,12 +171,33 @@ class GrokClient:
     }
 
   async def chat(self, request: ChatRequest) -> StreamingResponse:
+    # Create a modified request without functions parameter
+    request_data = request.model_dump()
+    if 'functions' in request_data:
+      logger.info(f"Removing functions from request: {request_data['functions']}")
+      del request_data['functions']
+      
     async with httpx.AsyncClient() as client:
       response = await client.post(
         f"{self.base_url}/chat",
         headers=self.headers, 
-        json=request.model_dump()
+        json=request_data
       )
+      
+      if response.status_code != 200:
+        try:
+          error_data = response.json()
+          error_message = error_data.get("error", {}).get("message", "Grok API error")
+          logger.error(f"Grok API error: {error_data}")
+        except (json.JSONDecodeError, ValueError):
+          error_message = f"Grok API error: Status {response.status_code}"
+          logger.error(f"Non-JSON error response: {response.text}")
+        except Exception as e:
+          error_message = f"Grok API error: Status {response.status_code}"
+          logger.error(f"Error parsing error response: {str(e)}")
+        
+        raise HTTPException(status_code=response.status_code, detail=error_message)
+        
       return response.json()
 
   async def create_completion(self, messages: List[Dict[str, Any]], model: str,
@@ -132,17 +206,62 @@ class GrokClient:
                               max_tokens: int=2048,
                               stream: bool=False) -> Dict[str, Any]:
         """Create a completion with Grok API"""
+        # Ensure model is valid
+        if model not in AVAILABLE_MODELS:
+            logger.warning(f"Model {model} not in available models list, using default {DEFAULT_GROK_MODEL}")
+            model = DEFAULT_GROK_MODEL
+            
+        # Ensure temperature is within valid range (0.0 to 1.0)
+        temperature = max(0.0, min(1.0, temperature))
+        
+        # Ensure max_tokens is reasonable
+        max_tokens = max(1, min(4096, max_tokens))
+        
+        # Validate messages format
+        validated_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                logger.warning(f"Invalid message format: {msg}")
+                continue
+                
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            if not role or not isinstance(role, str) or role not in ["system", "user", "assistant", "function"]:
+                logger.warning(f"Invalid message role: {role}")
+                continue
+                
+            if content is None:
+                content = ""
+                
+            validated_msg = {"role": role, "content": content}
+            
+            # Add function_call if present
+            if "function_call" in msg and msg["function_call"]:
+                validated_msg["function_call"] = msg["function_call"]
+                
+            validated_messages.append(validated_msg)
+            
+        # Ensure we have at least one message
+        if not validated_messages:
+            logger.error("No valid messages to send to API")
+            raise HTTPException(status_code=400, detail="No valid messages to send to API")
+            
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": validated_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": stream
         }
 
+        # Don't add functions to payload - Grok API doesn't support it properly
         if functions:
-            payload["functions"] = functions
+            logger.info(f"Will look for function calls in text: {[f['name'] for f in functions]}")
+            # IMPORTANT: Do NOT add functions to the payload as it causes 400 errors
+            # The function calls will be detected in the text response instead
 
+        logger.info(f"Sending payload to API: {json.dumps(payload, default=str)}")
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
@@ -151,10 +270,18 @@ class GrokClient:
             )
 
             if response.status_code != 200:
-                error_data = response.json()
-                logger.error(f"Grok API error: {error_data}")
-                raise HTTPException(status_code=response.status_code,
-                                  detail=error_data.get("error", {}).get("message", "Grok API error"))
+                try:
+                    error_data = response.json()
+                    error_message = error_data.get("error", {}).get("message", "Grok API error")
+                    logger.error(f"Grok API error: {error_data}")
+                except (json.JSONDecodeError, ValueError):
+                    error_message = f"Grok API error: Status {response.status_code}"
+                    logger.error(f"Non-JSON error response: {response.text}")
+                except Exception as e:
+                    error_message = f"Grok API error: Status {response.status_code}"
+                    logger.error(f"Error parsing error response: {str(e)}")
+                
+                raise HTTPException(status_code=response.status_code, detail=error_message)
 
             return response.json()
 
@@ -163,59 +290,190 @@ class GrokClient:
                               temperature: float=0.7,
                               max_tokens: int=2048):
         """Stream a completion from Grok API"""
+        # Ensure model is valid
+        if model not in AVAILABLE_MODELS:
+            logger.warning(f"Model {model} not in available models list, using default {DEFAULT_GROK_MODEL}")
+            model = DEFAULT_GROK_MODEL
+            
+        # Ensure temperature is within valid range (0.0 to 1.0)
+        temperature = max(0.0, min(1.0, temperature))
+        
+        # Ensure max_tokens is reasonable
+        max_tokens = max(1, min(4096, max_tokens))
+        
+        # Validate messages format
+        validated_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                logger.warning(f"Invalid message format: {msg}")
+                continue
+                
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            if not role or not isinstance(role, str) or role not in ["system", "user", "assistant", "function"]:
+                logger.warning(f"Invalid message role: {role}")
+                continue
+                
+            if content is None:
+                content = ""
+                
+            validated_msg = {"role": role, "content": content}
+            
+            # Add function_call if present
+            if "function_call" in msg and msg["function_call"]:
+                validated_msg["function_call"] = msg["function_call"]
+                
+            validated_messages.append(validated_msg)
+            
+        # Ensure we have at least one message
+        if not validated_messages:
+            logger.error("No valid messages to send to API")
+            raise HTTPException(status_code=400, detail="No valid messages to send to API")
+            
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": validated_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True
         }
 
+        # Don't add functions to payload - Grok API doesn't support it properly
+        # Just log that we're looking for function calls in text
         if functions:
-            payload["functions"] = functions
+            logger.info(f"Will look for function calls in text: {[f['name'] for f in functions]}")
+            # IMPORTANT: Do NOT add functions to the payload as it causes 400 errors
+            # The function calls will be detected in the text response instead
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=payload
-            ) as response:
-                if response.status_code != 200:
-                    error_content = await response.aread()
-                    try:
-                        error_data = json.loads(error_content)
-                        error_message = error_data.get("error", {}).get("message", "Grok API error")
-                    except:
-                        error_message = f"Grok API error: Status {response.status_code}"
+        # Log the payload for debugging
+        logger.info(f"Sending payload to API: {json.dumps(payload, default=str)}")
+        
+        # Log the first few messages for debugging
+        if validated_messages and len(validated_messages) > 0:
+            logger.info(f"First message role: {validated_messages[0].get('role', 'unknown')}")
+            logger.info(f"First message content type: {type(validated_messages[0].get('content', ''))}")
+            if len(validated_messages) > 1:
+                logger.info(f"Last message role: {validated_messages[-1].get('role', 'unknown')}")
+                logger.info(f"Last message content type: {type(validated_messages[-1].get('content', ''))}")
 
-                    logger.error(error_message)
-                    raise HTTPException(status_code=response.status_code, detail=error_message)
+        # Regex for detecting toggle_platform in text - improved to handle malformed calls
+        toggle_platform_regex = re.compile(r'toggle_platform\s*\(\s*(?:\{.*?"platforms"\s*:\s*\[(.*?)\].*?(?:\}|\}?\s*$)|\[(.*?)\](?:\)|\s*$))')
+        accumulated_text = ""
+        function_call_detected = False
 
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    if chunk.startswith("data: "):
-                        data_str = chunk[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload
+                ) as response:
+                    if response.status_code != 200:
+                        error_content = await response.aread()
                         try:
-                            data = json.loads(data_str)
-                            if "choices" in data and len(data["choices"]) > 0:
-                                if "delta" in data["choices"][0] and "content" in data["choices"][0]["delta"]:
-                                    content = data["choices"][0]["delta"]["content"]
-                                    buffer += content
-                                    yield f"data: {json.dumps({'v': content})}\n\n"
-                                elif "function_call" in data["choices"][0].get("delta", {}):
-                                    function_data = data["choices"][0]["delta"]["function_call"]
-                                    yield json.dumps({
-                                        "type": "function_call",
-                                        "function_call": function_data
-                                    })
+                            error_data = json.loads(error_content)
+                            error_message = error_data.get("error", {}).get("message", "Grok API error")
+                            # Add more detailed logging
+                            logger.error(f"Full error response: {error_content.decode('utf-8', errors='replace')}")
                         except json.JSONDecodeError:
-                            logger.error(f"Error parsing chunk: {chunk}")
+                            # Handle case where error_content is not valid JSON
+                            logger.error(f"Non-JSON error response: {error_content.decode('utf-8', errors='replace')}")
+                            error_message = f"Grok API error: Status {response.status_code}"
                         except Exception as e:
-                            logger.error(f"Error processing chunk: {str(e)}")
+                            logger.error(f"Error parsing error response: {str(e)}")
+                            error_message = f"Grok API error: Status {response.status_code}"
+
+                        logger.error(error_message)
+                        raise HTTPException(status_code=response.status_code, detail=error_message)
+
+                    buffer = ""
+                    try:
+                        async for chunk in response.aiter_text():
+                            try:
+                                if chunk.startswith("data: "):
+                                    data_str = chunk[6:]
+                                    if data_str.strip() == "[DONE]":
+                                        break
+
+                                    try:
+                                        data = json.loads(data_str)
+                                        if "choices" in data and len(data["choices"]) > 0:
+                                            if "delta" in data["choices"][0] and "content" in data["choices"][0]["delta"]:
+                                                content = data["choices"][0]["delta"]["content"]
+                                                buffer += content
+                                                accumulated_text += content
+                                                
+                                                # Check for function calls in text if we haven't detected one yet
+                                                if not function_call_detected and "toggle_platform" in accumulated_text:
+                                                    match = toggle_platform_regex.search(accumulated_text)
+                                                    if match:
+                                                        platforms_str = match.group(1) or match.group(2) or ""
+                                                        logger.info(f"Detected toggle_platform in text: {match.group(0)}")
+                                                        
+                                                        # Try to parse the platforms
+                                                        try:
+                                                            # Clean up the string and parse platforms
+                                                            platforms_str = platforms_str.replace('"', '').replace("'", "").replace(" ", "")
+                                                            platforms = [p.strip() for p in platforms_str.split(',') if p.strip()]
+                                                            
+                                                            if platforms:
+                                                                function_call_detected = True
+                                                                # Create a synthetic function call
+                                                                function_data = {
+                                                                    "name": "toggle_platform",
+                                                                    "arguments": json.dumps({"platforms": platforms})
+                                                                }
+                                                                
+                                                                # Yield the function call
+                                                                yield json.dumps({
+                                                                    "type": "function_call",
+                                                                    "function_call": function_data
+                                                                })
+                                                                
+                                                                # Continue with normal content streaming
+                                                        except Exception as e:
+                                                            logger.error(f"Error parsing platforms from text: {e}")
+                                                
+                                                # Always yield the content
+                                                yield f"data: {json.dumps({'v': content})}\n\n"
+                                            # We don't expect function_call from the API, but keep this just in case
+                                            elif "function_call" in data["choices"][0].get("delta", {}):
+                                                function_call_detected = True
+                                                function_data = data["choices"][0]["delta"]["function_call"]
+                                                yield json.dumps({
+                                                    "type": "function_call",
+                                                    "function_call": function_data
+                                                })
+                                    except json.JSONDecodeError:
+                                        logger.error(f"Error parsing chunk: {chunk}")
+                                    except Exception as e:
+                                        logger.error(f"Error processing chunk: {str(e)}")
+                            except (ConnectionResetError, asyncio.CancelledError):
+                                logger.warning("Client disconnected during streaming")
+                                break
+                            except Exception as e:
+                                logger.error(f"Error processing stream chunk: {str(e)}")
+                                # Continue trying to process other chunks
+                    except (ConnectionResetError, asyncio.CancelledError):
+                        logger.warning("Client disconnected during streaming")
+                    except Exception as e:
+                        logger.error(f"Error in stream loop: {str(e)}")
+                        # Try to yield an error message
+                        try:
+                            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                        except:
+                            pass
+        except (ConnectionResetError, asyncio.CancelledError):
+            logger.warning("Client disconnected before streaming could start")
+        except Exception as e:
+            logger.error(f"Error setting up streaming: {str(e)}")
+            # Try to yield an error message
+            try:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            except:
+                pass
 
 class FunctionRegistry:
   def __init__(self):
@@ -223,58 +481,56 @@ class FunctionRegistry:
     self._register_default_functions()
 
   def _register_default_functions(self):
-    self.functions["get_current_time"] = self._get_current_time
+    # Register get_current_time function
+    self.register(
+      name="get_current_time",
+      description="Get the current server time",
+      parameters={
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      handler=self._get_current_time
+    )
+    
+    # Register toggle_platform function
+    self.register(
+      name="toggle_platform",
+      description="Toggle selected platforms for content creation",
+      parameters={
+        "type": "object",
+        "properties": {
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of platforms to toggle"
+          }
+        },
+        "required": ["platforms"]
+      },
+      handler=self._toggle_platform
+    )
 
   async def _get_current_time(self) -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _register_default_functions(self):
-    """Register default system functions"""
-    # Weather function
-    self.register(
-        name="get_weather",
-        description="Get current weather in a location",
-        parameters={
-            "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "City name"},
-                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-            },
-            "required": ["location"]
-        },
-        handler=self._get_weather
-    )
+  async def _toggle_platform(self, platforms):
+    """Handle platform toggling"""
+    logger.info(f"Platform toggle function called with: {platforms}")
     
-    # Calculator function
-    self.register(
-        name="calculate",
-        description="Perform a mathematical calculation",
-        parameters={
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "Mathematical expression to evaluate"}
-            },
-            "required": ["expression"]
-        },
-        handler=self._calculate
-    )
-    
-    # Search function
-    self.register(
-        name="search_web",
-        description="Search the web for information",
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results to return"}
-            },
-            "required": ["query"]
-        },
-        handler=self._search_web
-    )
+    if not platforms or not isinstance(platforms, list):
+      logger.warning(f"Invalid platforms format received: {platforms}")
+      platforms = []
+      
+    return {
+        "platforms": platforms,
+        "status": "toggled",
+        "message": f"Selected platforms: {', '.join(platforms)}"
+    }
 
-def register(self, name, description, parameters, handler):
+  def register(self, name, description, parameters, handler):
     """Register a function with its schema and handler"""
     self.functions[name] = {
         "name": name,
@@ -283,7 +539,7 @@ def register(self, name, description, parameters, handler):
         "handler": handler
     }
 
-def get_functions(self, function_names=None):
+  def get_functions(self, function_names=None):
     """Get function schemas for specified functions or all if None"""
     if function_names is None:
         return [
@@ -303,7 +559,7 @@ def get_functions(self, function_names=None):
     
     return result
 
-async def execute(self, name, arguments):
+  async def execute(self, name, arguments):
     """Execute a registered function with the provided arguments"""
     if name not in self.functions:
         raise ValueError(f"Function {name} not found")
@@ -598,41 +854,185 @@ request: ChatRequest, grok_client: GrokClient):
     function_definitions = None
     if request.functions:
         function_definitions = function_registry.get_functions(request.functions)
+        logger.info(f"Using functions: {request.functions}")
+        logger.info(f"Function definitions: {[f['name'] for f in function_definitions]}")
 
     # Initialize response tracking
     full_response = ""
     current_function_call = None
+    function_call_detected = False
+    toggle_platform_regex = re.compile(r'toggle_platform\s*\(\s*(?:\{.*?"platforms"\s*:\s*\[(.*?)\].*?(?:\}|\}?\s*$)|\[(.*?)\](?:\)|\s*$))')
 
-    # Stream response from Grok
-    async for chunk in grok_client.stream_completion(
-        messages=conversation_messages,
-        model=request.model,
-        functions=function_definitions,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens
-    ):
-        yield chunk
-        
-        # Extract content for storing later
-        if chunk.startswith('data: '):
+    try:
+        # Stream response from Grok
+        async for chunk in grok_client.stream_completion(
+            messages=conversation_messages,
+            model=request.model,
+            functions=function_definitions,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        ):
             try:
-                data = json.loads(chunk[6:])
-                if 'v' in data:
-                    full_response += data['v']
-            except Exception:
-                pass
+                yield chunk
+                
+                # Extract content for storing later
+                if chunk.startswith('data: '):
+                    try:
+                        data = json.loads(chunk[6:])
+                        if 'v' in data:
+                            content_chunk = data['v']
+                            full_response += content_chunk
+                            
+                            # Check if this chunk contains a function call as text
+                            if not function_call_detected and "toggle_platform" in full_response:
+                                # Check for toggle_platform in various formats
+                                match = toggle_platform_regex.search(full_response)
+                                if match:
+                                    platforms_str = match.group(1) or match.group(2) or ""
+                                    logger.info(f"Function call detected in text: {match.group(0)}")
+                                    logger.info(f"Extracted platforms: {platforms_str}")
+                                    
+                                    # Try to parse the platforms
+                                    try:
+                                        # Clean up the string and parse platforms
+                                        platforms_str = platforms_str.replace('"', '').replace("'", "").replace(" ", "")
+                                        platforms = [p.strip() for p in platforms_str.split(',') if p.strip()]
+                                        
+                                        if platforms:
+                                            function_call_detected = True
+                                            # Create a synthetic function call
+                                            current_function_call = {
+                                                "name": "toggle_platform",
+                                                "arguments": json.dumps({"platforms": platforms})
+                                            }
+                                            logger.info(f"Created synthetic function call with platforms: {platforms}")
+                                    except Exception as e:
+                                        logger.error(f"Error parsing platforms from text: {e}")
+                    except Exception as e:
+                        logger.error(f"Error processing chunk: {e}")
+                elif chunk.startswith('{"type":"function_call"'):
+                    try:
+                        data = json.loads(chunk)
+                        logger.info(f"Received function call: {data}")
+                        function_call_detected = True
+                        current_function_call = data.get("function_call")
+                    except Exception as e:
+                        logger.error(f"Error parsing function call: {e}")
+            except ConnectionResetError:
+                logger.warning("Client disconnected during streaming")
+                break
+            except asyncio.CancelledError:
+                logger.warning("Stream was cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error yielding chunk: {str(e)}")
+                break
 
-    # Store the complete response if we have content
-    if full_response:
-        await add_message(
-            db=db,
-            conversation_id=conversation_id,
-            role="assistant",
-            content=full_response
-        )
+        # Check one last time for function calls in the complete response
+        if not function_call_detected and "toggle_platform" in full_response:
+            match = toggle_platform_regex.search(full_response)
+            if match:
+                platforms_str = match.group(1) or match.group(2) or ""
+                logger.info(f"Function call detected in final text: {match.group(0)}")
+                
+                try:
+                    # Clean up the string and parse platforms
+                    platforms_str = platforms_str.replace('"', '').replace("'", "").replace(" ", "")
+                    platforms = [p.strip() for p in platforms_str.split(',') if p.strip()]
+                    
+                    if platforms:
+                        function_call_detected = True
+                        current_function_call = {
+                            "name": "toggle_platform",
+                            "arguments": json.dumps({"platforms": platforms})
+                        }
+                        logger.info(f"Created synthetic function call with platforms: {platforms}")
+                except Exception as e:
+                    logger.error(f"Error parsing platforms from final text: {e}")
 
-    # Add final marker
-    yield "data: [DONE]\n\n"
+        # Log completion status
+        if function_call_detected:
+            logger.info("Function call was detected during streaming")
+            
+            # Process the function call if we have one
+            if current_function_call and current_function_call.get("name") == "toggle_platform":
+                try:
+                    # Extract arguments
+                    args = json.loads(current_function_call.get("arguments", "{}"))
+                    platforms = args.get("platforms", [])
+                    
+                    if platforms:
+                        logger.info(f"Processing toggle_platform with platforms: {platforms}")
+                        
+                        # Execute the function
+                        result = await function_registry.execute("toggle_platform", {"platforms": platforms})
+                        logger.info(f"Function result: {result}")
+                        
+                        # Store function call and result
+                        message_id = await add_message(
+                            db=db,
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content="",
+                            function_call=current_function_call
+                        )
+                        
+                        await store_function_call(
+                            db=db,
+                            message_id=message_id,
+                            function_name="toggle_platform",
+                            arguments={"platforms": platforms},
+                            result=result
+                        )
+                        
+                        # Add function result as a message
+                        await add_message(
+                            db=db,
+                            conversation_id=conversation_id,
+                            role="function",
+                            content=json.dumps(result)
+                        )
+                except Exception as e:
+                    logger.error(f"Error processing toggle_platform function: {e}")
+        else:
+            logger.warning("No function call was detected during streaming")
+
+        # Clean the response to remove function calls before storing
+        if function_call_detected:
+            # Remove the function call text from the response
+            clean_response = re.sub(r'toggle_platform\s*\(\s*(?:\{.*?"platforms"\s*:\s*\[.*?\].*?(?:\}|\}?\s*$)|\[.*?\](?:\)|\s*$))', '', full_response)
+            clean_response = clean_response.strip()
+            logger.info(f"Cleaned response length: {len(clean_response)} (original: {len(full_response)})")
+            full_response = clean_response
+
+        # Store the complete response if we have content
+        if full_response:
+            try:
+                await add_message(
+                    db=db,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=full_response
+                )
+            except Exception as e:
+                logger.error(f"Error storing response: {str(e)}")
+
+        # Add final marker
+        try:
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Error sending final marker: {str(e)}")
+    
+    except asyncio.CancelledError:
+        logger.warning("Stream was cancelled by client")
+    except Exception as e:
+        logger.error(f"Error in stream_chat_response: {str(e)}")
+        # Try to send an error message to the client
+        try:
+            yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception:
+            pass
 
 async def stream_vision_response(db: Database, conversation_id: str, user_id: str,
 request: VisionRequest, grok_client: GrokClient):
@@ -664,13 +1064,31 @@ request: VisionRequest, grok_client: GrokClient):
     if not GROK_API_KEY:
         raise HTTPException(status_code=500, detail="Grok API key not configured")
 
+    # Ensure model is valid
+    model = request.model
+    if model not in AVAILABLE_MODELS:
+        logger.warning(f"Vision model {model} not in available models list, using grok-2-vision")
+        model = "grok-2-vision"  # Default vision model
+        
+    # Ensure max_tokens is reasonable
+    max_tokens = max(1, min(4096, request.max_tokens))
+
     # Create payload for vision request
     payload = {
-        "model": request.model,
+        "model": model,
         "messages": vision_messages,
-        "max_tokens": request.max_tokens,
+        "max_tokens": max_tokens,
         "stream": True
     }
+    
+    # Log the payload for debugging (excluding large image data)
+    debug_payload = payload.copy()
+    for msg in debug_payload.get("messages", []):
+        if isinstance(msg.get("content"), list):
+            for item in msg.get("content", []):
+                if item.get("type") == "image_url" and "image_url" in item:
+                    item["image_url"] = {"url": "[IMAGE DATA REDACTED]"}
+    logger.info(f"Sending vision payload to API: {json.dumps(debug_payload, default=str)}")
 
     # Stream the response
     async with httpx.AsyncClient(timeout=300.0) as client:
@@ -688,8 +1106,14 @@ request: VisionRequest, grok_client: GrokClient):
                 try:
                     error_data = json.loads(error_content)
                     error_message = error_data.get("error", {}).get("message", "Grok API error")
-                except:
-                    error_message = f"Grok Vision API error: Status {response.status_code}"
+                    # Add more detailed logging
+                    logger.error(f"Full error response: {error_content.decode('utf-8', errors='replace')}")
+                except json.JSONDecodeError:
+                    # Handle case where error_content is not valid JSON
+                    logger.error(f"Non-JSON error response: {error_content.decode('utf-8', errors='replace')}")
+                    error_message = f"Grok API error: Status {response.status_code}"
+                except Exception as e:
+                    error_message = f"Grok API error: Status {response.status_code}"
                 
                 logger.error(error_message)
                 raise HTTPException(status_code=response.status_code, detail=error_message)
@@ -1035,8 +1459,7 @@ async def stream_chat_get(
         system_prompt=request.system_prompt,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
-        stream=True,
-        functions=request.functions
+        stream=True
     )
 
     # Initialize Grok client
