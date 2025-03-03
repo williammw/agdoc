@@ -90,6 +90,7 @@ router_list = [
     (folders_router.router, "/api/v1/folders", ["folders"]),
     (media_router.router, "/api/v1/media", ["media"]),
     (threads_router.router, "/api/v1/threads", ["threads"]),
+    
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
