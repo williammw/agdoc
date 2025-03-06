@@ -841,10 +841,11 @@ async def stream_chat_response(db: Database, conversation_id: str, user_id: str,
     logger.info(f"Processing message: '{request.message}' for conversation {conversation_id}")
 
     # Get conversation history
+    system_prompt = getattr(request, 'system_prompt', None)
     conversation_messages = await prepare_conversation_messages(
         db=db,
         conversation_id=conversation_id,
-        system_prompt=request.system_prompt
+        system_prompt=system_prompt
     )
 
     # Add the current user message to conversation_messages
