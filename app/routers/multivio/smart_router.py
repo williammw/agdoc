@@ -172,6 +172,82 @@ async def stream_chat(
             
             await db.execute(query=query, values=values)
             
+            # Store message ID for later reference
+            message_id = None
+            
+            # Record the message in conversation if conversation_id is provided
+            conversation_id = getattr(request, 'conversation_id', None)
+            if conversation_id:
+                try:
+                    # Add user message
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (
+                            id, conversation_id, role, content, created_at
+                        ) VALUES (
+                            :id, :conversation_id, :role, :content, :created_at
+                        )
+                        """,
+                        {
+                            "id": str(uuid.uuid4()),
+                            "conversation_id": conversation_id,
+                            "role": "user",
+                            "content": user_message,
+                            "created_at": now
+                        }
+                    )
+                    
+                    # Check if the table has an image_url column
+                    check_image_url_query = """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                    """
+                    has_image_url = await db.fetch_one(check_image_url_query)
+                    
+                    # Add assistant message (placeholder)
+                    message_id = str(uuid.uuid4())
+                    
+                    # Determine columns and values based on schema
+                    insert_fields = [
+                        "id", "conversation_id", "role", "content", "created_at", "metadata"
+                    ]
+                    
+                    insert_values = {
+                        "id": message_id,
+                        "conversation_id": conversation_id,
+                        "role": "assistant",
+                        "content": f"Generating image of {prompt}...",
+                        "created_at": now,
+                        "metadata": json.dumps({
+                            "is_image": True,
+                            "image_task_id": task_id,
+                            "prompt": prompt,
+                            "status": "generating"
+                        })
+                    }
+                    
+                    # Add image_url placeholder if the column exists
+                    if has_image_url:
+                        insert_fields.append("image_url")
+                        insert_values["image_url"] = "pending"  # Will be updated when image is ready
+                    
+                    # Build dynamic query
+                    fields_str = ", ".join(insert_fields)
+                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
+                    
+                    insert_query = f"""
+                    INSERT INTO mo_llm_messages (
+                        {fields_str}
+                    ) VALUES (
+                        {placeholders_str}
+                    )
+                    """
+                    
+                    await db.execute(query=insert_query, values=insert_values)
+                except Exception as e:
+                    logger.error(f"Error recording messages in stream chat: {str(e)}")
+                    # Continue even if message recording fails
+            
             # Start background task
             background_tasks.add_task(
                 generate_image_task,
@@ -179,7 +255,9 @@ async def stream_chat(
                 api_data,
                 current_user["uid"],
                 None,  # No folder_id for chat-based images
-                db
+                db,
+                conversation_id,
+                message_id
             )
             
             # Return a special message that can be interpreted by the frontend
@@ -292,6 +370,82 @@ async def smart_chat(
             
             await db.execute(query=query, values=values)
             
+            # Store message ID for later reference
+            message_id = None
+            
+            # Record the message in conversation if conversation_id is provided
+            conversation_id = getattr(request, 'conversation_id', None)
+            if conversation_id:
+                try:
+                    # Add user message
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (
+                            id, conversation_id, role, content, created_at
+                        ) VALUES (
+                            :id, :conversation_id, :role, :content, :created_at
+                        )
+                        """,
+                        {
+                            "id": str(uuid.uuid4()),
+                            "conversation_id": conversation_id,
+                            "role": "user",
+                            "content": user_message,
+                            "created_at": now
+                        }
+                    )
+                    
+                    # Check if the table has an image_url column
+                    check_image_url_query = """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                    """
+                    has_image_url = await db.fetch_one(check_image_url_query)
+                    
+                    # Add assistant message (placeholder)
+                    message_id = str(uuid.uuid4())
+                    
+                    # Determine columns and values based on schema
+                    insert_fields = [
+                        "id", "conversation_id", "role", "content", "created_at", "metadata"
+                    ]
+                    
+                    insert_values = {
+                        "id": message_id,
+                        "conversation_id": conversation_id,
+                        "role": "assistant",
+                        "content": f"Generating image for: {prompt}...",
+                        "created_at": now,
+                        "metadata": json.dumps({
+                            "is_image": True,
+                            "image_task_id": task_id,
+                            "prompt": prompt,
+                            "status": "generating"
+                        })
+                    }
+                    
+                    # Add image_url placeholder if the column exists
+                    if has_image_url:
+                        insert_fields.append("image_url")
+                        insert_values["image_url"] = "pending"  # Will be updated when image is ready
+                    
+                    # Build dynamic query
+                    fields_str = ", ".join(insert_fields)
+                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
+                    
+                    insert_query = f"""
+                    INSERT INTO mo_llm_messages (
+                        {fields_str}
+                    ) VALUES (
+                        {placeholders_str}
+                    )
+                    """
+                    
+                    await db.execute(query=insert_query, values=insert_values)
+                except Exception as e:
+                    logger.error(f"Error recording messages in smart chat: {str(e)}")
+                    # Continue even if message recording fails
+            
             # Start background task
             background_tasks.add_task(
                 generate_image_task,
@@ -299,7 +453,9 @@ async def smart_chat(
                 api_data,
                 current_user["uid"],
                 None,  # No folder_id for chat-based images
-                db
+                db,
+                conversation_id,
+                message_id
             )
             
             return SmartResponse(
@@ -422,15 +578,8 @@ async def generate_image_from_text(
         
         await db.execute(query=query, values=values)
         
-        # Start background task
-        background_tasks.add_task(
-            generate_image_task,
-            task_id,
-            api_data,
-            current_user["uid"],
-            None,  # No folder_id for chat-based images
-            db
-        )
+        # Store message ID for later reference
+        message_id = None
         
         # Record the message in conversation if conversation_id is provided
         conversation_id = getattr(request, 'conversation_id', None)
@@ -455,25 +604,81 @@ async def generate_image_from_text(
                 )
                 
                 # Add assistant message (placeholder)
-                await db.execute(
-                    """
-                    INSERT INTO mo_llm_messages (
-                        id, conversation_id, role, content, created_at
-                    ) VALUES (
-                        :id, :conversation_id, :role, :content, :created_at
+                message_id = str(uuid.uuid4())
+                
+                # Check if the table has an image_url column
+                check_image_url_query = """
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                """
+                has_image_url = await db.fetch_one(check_image_url_query)
+                
+                if has_image_url:
+                    # If image_url column exists, include it in the insert
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (
+                            id, conversation_id, role, content, created_at, metadata, image_url
+                        ) VALUES (
+                            :id, :conversation_id, :role, :content, :created_at, :metadata, :image_url
+                        )
+                        """,
+                        {
+                            "id": message_id,
+                            "conversation_id": conversation_id,
+                            "role": "assistant",
+                            "content": f"Generating image for: {prompt}...",
+                            "created_at": now,
+                            "metadata": json.dumps({
+                                "is_image": True,
+                                "image_task_id": task_id,
+                                "prompt": prompt,
+                                "status": "generating"
+                            }),
+                            "image_url": "pending"  # Will be updated when image is ready
+                        }
                     )
-                    """,
-                    {
-                        "id": str(uuid.uuid4()),
-                        "conversation_id": conversation_id,
-                        "role": "assistant",
-                        "content": f"Generating image for: {prompt}...",
-                        "created_at": now
-                    }
-                )
+                else:
+                    # Otherwise, use the original columns
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (
+                            id, conversation_id, role, content, created_at, metadata
+                        ) VALUES (
+                            :id, :conversation_id, :role, :content, :created_at, :metadata
+                        )
+                        """,
+                        {
+                            "id": message_id,
+                            "conversation_id": conversation_id,
+                            "role": "assistant",
+                            "content": f"Generating image for: {prompt}...",
+                            "created_at": now,
+                            "metadata": json.dumps({
+                                "is_image": True,
+                                "image_task_id": task_id,
+                                "prompt": prompt,
+                                "status": "generating"
+                            })
+                        }
+                    )
             except Exception as e:
                 logger.error(f"Error recording messages: {str(e)}")
                 # Continue even if message recording fails
+        
+        # Start background task with message info
+        background_tasks.add_task(
+            generate_image_task,
+            task_id,
+            api_data,
+            current_user["uid"],
+            None,  # No folder_id for chat-based images
+            db,
+            conversation_id,  # Pass conversation_id
+            message_id       # Pass message_id
+        )
+        
+        # This section has been moved into the code above before starting the background task
         
         return JSONResponse({
             "is_image_request": True,

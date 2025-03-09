@@ -6,10 +6,13 @@ from typing import Optional, List, Dict, Any
 import os
 import httpx
 import logging
+import traceback
 from datetime import datetime, timezone
 import json
 import uuid
 import base64
+import tempfile
+import boto3
 
 # Import the official Together Python package
 try:
@@ -26,6 +29,14 @@ logger = logging.getLogger(__name__)
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 TOGETHER_API_BASE = "https://api.together.ai/v1"
 CDN_DOMAIN = os.getenv("CDN_DOMAIN", "cdn.multivio.com")
+
+# Configure R2 client
+s3_client = boto3.client('s3',
+    endpoint_url=os.getenv('R2_ENDPOINT_URL'),
+    aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+    region_name='weur')
+bucket_name = 'multivio'
 
 # Initialize Together client if available
 together_client = Together(api_key=TOGETHER_API_KEY) if TOGETHER_CLIENT_AVAILABLE and TOGETHER_API_KEY else None
@@ -68,7 +79,7 @@ async def call_together_api(endpoint: str, data: Dict, method: str = "POST"):
             prompt = data.get("prompt", "")
             model = "black-forest-labs/FLUX.1-dev"  # Use the correct model ID
             n = data.get("n", 1)
-            steps = data.get("steps", 10)  # Default to 10 steps
+            steps = data.get("steps", 24)  # Default to 10 steps
             width = data.get("width", 1024)  # Default width
             height = data.get("height", 1024)  # Default height
             disable_safety_checker = data.get("disable_safety_checker", True)  # Add safety checker option
@@ -138,7 +149,9 @@ async def generate_image_task(
     api_data: Dict[str, Any], 
     user_id: str,
     folder_id: Optional[str],
-    db: Database
+    db: Database,
+    conversation_id: Optional[str] = None,
+    message_id: Optional[str] = None
 ):
     try:
         logger.info(f"Starting image generation task {task_id}")
@@ -150,12 +163,61 @@ async def generate_image_task(
         now = datetime.now(timezone.utc)
         generated_images = []
         
+        # Generate timestamp for folder structure
+        timestamp_folder = now.strftime('%Y/%m/%d')
+        
         for i, img_data in enumerate(result.get("data", [])):
             image_url = img_data.get("url")
             
             if image_url:
                 # Generate a unique ID
                 image_id = str(uuid.uuid4())
+                timestamp_file = now.strftime('%Y-%m-%d_%H-%M-%S')
+                name = f"Flux_image_{timestamp_file}_{i+1}.png"
+                
+                # Check if it's a base64 data URL
+                if image_url.startswith('data:image/'):
+                    try:
+                        # Extract the base64 data
+                        base64_data = image_url.split(',')[1]
+                        image_data = base64.b64decode(base64_data)
+                        
+                        # Define the path in R2
+                        r2_key = f"flux-images/{user_id}/{timestamp_folder}/{image_id}.png"
+                        
+                        # Create a temporary file for the image
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
+                            temp_file.write(image_data)
+                            temp_file_path = temp_file.name
+                        
+                        try:
+                            # Upload the file to R2
+                            with open(temp_file_path, 'rb') as file_to_upload:
+                                s3_client.upload_fileobj(
+                                    file_to_upload,
+                                    bucket_name,
+                                    r2_key,
+                                    ExtraArgs={
+                                        "ContentType": "image/png", 
+                                        "ACL": "public-read"
+                                    }
+                                )
+                            
+                            # Update the image URL to the R2 URL
+                            image_url = f"https://{CDN_DOMAIN}/{r2_key}"
+                            logger.info(f"Uploaded image to R2: {image_url}")
+                            
+                            # Get file size
+                            file_size = os.path.getsize(temp_file_path)
+                        finally:
+                            # Clean up the temporary file
+                            os.unlink(temp_file_path)
+                    except Exception as e:
+                        logger.error(f"Error uploading to R2: {str(e)}")
+                        # Continue with the base64 URL if upload fails
+                        file_size = len(image_data) if 'image_data' in locals() else 0
+                else:
+                    file_size = 0  # We don't know the file size
                 
                 # Store in assets table
                 asset_query = """
@@ -170,8 +232,6 @@ async def generate_image_task(
                 )
                 """
                 
-                timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
-                name = f"Flux_image_{timestamp}_{i+1}.png"
                 metadata = {
                     "prompt": api_data["prompt"],
                     "model": api_data["model"],
@@ -187,7 +247,7 @@ async def generate_image_task(
                         "type": "image",
                         "url": image_url,
                         "content_type": "image/png",
-                        "file_size": 0,  # We don't know the file size yet
+                        "file_size": file_size,
                         "folder_id": folder_id,
                         "created_by": user_id,
                         "processing_status": "completed",
@@ -226,6 +286,132 @@ async def generate_image_task(
                 "user_id": user_id
             }
         )
+        
+        # Update the conversation message if we have conversation_id and message_id
+        if conversation_id and message_id and generated_images:
+            try:
+                # Use the first generated image for the conversation
+                first_image = generated_images[0]
+                image_url = first_image.get("url")
+                prompt = first_image.get("prompt", "")
+                
+                logger.info(f"Updating conversation {conversation_id}, message {message_id} with image URL: {image_url}")
+                
+                # Create a message that references the image
+                # Use markdown image syntax: ![alt text](url)
+                message_content = f"![Generated image for: {prompt}]({image_url})"
+                
+                # Create metadata with image information
+                metadata = {
+                    "is_image": True,
+                    "image_task_id": task_id,
+                    "image_id": first_image.get("id"),
+                    "image_url": image_url,
+                    "prompt": prompt,
+                    "status": "completed"
+                }
+                
+                # Check if various columns exist
+                check_image_url_query = """
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                """
+                has_image_url = await db.fetch_one(check_image_url_query)
+                
+                check_metadata_query = """
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'mo_llm_messages' AND column_name = 'metadata'
+                """
+                has_metadata = await db.fetch_one(check_metadata_query)
+                
+                check_updated_at_query = """
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'mo_llm_messages' AND column_name = 'updated_at'
+                """
+                has_updated_at = await db.fetch_one(check_updated_at_query)
+                
+                # First check if the message exists
+                check_msg_query = "SELECT id FROM mo_llm_messages WHERE id = :message_id AND conversation_id = :conversation_id"
+                existing_msg = await db.fetch_one(
+                    query=check_msg_query,
+                    values={
+                        "message_id": message_id,
+                        "conversation_id": conversation_id
+                    }
+                )
+                
+                if not existing_msg:
+                    logger.warning(f"Message {message_id} not found in conversation {conversation_id}. Creating new message.")
+                    # If message doesn't exist, create it
+                    insert_fields = [
+                        "id", "conversation_id", "role", "content", "created_at", "metadata"
+                    ]
+                    insert_values = {
+                        "id": message_id,
+                        "conversation_id": conversation_id,
+                        "role": "assistant",
+                        "content": message_content,
+                        "created_at": now,
+                        "metadata": json.dumps(metadata)
+                    }
+                    
+                    # Add image_url if the column exists
+                    if has_image_url:
+                        insert_fields.append("image_url")
+                        insert_values["image_url"] = image_url
+                    
+                    # Build dynamic query based on available columns
+                    fields_str = ", ".join(insert_fields)
+                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
+                    
+                    insert_query = f"""
+                    INSERT INTO mo_llm_messages (
+                        {fields_str}
+                    ) VALUES (
+                        {placeholders_str}
+                    )
+                    """
+                    
+                    await db.execute(query=insert_query, values=insert_values)
+                else:
+                    # Update the existing message with appropriate fields
+                    update_fields = ["content"]
+                    update_values = {
+                        "content": message_content,
+                        "message_id": message_id,
+                        "conversation_id": conversation_id
+                    }
+                    
+                    # Add metadata if the column exists
+                    if has_metadata:
+                        update_fields.append("metadata")
+                        update_values["metadata"] = json.dumps(metadata)
+                    
+                    # Add image_url if the column exists
+                    if has_image_url:
+                        update_fields.append("image_url")
+                        update_values["image_url"] = image_url
+                    
+                    # Add updated_at if the column exists
+                    if has_updated_at:
+                        update_fields.append("updated_at")
+                        update_values["updated_at"] = now
+                    
+                    # Build the update query dynamically
+                    set_clause = ", ".join([f"{field} = :{field}" for field in update_fields])
+                    update_query = f"""
+                    UPDATE mo_llm_messages 
+                    SET {set_clause}
+                    WHERE id = :message_id AND conversation_id = :conversation_id
+                    """
+                    
+                    await db.execute(query=update_query, values=update_values)
+                
+                logger.info(f"Successfully updated conversation message with image URL and metadata")
+            except Exception as e:
+                logger.error(f"Error updating conversation message: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Continue even if message update fails
         
         logger.info(f"Completed image generation task {task_id} with {len(generated_images)} images")
         
@@ -309,7 +495,7 @@ async def generate_image(
             "prompt": request.prompt,
             "model": "black-forest-labs/FLUX.1-dev",  # Use correct model ID
             "n": request.num_images,
-            "steps": 10,  # Default steps parameter
+            "steps":24,  # Default steps parameter
             "disable_safety_checker": request.disable_safety_checker  # Add safety checker option
         }
         

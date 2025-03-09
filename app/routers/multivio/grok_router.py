@@ -1754,7 +1754,7 @@ async def get_content_conversation(
     # Try to find an existing conversation for this content
     conversation_query = """
     SELECT 
-        id, title, model_id as model,
+        id, title, model_id as model, 
         created_at, updated_at, 
         content_id,
         (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count,
@@ -1777,7 +1777,7 @@ async def get_content_conversation(
 
         # Get messages for the conversation
         messages_query = """
-        SELECT id, role, content, created_at, function_call
+        SELECT id, role, content, created_at, function_call, image_url, image_metadata
         FROM mo_llm_messages
         WHERE conversation_id = :conversation_id
         ORDER BY created_at
