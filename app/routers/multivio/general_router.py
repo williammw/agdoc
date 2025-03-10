@@ -1121,24 +1121,44 @@ async def stream_chat_api(
         logger.info(
             f"Using general knowledge system prompt: {DEFAULT_SYSTEM_PROMPT[:50]}...")
 
-        # Always create a new conversation for general knowledge
-        # This ensures we don't reuse a conversation that used the social media prompt
-        old_conversation_id = request.conversation_id
-
-        # Create a new conversation
-        new_conversation_id = await create_conversation(
-            db=db,
-            user_id=current_user["uid"],
-            model=request.model or DEFAULT_GROK_MODEL,
-            title="General Knowledge: " +
-            (request.message[:30] + "..." if len(request.message)
-             > 30 else request.message),
-            content_id=request.content_id
-        )
-
-        logger.info(
-            f"Created new conversation {new_conversation_id} instead of using {old_conversation_id}")
-        request.conversation_id = new_conversation_id
+        # Ensure we have a valid conversation ID
+        conversation_id = None
+        
+        # Use the existing conversation if provided, otherwise create a new one
+        if request.conversation_id:
+            # Verify the conversation exists and belongs to the user
+            try:
+                await get_conversation(db, request.conversation_id, current_user["uid"])
+                logger.info(f"Using existing conversation {request.conversation_id}")
+                conversation_id = request.conversation_id
+            except HTTPException as e:
+                logger.warning(f"Conversation not found or unauthorized: {str(e)}")
+                # Create a new conversation if the provided one is invalid
+                conversation_id = await create_conversation(
+                    db=db,
+                    user_id=current_user["uid"],
+                    model=request.model or DEFAULT_GROK_MODEL,
+                    title="General Knowledge: " +
+                    (request.message[:30] + "..." if len(request.message)
+                     > 30 else request.message),
+                    content_id=request.content_id
+                )
+                logger.info(f"Created new conversation {conversation_id} instead of {request.conversation_id}")
+        else:
+            # Create a new conversation if none was provided
+            conversation_id = await create_conversation(
+                db=db,
+                user_id=current_user["uid"],
+                model=request.model or DEFAULT_GROK_MODEL,
+                title="General Knowledge: " +
+                (request.message[:30] + "..." if len(request.message)
+                 > 30 else request.message),
+                content_id=request.content_id
+            )
+            logger.info(f"Created new conversation {conversation_id}")
+        
+        # Update the request with the final conversation ID
+        request.conversation_id = conversation_id
 
         # Sanitize the message
         original_message = request.message
@@ -1160,10 +1180,10 @@ async def stream_chat_api(
                 content={"error": "Grok API key not configured"}
             )
 
-        # Add user message to the new conversation
+        # Add user message to the conversation
         await add_message(
             db=db,
-            conversation_id=new_conversation_id,
+            conversation_id=conversation_id,
             role="user",
             content=original_message
         )
@@ -1174,14 +1194,14 @@ async def stream_chat_api(
 
         await db.execute(
             "UPDATE mo_llm_conversations SET title = :title WHERE id = :id",
-            {"id": new_conversation_id, "title": title}
+            {"id": conversation_id, "title": title}
         )
 
         # Return streaming response with the new conversation
         return StreamingResponse(
             stream_chat_response(
                 db=db,
-                conversation_id=new_conversation_id,
+                conversation_id=conversation_id,
                 user_id=current_user["uid"],
                 request=request
             ),

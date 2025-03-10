@@ -15,6 +15,13 @@ from datetime import datetime, timezone
 import uuid
 import asyncio
 
+# IMPORTANT NOTE ABOUT CONVERSATION CONTEXT:
+# When routing requests between different handlers (grok_router, general_router, etc.),
+# always preserve the conversation_id to maintain context. Each handler should respect
+# the provided conversation_id rather than creating a new one if one is supplied.
+# This prevents issues with image generation and other asynchronous tasks trying to
+# update messages in the wrong conversation.
+
 # Import the functionality from grok, together, and general routers
 # Import the functionality from grok, together, and general routers with explicit naming
 from app.routers.multivio.grok_router import router as grok_router, stream_chat_api as grok_stream_chat
@@ -327,6 +334,7 @@ async def stream_chat(
             for msg in reversed(request.messages):
                 if msg.role.lower() == "user":
                     # Create a new ChatRequest with all required fields
+                    # IMPORTANT: Always pass the conversation_id to maintain context
                     request_with_message = ChatRequest(
                         messages=request.messages,
                         message=msg.content,
@@ -339,7 +347,8 @@ async def stream_chat(
                         stream=True,
                         conversation_id=getattr(
                             request, 'conversation_id', None),
-                        content_id=getattr(request, 'content_id', None)
+                        content_id=getattr(request, 'content_id', None),
+                        system_prompt=getattr(request, 'system_prompt', None)
                     )
                     return await grok_stream_chat(request_with_message, current_user, db)
 
@@ -353,6 +362,7 @@ async def stream_chat(
             for msg in reversed(request.messages):
                 if msg.role.lower() == "user":
                     # Create a new ChatRequest with all required fields
+                    # IMPORTANT: Always pass the conversation_id to maintain context
                     request_with_message = ChatRequest(
                         messages=request.messages,
                         message=msg.content,
@@ -365,7 +375,8 @@ async def stream_chat(
                         stream=True,
                         conversation_id=getattr(
                             request, 'conversation_id', None),
-                        content_id=getattr(request, 'content_id', None)
+                        content_id=getattr(request, 'content_id', None),
+                        system_prompt=getattr(request, 'system_prompt', None)
                     )
                     return await general_stream_chat(request_with_message, current_user, db)
 

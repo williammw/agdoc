@@ -382,6 +382,9 @@ async def generate_image_task(
                         "conversation_id": conversation_id
                     }
                     
+                    # Log the update operation to help debug any issues
+                    logger.info(f"Updating message {message_id} in conversation {conversation_id} with image content")
+                    
                     # Add metadata if the column exists
                     if has_metadata:
                         update_fields.append("metadata")
