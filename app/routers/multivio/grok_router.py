@@ -1013,8 +1013,8 @@ async def stream_chat_response(db: Database, conversation_id: str, user_id: str,
                     system_prompt=request.system_prompt
                 )
 
-                # Add explicit instruction to generate content
-                content_request = f"Create content for the selected platforms: {', '.join(platforms)}."
+                # Add explicit instruction to generate content with clear instruction to not use function calls
+                content_request = f"Create content for the selected platforms: {', '.join(platforms)}. Generate only the content without suggesting any additional function calls or platform selections. Just provide the actual post content for these platforms."
                 updated_messages.append({
                     "role": "user",
                     "content": content_request
@@ -1024,11 +1024,14 @@ async def stream_chat_response(db: Database, conversation_id: str, user_id: str,
                     f"Requesting content generation with message: {content_request}")
 
                 # Generate content response (non-streaming for simplicity)
+                # Pass empty tools array and set tool_choice to 'none' to prevent another function call
                 content_response = await grok_client.async_client.chat.completions.create(
                     model=grok_client.validate_model(request.model),
                     messages=updated_messages,
                     temperature=request.temperature,
-                    max_tokens=request.max_tokens
+                    max_tokens=request.max_tokens,
+                    tools=[],
+                    tool_choice=None
                 )
 
                 content_text = content_response.choices[0].message.content
