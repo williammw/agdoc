@@ -383,12 +383,23 @@ async def prepare_conversation_messages(db: Database, conversation_id: str, syst
             "content": system_prompt
         })
     else:
-        logger.info(
-            f"Using DEFAULT_SYSTEM_PROMPT: '{DEFAULT_SYSTEM_PROMPT[:50]}...'")
-        formatted_messages.append({
-            "role": "system",
-            "content": DEFAULT_SYSTEM_PROMPT
-        })
+        # Before adding the default system prompt, check if there's already a system message with search results
+        has_search_results = False
+        for msg in messages:
+            msg_dict = dict(msg)
+            if msg_dict["role"] == "system" and msg_dict["content"] and "I've performed a web search" in msg_dict["content"]:
+                has_search_results = True
+                logger.info(
+                    "Found existing search results system message - keeping it")
+                break
+
+        if not has_search_results:
+            logger.info(
+                f"Using DEFAULT_SYSTEM_PROMPT: '{DEFAULT_SYSTEM_PROMPT[:50]}...'")
+            formatted_messages.append({
+                "role": "system",
+                "content": DEFAULT_SYSTEM_PROMPT
+            })
 
     # Process each message
     for i, msg in enumerate(messages):
@@ -1116,23 +1127,43 @@ async def stream_chat_api(
                 content={"error": "Message cannot be empty"}
             )
 
-        # IMPORTANT: Force the system prompt to always be the general knowledge one
-        request.system_prompt = DEFAULT_SYSTEM_PROMPT
-        logger.info(
-            f"Using general knowledge system prompt: {DEFAULT_SYSTEM_PROMPT[:50]}...")
+        # Check for search results in the messages - if present, keep them
+        has_search_results = False
+        search_system_message = None  # NEW: Variable to store search results content
+        if hasattr(request, 'messages') and request.messages:
+            for msg in request.messages:
+                if msg.role == "system" and "I've performed a web search" in msg.content:
+                    has_search_results = True
+                    search_system_message = msg.content  # NEW: Save the search results
+                    logger.info(
+                        "Found search results in system message - preserving them")
+                    break
+
+        # Only force the system prompt if there are no search results
+        if not has_search_results:
+            request.system_prompt = DEFAULT_SYSTEM_PROMPT
+            logger.info(
+                f"Using general knowledge system prompt: {DEFAULT_SYSTEM_PROMPT[:50]}...")
+        else:
+            # Ensure we don't override the search results
+            request.system_prompt = None
+            logger.info(
+                "Using search results from smart_router instead of default system prompt")
 
         # Ensure we have a valid conversation ID
         conversation_id = None
-        
+
         # Use the existing conversation if provided, otherwise create a new one
         if request.conversation_id:
             # Verify the conversation exists and belongs to the user
             try:
                 await get_conversation(db, request.conversation_id, current_user["uid"])
-                logger.info(f"Using existing conversation {request.conversation_id}")
+                logger.info(
+                    f"Using existing conversation {request.conversation_id}")
                 conversation_id = request.conversation_id
             except HTTPException as e:
-                logger.warning(f"Conversation not found or unauthorized: {str(e)}")
+                logger.warning(
+                    f"Conversation not found or unauthorized: {str(e)}")
                 # Create a new conversation if the provided one is invalid
                 conversation_id = await create_conversation(
                     db=db,
@@ -1143,7 +1174,8 @@ async def stream_chat_api(
                      > 30 else request.message),
                     content_id=request.content_id
                 )
-                logger.info(f"Created new conversation {conversation_id} instead of {request.conversation_id}")
+                logger.info(
+                    f"Created new conversation {conversation_id} instead of {request.conversation_id}")
         else:
             # Create a new conversation if none was provided
             conversation_id = await create_conversation(
@@ -1156,7 +1188,7 @@ async def stream_chat_api(
                 content_id=request.content_id
             )
             logger.info(f"Created new conversation {conversation_id}")
-        
+
         # Update the request with the final conversation ID
         request.conversation_id = conversation_id
 
@@ -1179,6 +1211,16 @@ async def stream_chat_api(
                 status_code=500,
                 content={"error": "Grok API key not configured"}
             )
+
+        # NEW: Store the search results system message in the database if present
+        if has_search_results and search_system_message:
+            await add_message(
+                db=db,
+                conversation_id=conversation_id,
+                role="system",
+                content=search_system_message
+            )
+            logger.info("Stored search results system message in the database")
 
         # Add user message to the conversation
         await add_message(
@@ -1213,7 +1255,6 @@ async def stream_chat_api(
             status_code=500,
             content={"error": f"Internal server error: {str(e)}"}
         )
-
 
 @router.post("/chat/vision")
 async def vision_chat(

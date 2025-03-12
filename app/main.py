@@ -1,10 +1,11 @@
 from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router
 # Add this import
-from app.routers.multivio import grok_router, linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router, together_router, smart_router, general_router
+from app.routers.multivio import grok_router, linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router, together_router, smart_router, general_router, brave_search_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
+import sys
 from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,24 @@ import logging
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Check for required API keys
+required_keys = {
+    "BRAVE_API_KEY": "Brave Web Search - required for web search functionality",
+    # Add other required keys here as needed
+}
+
+missing_keys = []
+for key, description in required_keys.items():
+    if not os.getenv(key):
+        missing_keys.append(f"{key}: {description}")
+        
+if missing_keys:
+    print("\n⚠️  WARNING: Missing required API keys ⚠️")
+    print("The following environment variables are missing:")
+    for key in missing_keys:
+        print(f"  - {key}")
+    print("Some functionality may be limited.\n")
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=app_lifespan, debug=True)
@@ -93,6 +112,8 @@ router_list = [
     (together_router.router, "/api/v1/together", ["together"]),
     (smart_router.router, "/api/v1/smart", ["smart"]),
     (general_router.router, "/api/v1/general", ["general"]),
+    (brave_search_router.router, "/api/v1/brave-search", ["brave_search"]),
+
     
 ]
 for router, prefix, tags in router_list:
