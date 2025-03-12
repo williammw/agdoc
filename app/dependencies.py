@@ -28,8 +28,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
 logger = logging.getLogger(__name__)
 
 
-
-
 class TokenData(BaseModel):
     username: Optional[str] = None
 
@@ -65,7 +63,7 @@ async def get_database():
 #             headers={"WWW-Authenticate": "Bearer"},
 #         )
 
-#v2
+# v2
 
 
 async def get_current_user(authorization: str = Header(...), db: Database = Depends(get_database)):
@@ -79,7 +77,7 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
         firebase_user = firebase_auth.get_user(uid)
         if firebase_user.disabled:
             raise HTTPException(
-                status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
+                status_code=403, detail="User account is disabled.")
 
         # First try mo_user_info table
         query = """
@@ -101,24 +99,54 @@ async def get_current_user(authorization: str = Header(...), db: Database = Depe
             """
             user = await db.fetch_one(query=query, values={"uid": uid})
 
-            # If still not found, return just the Firebase user info
+            # If still not found, CREATE a new user record
             if not user:
-                return {
-                    "uid": uid,
-                    "email": firebase_user.email,
-                    "username": firebase_user.display_name or firebase_user.email.split('@')[0] if firebase_user.email else None
-                }
+                # Create username from email or display name
+                username = firebase_user.display_name or firebase_user.email.split(
+                    '@')[0] if firebase_user.email else f"user_{uid[:8]}"
+
+                # Insert into mo_user_info
+                insert_query = """
+                INSERT INTO mo_user_info (
+                    id, email, username, full_name, plan_type, 
+                    monthly_post_quota, remaining_posts,
+                    is_active, is_verified, created_at, updated_at, last_login_at
+                ) VALUES (
+                    :uid, :email, :username, :username, 'free',
+                    10, 10, true, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                ) RETURNING id, email, username, full_name, plan_type
+                """
+                try:
+                    user = await db.fetch_one(
+                        query=insert_query,
+                        values={
+                            "uid": uid,
+                            "email": firebase_user.email or "",
+                            "username": username
+                        }
+                    )
+                    logger.info(f"Created new user record for {uid}")
+                except Exception as e:
+                    logger.error(f"Failed to create user record: {str(e)}")
+                    # Return basic info even if DB insert fails
+                    return {
+                        "uid": uid,
+                        "email": firebase_user.email,
+                        "username": username
+                    }
 
         user_dict = dict(user)
         user_dict['uid'] = uid
         return user_dict
+
     except firebase_auth.UserDisabledError:
         raise HTTPException(
-            status_code=403, detail="User account is disabled. Please check your email for verification instructions.")
+            status_code=403, detail="User account is disabled.")
     except Exception as e:
         logger.error(f"Error in get_current_user: {str(e)}")
         raise HTTPException(
             status_code=401, detail="Invalid authentication credentials")
+
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
