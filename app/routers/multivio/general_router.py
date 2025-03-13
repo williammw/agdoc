@@ -69,6 +69,15 @@ class Message(BaseModel):
     function_call: Optional[Dict[str, Any]] = None
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+    name: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = None
+    timestamp: Optional[datetime] = None
+    id: Optional[str] = None
+
+
 class ImageContent(BaseModel):
     type: Literal["image_url", "text"]
     text: Optional[str] = None
@@ -387,7 +396,7 @@ async def prepare_conversation_messages(db: Database, conversation_id: str, syst
         has_search_results = False
         for msg in messages:
             msg_dict = dict(msg)
-            if msg_dict["role"] == "system" and msg_dict["content"] and "I've performed a web search" in msg_dict["content"]:
+            if msg_dict["role"] == "system" and msg_dict["content"] and ("I've performed a web search" in msg_dict["content"] or "WEB SEARCH RESULTS" in msg_dict["content"]):
                 has_search_results = True
                 logger.info(
                     "Found existing search results system message - keeping it")
@@ -400,6 +409,10 @@ async def prepare_conversation_messages(db: Database, conversation_id: str, syst
                 "role": "system",
                 "content": DEFAULT_SYSTEM_PROMPT
             })
+        else:
+            # If we have search results, they're already in the message list
+            logger.info(
+                "Found existing search results system message - keeping it")
 
     # Process each message
     for i, msg in enumerate(messages):

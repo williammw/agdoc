@@ -15,6 +15,16 @@ BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1"
 async def perform_web_search(query: str, count: int = 10, offset: int = 0) -> Dict[str, Any]:
     """Perform a Brave web search and return results"""
     try:
+        logger.info("================== BRAVE SEARCH API CALLED ==================")
+        logger.info(f"Query: '{query}'")
+        logger.info(f"Count: {count}, Offset: {offset}")
+        logger.info(f"================== STARTING WEB SEARCH FOR: '{query}' ==================")
+        # Check if API key is configured
+        logger.info(f"Brave API key configured: {bool(BRAVE_API_KEY)}")
+        logger.info(f"Brave API key: {BRAVE_API_KEY[:4]}...{BRAVE_API_KEY[-4:] if BRAVE_API_KEY else ''}")
+        if not BRAVE_API_KEY:
+            logger.error("CRITICAL: Brave Search API key not set in environment variables")
+        
         if not BRAVE_API_KEY:
             raise ValueError("Brave Search API key not configured")
             
@@ -33,12 +43,22 @@ async def perform_web_search(query: str, count: int = 10, offset: int = 0) -> Di
         
         logger.info(f"Performing web search for query: '{query}'")
         
+        logger.info(f"Calling Brave Search API with params: {params}")
+        logger.info(f"API URL: {BRAVE_SEARCH_URL}/web/search")
+        
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BRAVE_SEARCH_URL}/web/search",
-                headers=headers,
-                params=params
-            )
+            try:
+                response = await client.get(
+                    f"{BRAVE_SEARCH_URL}/web/search",
+                    headers=headers,
+                    params=params,
+                    timeout=30.0  # Add explicit timeout
+                )
+                
+                logger.info(f"Brave Search API response status: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Exception during Brave API call: {str(e)}")
+                raise
             
             if response.status_code != 200:
                 logger.error(f"Brave Search API error: {response.text}")
