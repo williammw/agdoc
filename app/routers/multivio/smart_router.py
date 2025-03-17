@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import uuid
 import asyncio
 import traceback
+import copy
 
 # Special override to force web search for all requests
 FORCE_WEB_SEARCH = True
@@ -33,6 +34,576 @@ from app.routers.multivio.together_router import call_together_api, generate_ima
 # the provided conversation_id rather than creating a new one if one is supplied.
 # This prevents issues with image generation and other asynchronous tasks trying to
 # update messages in the wrong conversation.
+
+# Intent Handler Base Class
+class IntentHandler:
+    """Base class for intent handlers using strategy pattern"""
+    async def can_handle(self, request, message) -> bool:
+        """Determine if this handler can process the request"""
+        raise NotImplementedError()
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        """Process the request"""
+        raise NotImplementedError()
+        
+    async def log_message(self, user_message, conversation_id, db, role="user"):
+        """Log a message to the conversation history"""
+        if not conversation_id:
+            return None
+            
+        message_id = str(uuid.uuid4())
+        try:
+            await db.execute(
+                """
+                INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at)
+                VALUES (:id, :conversation_id, :role, :content, :created_at)
+                """,
+                {
+                    "id": message_id,
+                    "conversation_id": conversation_id,
+                    "role": role,
+                    "content": user_message,
+                    "created_at": datetime.now(timezone.utc)
+                }
+            )
+            return message_id
+        except Exception as e:
+            logger.error(f"Error logging message: {str(e)}")
+            return None
+
+# Web Search Handler
+class WebSearchHandler(IntentHandler):
+    """Handler for web search requests"""
+    async def can_handle(self, request, message):
+        # Check for explicit web search flag from the frontend
+        perform_web_search = False
+        try:
+            if hasattr(request, '__dict__') and 'perform_web_search' in request.__dict__:
+                perform_web_search = request.__dict__['perform_web_search']
+            elif hasattr(request, 'perform_web_search'):
+                perform_web_search = request.perform_web_search
+            else:
+                req_dict = request.dict() if hasattr(request, 'dict') else {}
+                perform_web_search = req_dict.get('perform_web_search', False)
+        except Exception as e:
+            logger.error(f"Error getting web search flag: {str(e)}")
+            perform_web_search = False
+            
+        # Force enable search if keywords are in message
+        keywords_present = 'search' in message.lower() or 'find' in message.lower()
+        
+        # Return true if any condition is met
+        return FORCE_WEB_SEARCH or perform_web_search or keywords_present
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        logger.info(f"Web search handler processing: '{request.message}'")
+        
+        user_message = ""
+        if hasattr(request, 'message') and request.message:
+            user_message = request.message
+        else:
+            user_message = next((msg.content for msg in reversed(request.messages)
+                               if msg.role.lower() == "user"), "")
+                               
+        # Get conversation ID
+        conversation_id = getattr(request, 'conversation_id', None)
+        
+        # Log user message
+        user_message_id = await self.log_message(user_message, conversation_id, db)
+        
+        # Perform web search
+        from app.routers.multivio.brave_search_router import perform_web_search as search_function
+        search_results = await search_function(user_message)
+        formatted_results = format_web_results_for_llm(search_results)
+        
+        if not formatted_results:
+            logger.error("Web search returned no results, falling back to general knowledge")
+            return await general_stream_chat(request, current_user, db)
+            
+        logger.info(f"Successfully got {len(formatted_results)} chars of search results")
+        
+        # Build system prompt with search results
+        search_instruction = f"""
+            # WEB SEARCH RESULTS
+
+            I've performed a web search for "{user_message}" and found the following results:
+
+            {formatted_results}
+
+            When answering the user's question:
+            1. Use these search results to provide up-to-date information
+            2. Cite specific sources from the results when appropriate
+            3. If the search results don't provide enough information, clearly state this and use your general knowledge
+            4. Synthesize information from multiple sources if relevant
+        """
+        
+        # Record the search system prompt
+        if conversation_id:
+            try:
+                search_msg_id = str(uuid.uuid4())
+                await db.execute(
+                    """
+                    INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at, metadata)
+                    VALUES (:id, :conversation_id, :role, :content, :created_at, :metadata)
+                    """,
+                    {
+                        "id": search_msg_id,
+                        "conversation_id": conversation_id,
+                        "role": "system",
+                        "content": search_instruction,
+                        "created_at": datetime.now(timezone.utc),
+                        "metadata": json.dumps({"web_search": True, "query": user_message})
+                    }
+                )
+            except Exception as db_error:
+                logger.error(f"Error recording search message: {str(db_error)}")
+                
+        # Build a modified request for general_stream_chat
+        from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
+        modified_request = GeneralChatRequest(
+            conversation_id=conversation_id,
+            content_id=getattr(request, 'content_id', None),
+            message=user_message,
+            stream=True,
+            system_prompt=search_instruction
+        )
+        
+        # Use general_stream_chat with the enhanced request
+        return await general_stream_chat(modified_request, current_user, db)
+
+# Puppeteer Handler
+class PuppeteerHandler(IntentHandler):
+    """Handler for browser automation with puppeteer"""
+    async def can_handle(self, request, message):
+        # Check for explicit browser navigation flag
+        perform_browser_navigation = False
+        try:
+            if hasattr(request, '__dict__') and 'perform_browser_navigation' in request.__dict__:
+                perform_browser_navigation = request.__dict__['perform_browser_navigation']
+            elif hasattr(request, 'perform_browser_navigation'):
+                perform_browser_navigation = request.perform_browser_navigation
+            else:
+                req_dict = request.dict() if hasattr(request, 'dict') else {}
+                perform_browser_navigation = req_dict.get('perform_browser_navigation', False)
+        except Exception as e:
+            logger.error(f"Error getting browser navigation flag: {str(e)}")
+            perform_browser_navigation = False
+            
+        # Check for puppeteer intent based on keywords
+        puppeteer_keywords = ['browse to', 'navigate to', 'go to',
+                              'visit', 'open website', 'take a screenshot', 'capture screen']
+        detected_puppeteer = any(keyword in message.lower() for keyword in puppeteer_keywords)
+        
+        return perform_browser_navigation or detected_puppeteer
+    
+    def extract_url(self, message):
+        """Extract URL from user message"""
+        # Try to extract URL from message
+        url_pattern = r'https?://[^\s>)"]+|www\.[^\s>)"]+\.[^\s>)"]+|[a-zA-Z0-9][-a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})+\.[a-zA-Z0-9]{2,6}(/\S*)?'
+        url_match = re.search(url_pattern, message)
+        if url_match:
+            target_url = url_match.group(0)
+            # Add protocol if needed
+            if target_url.startswith('www.'):
+                target_url = 'https://' + target_url
+            elif not target_url.startswith(('http://', 'https://')):
+                target_url = 'https://' + target_url
+            return target_url
+            
+        # Try to extract domain/website name
+        domain_pattern = r'\b(?:browse to|navigate to|go to|visit|open)\s+(?:the\s+)?(?:website\s+)?([a-zA-Z0-9][-a-zA-Z0-9]{0,62}(?:\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})*(?:\.[a-zA-Z]{2,})+)'
+        domain_match = re.search(domain_pattern, message, re.IGNORECASE)
+        if domain_match:
+            return "https://" + domain_match.group(1)
+            
+        # Try to find any word that looks like a domain
+        domain_words_pattern = r'\b([a-zA-Z0-9][-a-zA-Z0-9]{0,62}\.(?:com|org|net|edu|gov|io|app|ai|co|me|info|biz))\b'
+        domain_words_match = re.search(domain_words_pattern, message)
+        if domain_words_match:
+            return "https://" + domain_words_match.group(1)
+            
+        return None
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        user_message = ""
+        if hasattr(request, 'message') and request.message:
+            user_message = request.message
+        else:
+            user_message = next((msg.content for msg in reversed(request.messages)
+                               if msg.role.lower() == "user"), "")
+        
+        # Extract URL from message
+        target_url = self.extract_url(user_message)
+        if not target_url:
+            # If no URL found, try domain extraction from context
+            domain_pattern = r'(?:about|for|of|from)\s+([a-zA-Z0-9][-a-zA-Z0-9]{0,62}(?:\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})*(?:\.[a-zA-Z]{2,})+)'
+            domain_match = re.search(domain_pattern, user_message, re.IGNORECASE)
+            if domain_match:
+                target_url = "https://" + domain_match.group(1)
+            else:
+                # Fall back to web search if no URL found
+                logger.info("No URL found for puppeteer intent, falling back to web search")
+                web_handler = WebSearchHandler()
+                return await web_handler.handle(request, background_tasks, current_user, db)
+        
+        logger.info(f"Performing browser navigation to: {target_url}")
+        
+        # Get conversation ID
+        conversation_id = getattr(request, 'conversation_id', None)
+        
+        # Log user message
+        await self.log_message(user_message, conversation_id, db)
+        
+        try:
+            # Navigate to the URL
+            logger.info(f"Navigating to URL: {target_url}")
+            navigation_result = execute_puppeteer_function("puppeteer_navigate", url=target_url)
+            
+            # Take a screenshot
+            screenshot_name = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            screenshot_result = execute_puppeteer_function("puppeteer_screenshot", name=screenshot_name)
+            
+            # Extract page content using JavaScript
+            content_script = """
+                function getMainContent() {
+                    // Try to find main content
+                    const selectors = ['main', 'article', '#content', '.content', '.main-content'];
+                    for (const selector of selectors) {
+                        const element = document.querySelector(selector);
+                        if (element) return element.innerText;
+                    }
+                    // Fall back to body text
+                    return document.body.innerText;
+                }
+                return getMainContent();
+            """
+            page_content = execute_puppeteer_function("puppeteer_evaluate", script=content_script)
+            
+            # Try to get the page title
+            title_script = "document.title"
+            page_title = execute_puppeteer_function("puppeteer_evaluate", script=title_script)
+            
+            # Trim content if it's too large
+            if page_content and len(page_content) > 8000:
+                page_content = page_content[:8000] + "... [content truncated]"
+                
+            # Create an enhanced prompt with the extracted content
+            puppeteer_context = f"""
+                # WEB PAGE CONTENT
+
+                I've navigated to {target_url} and found the following:
+
+                Title: {page_title or 'Unknown Title'}
+
+                Content:
+                {page_content or "No content could be extracted from this page."}
+
+                I've also taken a screenshot named '{screenshot_name}'.
+
+                When answering the user's question:
+                1. Use the content from this page to provide information
+                2. Describe what I found on the page
+                3. If the content doesn't address their question completely, clearly state this
+            """
+            
+            # Record the puppeteer system message
+            if conversation_id:
+                try:
+                    puppeteer_msg_id = str(uuid.uuid4())
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at, metadata)
+                        VALUES (:id, :conversation_id, :role, :content, :created_at, :metadata)
+                        """,
+                        {
+                            "id": puppeteer_msg_id,
+                            "conversation_id": conversation_id,
+                            "role": "system",
+                            "content": puppeteer_context,
+                            "created_at": datetime.now(timezone.utc),
+                            "metadata": json.dumps({
+                                "puppeteer_navigation": True,
+                                "url": target_url,
+                                "screenshot": screenshot_name
+                            })
+                        }
+                    )
+                except Exception as db_error:
+                    logger.error(f"Error recording puppeteer message: {str(db_error)}")
+                    
+            # Build a modified request for general_stream_chat
+            from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
+            modified_request = GeneralChatRequest(
+                conversation_id=conversation_id,
+                content_id=getattr(request, 'content_id', None),
+                message=user_message,
+                stream=True,
+                system_prompt=puppeteer_context  # Pass the puppeteer context as system prompt
+            )
+            
+            # Use general_stream_chat with the enhanced request
+            return await general_stream_chat(modified_request, current_user, db)
+        
+        except Exception as puppeteer_error:
+            logger.error(f"Error during browser navigation: {str(puppeteer_error)}")
+            logger.error(traceback.format_exc())
+            # Fall back to web search if navigation fails
+            logger.info("Falling back to web search after puppeteer failure")
+            web_handler = WebSearchHandler()
+            return await web_handler.handle(request, background_tasks, current_user, db)
+
+# Image Generation Handler
+class ImageGenerationHandler(IntentHandler):
+    """Handler for image generation requests"""
+    async def can_handle(self, request, message):
+        # Check for image generation keywords
+        for pattern in IMAGE_PATTERNS:
+            if re.search(pattern, message):
+                return True
+        return False
+    
+    def extract_image_prompt(self, message):
+        """Extract the actual image prompt from the user message"""
+        for pattern in IMAGE_PATTERNS:
+            match = re.search(pattern, message)
+            if match:
+                # Extract everything after the pattern
+                prompt_start = match.end()
+                return message[prompt_start:].strip()
+                
+        # If no pattern matches, return the original message
+        return message
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        user_message = ""
+        if hasattr(request, 'message') and request.message:
+            user_message = request.message
+        else:
+            user_message = next((msg.content for msg in reversed(request.messages)
+                               if msg.role.lower() == "user"), "")
+                               
+        # Extract image prompt
+        prompt = self.extract_image_prompt(user_message)
+        
+        # Create a task ID
+        task_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        
+        # Prepare request data for together.ai
+        api_data = {
+            "prompt": prompt,
+            "model": "flux",
+            "n": 1,  # Generate one image for chat
+            "disable_safety_checker": True
+        }
+        
+        # Store the task in the database
+        query = """
+        INSERT INTO mo_ai_tasks (
+            id, type, parameters, status, created_by, created_at, updated_at
+        ) VALUES (
+            :id, :type, :parameters, :status, :created_by, :created_at, :updated_at
+        )
+        """
+        
+        values = {
+            "id": task_id,
+            "type": "image_generation",
+            "parameters": json.dumps({
+                "prompt": prompt,
+                "model": "flux",
+                "num_images": 1,
+                "disable_safety_checker": True
+            }),
+            "status": "processing",
+            "created_by": current_user["uid"],
+            "created_at": now,
+            "updated_at": now
+        }
+        
+        await db.execute(query=query, values=values)
+        
+        # Store message ID for later reference
+        message_id = None
+        
+        # Record the message in conversation if conversation_id is provided
+        conversation_id = getattr(request, 'conversation_id', None)
+        if conversation_id:
+            try:
+                # Add user message
+                await self.log_message(user_message, conversation_id, db)
+                
+                # Check if the table has an image_url column
+                check_image_url_query = """
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                """
+                has_image_url = await db.fetch_one(check_image_url_query)
+                
+                # Add assistant message (placeholder)
+                message_id = str(uuid.uuid4())
+                
+                # Determine columns and values based on schema
+                insert_fields = [
+                    "id", "conversation_id", "role", "content", "created_at", "metadata"
+                ]
+                
+                insert_values = {
+                    "id": message_id,
+                    "conversation_id": conversation_id,
+                    "role": "assistant",
+                    "content": f"Generating image of {prompt}...",
+                    "created_at": now,
+                    "metadata": json.dumps({
+                        "is_image": True,
+                        "image_task_id": task_id,
+                        "prompt": prompt,
+                        "status": "generating"
+                    })
+                }
+                
+                # Add image_url placeholder if the column exists
+                if has_image_url:
+                    insert_fields.append("image_url")
+                    # Will be updated when image is ready
+                    insert_values["image_url"] = "pending" 
+                    
+                # Build dynamic query
+                fields_str = ", ".join(insert_fields)
+                placeholders_str = ", ".join([f":{field}" for field in insert_fields])
+                
+                insert_query = f"""
+                INSERT INTO mo_llm_messages (
+                    {fields_str}
+                ) VALUES (
+                    {placeholders_str}
+                )
+                """
+                
+                await db.execute(query=insert_query, values=insert_values)
+            except Exception as e:
+                logger.error(f"Error recording messages in stream chat: {str(e)}")
+                # Continue even if message recording fails
+                
+        # Start background task
+        background_tasks.add_task(
+            generate_image_task,
+            task_id,
+            api_data,
+            current_user["uid"],
+            None,  # No folder_id for chat-based images
+            db,
+            conversation_id,
+            message_id
+        )
+        
+        # Return a special message that can be interpreted by the frontend
+        response_data = {
+            "is_image_request": True,
+            "task_id": task_id,
+            "message": "Generating image of " + prompt
+        }
+        
+        return StreamingResponse(
+            content=iter([json.dumps(response_data)]),
+            media_type="application/json"
+        )
+
+# Social Media Handler
+class SocialMediaHandler(IntentHandler):
+    """Handler for social media content generation"""
+    async def can_handle(self, request, message):
+        # Check for social media keywords
+        logger.info(f"SocialMediaHandler checking message: '{message}'")
+        
+        # First try the explicit social media intent check
+        if check_social_media_intent(message):
+            return True
+            
+        # Then try the pattern-based checks
+        for pattern in SOCIAL_MEDIA_PATTERNS:
+            if re.search(pattern, message):
+                match = re.search(pattern, message)
+                logger.info(f"Social media intent detected with pattern: {pattern}")
+                logger.info(f"Matched text: '{match.group(0)}'")
+                return True
+                
+        logger.info("No social media patterns matched")
+        return False
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        # Social media requests are handled by grok_stream_chat
+        logger.info("Routing to social media handler (grok_router)")
+        return await grok_stream_chat(request, current_user, db)
+
+# General Knowledge Handler (fallback)
+class GeneralKnowledgeHandler(IntentHandler):
+    """Handler for general knowledge queries"""
+    async def can_handle(self, request, message):
+        # This is the fallback handler - always returns true
+        return True
+        
+    async def handle(self, request, background_tasks, current_user, db):
+        logger.info("Routing to general knowledge handler (general_router)")
+        return await general_stream_chat(request, current_user, db)
+
+# Intent Router class to organize handlers
+class IntentRouter:
+    """Router class that manages handlers and routes requests"""
+    def __init__(self):
+        self.handlers = []
+        
+    def register_handler(self, handler):
+        """Add a handler to the chain"""
+        self.handlers.append(handler)
+        
+    async def route(self, request, background_tasks, current_user, db):
+        """Route the request to the appropriate handler"""
+        user_message = self._extract_user_message(request)
+        logger.info(f"IntentRouter processing message: '{user_message}'")
+        
+        # Log if there are any explicit flags
+        if hasattr(request, 'perform_web_search'):
+            logger.info(f"perform_web_search flag: {request.perform_web_search}")
+        
+        # Try each handler in sequence
+        for handler in self.handlers:
+            handler_name = handler.__class__.__name__
+            logger.info(f"Checking handler: {handler_name}")
+            
+            if await handler.can_handle(request, user_message):
+                logger.info(f"✅ Using handler: {handler_name}")
+                return await handler.handle(request, background_tasks, current_user, db)
+            else:
+                logger.info(f"❌ Handler {handler_name} cannot handle this request")
+                
+        # This should never happen since GeneralKnowledgeHandler is a catch-all
+        logger.error("No handler found, using general knowledge (fallback)")
+        return await general_stream_chat(request, current_user, db)
+        
+    def _extract_user_message(self, request):
+        """Extract the user message from the request"""
+        if hasattr(request, 'message') and request.message:
+            return request.message
+        else:
+            return next((msg.content for msg in reversed(request.messages)
+                        if msg.role.lower() == "user"), "")
+
+# Helper function to set up the router with all handlers
+def setup_intent_router():
+    """Create and configure the intent router with all handlers"""
+    router = IntentRouter()
+    
+    # Add handlers in order of precedence
+    # The order matters - handlers are checked in sequence
+    # Social media handler should be high priority
+    router.register_handler(SocialMediaHandler())
+    router.register_handler(PuppeteerHandler())
+    router.register_handler(ImageGenerationHandler())
+    router.register_handler(WebSearchHandler())
+    router.register_handler(GeneralKnowledgeHandler())  # Fallback handler
+    
+    return router
 
 router = APIRouter(tags=["smart"])
 logger = logging.getLogger(__name__)
@@ -129,15 +700,18 @@ IMAGE_PATTERNS = [
 
 # Social media content patterns
 SOCIAL_MEDIA_PATTERNS = [
-    # Platform references
-    r"(?i)\b(facebook|instagram|twitter|x\.com|threads|linkedin|tiktok|youtube)\b",
+    # Platform references - add IG as Instagram abbreviation
+    r"(?i)\b(facebook|fb|instagram|ig|twitter|x\.com|threads|linkedin|tiktok|youtube)\b",
 
     # Content types
     r"(?i)\b(post|tweet|reel|story|caption|video)\b",
 
-    # Actions
-    r"(?i)(create|write|draft|schedule)\s+(a|an|my)?\s+(post|tweet|content)",
+    # Actions - make more flexible for various phrasings
+    r"(?i)(create|write|draft|schedule|make)\s+(a|an|my|some)?\s*(post|tweet|content|update)",
     r"(?i)social\s+media\s+(content|strategy|post|campaign)",
+    
+    # Platform-specific content
+    r"(?i)(instagram|ig|facebook|fb|twitter)\s*(post|story|reel|tweet)",
 
     # Engagement/metrics references
     r"(?i)(engagement|followers|likes|shares|comments)",
@@ -326,628 +900,14 @@ async def stream_chat(
     db: Database = Depends(get_database)
 ):
     """Streaming chat endpoint that routes requests based on detected intent or explicit web search flag."""
-    # CRITICAL TEST - If you see this, the code is being executed
-    logger.warning(
-        "!!!!!!!!!!!!!!! SMART ROUTER STREAM CHAT FUNCTION RUNNING WITH UPDATED CODE !!!!!!!!!!!!!!!")
     try:
-        # CRITICAL LOGGING: Print the entire request details
-        logger.info(
-            "========================= CHAT STREAM REQUEST ==========================")
-        logger.info(f"Request type: {type(request)}")
-        # Try to extract all fields
-        try:
-            as_dict = request.dict() if hasattr(request, 'dict') else {
-                "unable_to_get_dict": True}
-            logger.info(f"Request as dict: {as_dict}")
-        except Exception as e:
-            logger.info(f"Error getting request dict: {str(e)}")
-
-        # Specifically look for perform_web_search
-        try:
-            web_search_flag = getattr(request, 'perform_web_search', None)
-            logger.info(
-                f"Direct attribute access - perform_web_search: {web_search_flag}")
-        except Exception as e:
-            logger.info(f"Error getting web_search_flag attribute: {str(e)}")
-
-        # Look for perform_browser_navigation flag
-        try:
-            browser_flag = getattr(request, 'perform_browser_navigation', None)
-            logger.info(
-                f"Direct attribute access - perform_browser_navigation: {browser_flag}")
-        except Exception as e:
-            logger.info(f"Error getting browser_flag attribute: {str(e)}")
-
         # Add debug logging
-        logger.info(
-            f"Smart router received streaming request from user: {current_user['uid']}")
-
-        # Get the user message - check both message and messages array
-        user_message = ""
-
-        if hasattr(request, 'message') and request.message:
-            # Direct message field (sent by frontend)
-            user_message = request.message
-        else:
-            # Get the last user message from messages array
-            user_message = next((msg.content for msg in reversed(request.messages)
-                                if msg.role.lower() == "user"), "")
-
-        logger.info(f"Processing message in stream_chat: '{user_message}'")
-
-        if not user_message:
-            return StreamingResponse(
-                content=iter(["No user message found"]),
-                media_type="text/plain"
-            )
-
-        # Check for explicit web search flag from the frontend
-        # First try to extract it directly from request.__dict__
-        perform_web_search = False
-        try:
-            if hasattr(request, '__dict__') and 'perform_web_search' in request.__dict__:
-                perform_web_search = request.__dict__['perform_web_search']
-                logger.info(
-                    f"Web search flag from __dict__: {perform_web_search}")
-            elif hasattr(request, 'perform_web_search'):
-                perform_web_search = request.perform_web_search
-                logger.info(
-                    f"Web search flag from attribute: {perform_web_search}")
-            else:
-                # Try to get the dict representation of the request
-                req_dict = request.dict() if hasattr(request, 'dict') else {}
-                perform_web_search = req_dict.get('perform_web_search', False)
-                logger.info(f"Web search flag from dict: {perform_web_search}")
-        except Exception as e:
-            logger.error(f"Error getting web search flag: {str(e)}")
-            perform_web_search = False
-
-        # Check for explicit browser navigation flag
-        perform_browser_navigation = False
-        try:
-            if hasattr(request, '__dict__') and 'perform_browser_navigation' in request.__dict__:
-                perform_browser_navigation = request.__dict__[
-                    'perform_browser_navigation']
-                logger.info(
-                    f"Browser navigation flag from __dict__: {perform_browser_navigation}")
-            elif hasattr(request, 'perform_browser_navigation'):
-                perform_browser_navigation = request.perform_browser_navigation
-                logger.info(
-                    f"Browser navigation flag from attribute: {perform_browser_navigation}")
-            else:
-                # Try to get the dict representation of the request
-                req_dict = request.dict() if hasattr(request, 'dict') else {}
-                perform_browser_navigation = req_dict.get(
-                    'perform_browser_navigation', False)
-                logger.info(
-                    f"Browser navigation flag from dict: {perform_browser_navigation}")
-        except Exception as e:
-            logger.error(f"Error getting browser navigation flag: {str(e)}")
-            perform_browser_navigation = False
-
-        # Force-enable web search if the message explicitly contains search keywords
-        if not perform_web_search and ('search' in user_message.lower() or 'find' in user_message.lower()):
-            logger.info(
-                f"Forcing web search based on message content: '{user_message}'")
-            perform_web_search = True
-
-        # Check for puppeteer intent based on keywords
-        puppeteer_keywords = ['browse to', 'navigate to', 'go to',
-                              'visit', 'open website', 'take a screenshot', 'capture screen']
-        detected_puppeteer = any(keyword in user_message.lower()
-                                 for keyword in puppeteer_keywords)
-        if detected_puppeteer and not perform_browser_navigation:
-            logger.info(
-                f"Detected puppeteer intent based on message content: '{user_message}'")
-            perform_browser_navigation = True
-
-        logger.info(f"FINAL web search flag: {perform_web_search}")
-        logger.info(
-            f"FINAL browser navigation flag: {perform_browser_navigation}")
-
-        # Web search specific logging
-        logger.info(
-            "================== WEB SEARCH DECISION LOGIC ==================")
-        logger.info(f"FORCE_WEB_SEARCH global flag: {FORCE_WEB_SEARCH}")
-        logger.info(
-            f"getattr request.perform_web_search: {getattr(request, 'perform_web_search', False)}")
-
-        # Puppeteer specific logging
-        logger.info(
-            "================== BROWSER NAVIGATION DECISION LOGIC ==================")
-        logger.info(
-            f"getattr request.perform_browser_navigation: {getattr(request, 'perform_browser_navigation', False)}")
-        logger.info(f"Detected puppeteer intent: {detected_puppeteer}")
-
-        # URL extraction for puppeteer
-        target_url = None
-        if perform_browser_navigation:
-            # Try to extract URL from message
-            url_pattern = r'https?://[^\s>)"]+|www\.[^\s>)"]+\.[^\s>)"]+|[a-zA-Z0-9][-a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})+\.[a-zA-Z0-9]{2,6}(/\S*)?'
-            url_match = re.search(url_pattern, user_message)
-            if url_match:
-                target_url = url_match.group(0)
-                # Add protocol if needed
-                if target_url.startswith('www.'):
-                    target_url = 'https://' + target_url
-                elif not target_url.startswith(('http://', 'https://')):
-                    target_url = 'https://' + target_url
-                logger.info(
-                    f"Extracted URL for browser navigation: {target_url}")
-            else:
-                logger.info(
-                    "No URL found in message, will attempt domain extraction")
-                # Try to extract domain/website name
-                domain_pattern = r'\b(?:browse to|navigate to|go to|visit|open)\s+(?:the\s+)?(?:website\s+)?([a-zA-Z0-9][-a-zA-Z0-9]{0,62}(?:\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})*(?:\.[a-zA-Z]{2,})+)'
-                domain_match = re.search(
-                    domain_pattern, user_message, re.IGNORECASE)
-                if domain_match:
-                    target_url = "https://" + domain_match.group(1)
-                    logger.info(
-                        f"Extracted domain for browser navigation: {target_url}")
-                else:
-                    # Try to find any word that looks like a domain
-                    domain_words_pattern = r'\b([a-zA-Z0-9][-a-zA-Z0-9]{0,62}\.(?:com|org|net|edu|gov|io|app|ai|co|me|info|biz))\b'
-                    domain_words_match = re.search(
-                        domain_words_pattern, user_message)
-                    if domain_words_match:
-                        target_url = "https://" + domain_words_match.group(1)
-                        logger.info(f"Found domain-like word: {target_url}")
-
-        # Determine intent and perform web search if needed
-        try:
-            # First, check if we need to do browser navigation with puppeteer
-            if perform_browser_navigation and target_url:
-                logger.info(f"Performing browser navigation to: {target_url}")
-
-                try:
-                    # Import the execute_puppeteer_function helper
-                    from app.routers.multivio.puppeteer_router import execute_puppeteer_function
-
-                    # Navigate to the URL
-                    logger.info(f"Navigating to URL: {target_url}")
-                    navigation_result = execute_puppeteer_function(
-                        "puppeteer_navigate", url=target_url)
-
-                    # Take a screenshot
-                    screenshot_name = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    screenshot_result = execute_puppeteer_function(
-                        "puppeteer_screenshot", name=screenshot_name)
-
-                    # Extract page content using JavaScript
-                    content_script = """
-                        function getMainContent() {
-                            // Try to find main content
-                            const selectors = ['main', 'article', '#content', '.content', '.main-content'];
-                            for (const selector of selectors) {
-                                const element = document.querySelector(selector);
-                                if (element) return element.innerText;
-                            }
-                            // Fall back to body text
-                            return document.body.innerText;
-                        }
-                        return getMainContent();
-                    """
-                    page_content = execute_puppeteer_function(
-                        "puppeteer_evaluate", script=content_script)
-
-                    # Try to get the page title
-                    title_script = "document.title"
-                    page_title = execute_puppeteer_function(
-                        "puppeteer_evaluate", script=title_script)
-
-                    # Trim content if it's too large
-                    if page_content and len(page_content) > 8000:
-                        page_content = page_content[:8000] + \
-                            "... [content truncated]"
-
-                    # Create an enhanced prompt with the extracted content
-                    puppeteer_context = f"""
-                        # WEB PAGE CONTENT
-
-                        I've navigated to {target_url} and found the following:
-
-                        Title: {page_title or 'Unknown Title'}
-
-                        Content:
-                        {page_content or "No content could be extracted from this page."}
-
-                        I've also taken a screenshot named '{screenshot_name}'.
-
-                        When answering the user's question:
-                        1. Use the content from this page to provide information
-                        2. Describe what I found on the page
-                        3. If the content doesn't address their question completely, clearly state this
-                        """
-                    # Get conversation ID or create a new one
-                    conversation_id = getattr(request, 'conversation_id', None)
-
-                    # Log the message to the conversation if it exists
-                    if conversation_id:
-                        try:
-                            # Log user message
-                            user_message_id = str(uuid.uuid4())
-                            await db.execute(
-                                """
-                                INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at)
-                                VALUES (:id, :conversation_id, :role, :content, :created_at)
-                                """,
-                                {
-                                    "id": user_message_id,
-                                    "conversation_id": conversation_id,
-                                    "role": "user",
-                                    "content": user_message,
-                                    "created_at": datetime.now(timezone.utc)
-                                }
-                            )
-
-                            # Record the puppeteer system message
-                            puppeteer_msg_id = str(uuid.uuid4())
-                            await db.execute(
-                                """
-                                INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at, metadata)
-                                VALUES (:id, :conversation_id, :role, :content, :created_at, :metadata)
-                                """,
-                                {
-                                    "id": puppeteer_msg_id,
-                                    "conversation_id": conversation_id,
-                                    "role": "system",
-                                    "content": puppeteer_context,
-                                    "created_at": datetime.now(timezone.utc),
-                                    "metadata": json.dumps({
-                                        "puppeteer_navigation": True,
-                                        "url": target_url,
-                                        "screenshot": screenshot_name
-                                    })
-                                }
-                            )
-                        except Exception as db_error:
-                            logger.error(
-                                f"Error recording puppeteer messages: {str(db_error)}")
-
-                    # Build a modified request for general_stream_chat
-                    modified_request_data = {
-                        "conversation_id": conversation_id,
-                        "content_id": getattr(request, 'content_id', None),
-                        "message": user_message,
-                        "stream": True,
-                        "system_prompt": puppeteer_context  # Pass the puppeteer context as system prompt
-                    }
-
-                    # Convert to the GeneralChatRequest format
-                    from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
-                    modified_request = GeneralChatRequest(
-                        **modified_request_data)
-
-                    # Use general_stream_chat with the enhanced request
-                    return await general_stream_chat(modified_request, current_user, db)
-
-                except Exception as puppeteer_error:
-                    logger.error(
-                        f"Error during browser navigation: {str(puppeteer_error)}")
-                    logger.error(traceback.format_exc())
-                    # Fall back to web search if navigation fails
-                    logger.info(
-                        "Falling back to web search after puppeteer failure")
-                    perform_web_search = True
-
-            # If FORCE_WEB_SEARCH is enabled or the request explicitly asks for web search
-            if FORCE_WEB_SEARCH or perform_web_search:
-                logger.info(f"Web search enabled for: '{user_message}'")
-
-                # Perform web search directly here
-                logger.info("PERFORMING DIRECT WEB SEARCH INLINE")
-                # Use the imported function, not the variable
-                from app.routers.multivio.brave_search_router import perform_web_search as search_function
-                search_results = await search_function(user_message)
-                formatted_results = format_web_results_for_llm(search_results)
-
-                if formatted_results:
-                    logger.info(
-                        f"Successfully got {len(formatted_results)} chars of search results")
-
-                    # Build system prompt with search results
-                    search_instruction = f"""
-                        # WEB SEARCH RESULTS
-
-                        I've performed a web search for "{user_message}" and found the following results:
-
-                        {formatted_results}
-
-                        When answering the user's question:
-                        1. Use these search results to provide up-to-date information
-                        2. Cite specific sources from the results when appropriate
-                        3. If the search results don't provide enough information, clearly state this and use your general knowledge
-                        4. Synthesize information from multiple sources if relevant
-                        """
-
-                    # Create a message list with search results
-                    system_prompt = getattr(
-                        request, 'system_prompt', DEFAULT_SYSTEM_PROMPT)
-                    messages = [
-                        {"role": "system", "content": search_instruction},
-                        {"role": "user", "content": user_message}
-                    ]
-
-                    # Get conversation ID or create a new one
-                    conversation_id = getattr(request, 'conversation_id', None)
-
-                    # Use the general router with our enhanced messages
-                    logger.info(
-                        "ROUTING TO GENERAL KNOWLEDGE WITH SEARCH RESULTS")
-
-                    # Get user message ID for tracking
-                    user_message_id = str(uuid.uuid4())
-                    # Log the message to the conversation if it exists
-                    if conversation_id:
-                        try:
-                            await db.execute(
-                                """
-                                INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at)
-                                VALUES (:id, :conversation_id, :role, :content, :created_at)
-                                """,
-                                {
-                                    "id": user_message_id,
-                                    "conversation_id": conversation_id,
-                                    "role": "user",
-                                    "content": user_message,
-                                    "created_at": datetime.now(timezone.utc)
-                                }
-                            )
-
-                            # Record the search system prompt with full results
-                            search_msg_id = str(uuid.uuid4())
-                            await db.execute(
-                                """
-                                INSERT INTO mo_llm_messages (id, conversation_id, role, content, created_at, metadata)
-                                VALUES (:id, :conversation_id, :role, :content, :created_at, :metadata)
-                                """,
-                                {
-                                    "id": search_msg_id,
-                                    "conversation_id": conversation_id,
-                                    "role": "system",
-                                    "content": search_instruction,  # Store the FULL search results in content
-                                    "created_at": datetime.now(timezone.utc),
-                                    "metadata": json.dumps({"web_search": True, "query": user_message})
-                                }
-                            )
-                        except Exception as db_error:
-                            logger.error(
-                                f"Error recording messages: {str(db_error)}")
-
-                    # Build a modified request for general_stream_chat
-                    modified_request_data = {
-                        "conversation_id": conversation_id,
-                        "content_id": getattr(request, 'content_id', None),
-                        "message": user_message,
-                        "stream": True,
-                        # Pass the search instruction as system prompt
-                        "system_prompt": search_instruction
-                    }
-
-                    # Convert to the GeneralChatRequest format
-                    from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
-                    modified_request = GeneralChatRequest(
-                        **modified_request_data)
-
-                    # Use general_stream_chat with the enhanced request
-                    return await general_stream_chat(modified_request, current_user, db)
-                else:
-                    logger.error(
-                        "Web search returned no results, falling back to general knowledge")
-                    return await general_stream_chat(request, current_user, db)
-            else:
-                # Detect intent based on message content
-                intent = detect_intent(user_message)
-                logger.info(
-                    f">>> Smart router detected intent: {intent} for message: '{user_message}'")
-
-                # Route based on detected intent
-                if intent == "image_generation":
-                    # For image generation, don't stream but return a special response
-                    # Extract image prompt
-                    prompt = extract_image_prompt(user_message)
-
-                    # Image generation code
-                    # Create a task ID
-                    task_id = str(uuid.uuid4())
-                    now = datetime.now(timezone.utc)
-
-                    # Prepare request data for together.ai
-                    api_data = {
-                        "prompt": prompt,
-                        "model": "flux",
-                        "n": 1,  # Generate one image for chat
-                        "disable_safety_checker": True  # Add safety checker option
-                    }
-
-                    # Store the task in the database
-                    query = """
-                    INSERT INTO mo_ai_tasks (
-                        id, type, parameters, status, created_by, created_at, updated_at
-                    ) VALUES (
-                        :id, :type, :parameters, :status, :created_by, :created_at, :updated_at
-                    )
-                    """
-
-                    values = {
-                        "id": task_id,
-                        "type": "image_generation",
-                        "parameters": json.dumps({
-                            "prompt": prompt,
-                            "model": "flux",
-                            "num_images": 1,
-                            "disable_safety_checker": True
-                        }),
-                        "status": "processing",
-                        "created_by": current_user["uid"],
-                        "created_at": now,
-                        "updated_at": now
-                    }
-
-                    await db.execute(query=query, values=values)
-
-                    # Store message ID for later reference
-                    message_id = None
-
-                    # Record the message in conversation if conversation_id is provided
-                    conversation_id = getattr(request, 'conversation_id', None)
-                    if conversation_id:
-                        try:
-                            # Add user message
-                            await db.execute(
-                                """
-                                INSERT INTO mo_llm_messages (
-                                    id, conversation_id, role, content, created_at
-                                ) VALUES (
-                                    :id, :conversation_id, :role, :content, :created_at
-                                )
-                                """,
-                                {
-                                    "id": str(uuid.uuid4()),
-                                    "conversation_id": conversation_id,
-                                    "role": "user",
-                                    "content": user_message,
-                                    "created_at": now
-                                }
-                            )
-
-                            # Check if the table has an image_url column
-                            check_image_url_query = """
-                            SELECT column_name FROM information_schema.columns 
-                            WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
-                            """
-                            has_image_url = await db.fetch_one(check_image_url_query)
-
-                            # Add assistant message (placeholder)
-                            message_id = str(uuid.uuid4())
-
-                            # Determine columns and values based on schema
-                            insert_fields = [
-                                "id", "conversation_id", "role", "content", "created_at", "metadata"
-                            ]
-
-                            insert_values = {
-                                "id": message_id,
-                                "conversation_id": conversation_id,
-                                "role": "assistant",
-                                "content": f"Generating image of {prompt}...",
-                                "created_at": now,
-                                "metadata": json.dumps({
-                                    "is_image": True,
-                                    "image_task_id": task_id,
-                                    "prompt": prompt,
-                                    "status": "generating"
-                                })
-                            }
-
-                            # Add image_url placeholder if the column exists
-                            if has_image_url:
-                                insert_fields.append("image_url")
-                                # Will be updated when image is ready
-                                insert_values["image_url"] = "pending"
-
-                            # Build dynamic query
-                            fields_str = ", ".join(insert_fields)
-                            placeholders_str = ", ".join(
-                                [f":{field}" for field in insert_fields])
-
-                            insert_query = f"""
-                            INSERT INTO mo_llm_messages (
-                                {fields_str}
-                            ) VALUES (
-                                {placeholders_str}
-                            )
-                            """
-
-                            await db.execute(query=insert_query, values=insert_values)
-                        except Exception as e:
-                            logger.error(
-                                f"Error recording messages in stream chat: {str(e)}")
-                            # Continue even if message recording fails
-
-                    # Start background task
-                    background_tasks.add_task(
-                        generate_image_task,
-                        task_id,
-                        api_data,
-                        current_user["uid"],
-                        None,  # No folder_id for chat-based images
-                        db,
-                        conversation_id,
-                        message_id
-                    )
-
-                    # Return a special message that can be interpreted by the frontend
-                    response_data = {
-                        "is_image_request": True,
-                        "task_id": task_id,
-                        "message": "Generating image of " + prompt
-                    }
-
-                    return StreamingResponse(
-                        content=iter([json.dumps(response_data)]),
-                        media_type="application/json"
-                    )
-
-                elif intent == "puppeteer":
-                    # Handle puppeteer intent if not already handled by the explicit flag
-                    logger.info(
-                        "Detected puppeteer intent but no URL was found earlier")
-
-                    # Try one more time to extract a URL or domain
-                    domain_pattern = r'(?:about|for|of|from)\s+([a-zA-Z0-9][-a-zA-Z0-9]{0,62}(?:\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})*(?:\.[a-zA-Z]{2,})+)'
-                    domain_match = re.search(
-                        domain_pattern, user_message, re.IGNORECASE)
-
-                    if domain_match:
-                        extracted_domain = "https://" + domain_match.group(1)
-                        logger.info(
-                            f"Found domain in secondary extraction: {extracted_domain}")
-
-                        # Recursively call this function with the extracted domain but avoid infinite loop
-                        temp_request = copy.deepcopy(request)
-                        if hasattr(temp_request, '__dict__'):
-                            temp_request.__dict__[
-                                'perform_browser_navigation'] = True
-
-                        # Modify the message to include the extracted URL to ensure it's found
-                        if hasattr(temp_request, 'message'):
-                            temp_request.message = f"{user_message} {extracted_domain}"
-                        elif hasattr(temp_request, 'messages') and temp_request.messages:
-                            for i in range(len(temp_request.messages)):
-                                if temp_request.messages[i].role.lower() == "user":
-                                    temp_request.messages[i].content = f"{temp_request.messages[i].content} {extracted_domain}"
-                                    break
-
-                        return await stream_chat(temp_request, background_tasks, current_user, db)
-                    else:
-                        # If we still can't find a URL, perform a web search instead
-                        logger.info(
-                            "No URL found for puppeteer intent, falling back to web search")
-                        temp_request = copy.deepcopy(request)
-                        if hasattr(temp_request, '__dict__'):
-                            temp_request.__dict__['perform_web_search'] = True
-
-                        return await stream_chat(temp_request, background_tasks, current_user, db)
-
-                elif intent == "social_media":
-                    # IMPORTANT: Explicitly use the grok_router's stream_chat_api
-                    logger.info(
-                        "Routing to social media handler (grok_router)")
-                    return await grok_stream_chat(request, current_user, db)
-
-                else:  # general_knowledge or any other intent
-                    # IMPORTANT: Explicitly use the general_router's stream_chat_api
-                    logger.info(
-                        "Routing to general knowledge handler (general_router)")
-                    return await general_stream_chat(request, current_user, db)
-        except Exception as e:
-            logger.error(f"Error in handling web search decision: {str(e)}")
-            logger.error(traceback.format_exc())
-            # Fall back to general knowledge
-            return await general_stream_chat(request, current_user, db)
-
+        logger.info(f"Smart router received streaming request from user: {current_user['uid']}")
+        
+        # Use the intent router to handle the request
+        intent_router = setup_intent_router()
+        return await intent_router.route(request, background_tasks, current_user, db)
+        
     except Exception as e:
         logger.error(f"Error in stream chat: {str(e)}")
         logger.error(traceback.format_exc())
@@ -955,7 +915,6 @@ async def stream_chat(
             content=iter([f"Error: {str(e)}"]),
             media_type="text/plain"
         )
-
 
 
 @router.post("/chat", response_model=SmartResponse)
@@ -1017,12 +976,8 @@ async def smart_chat(
                 "type": "image_generation",
                 "parameters": json.dumps({
                     "prompt": prompt,
-                    "negative_prompt": None,
-                    "size": "1024x1024",
                     "model": "flux",
                     "num_images": 1,
-                    "folder_id": None,
-                    "disable_safety_checker": True
                 }),
                 "status": "processing",
                 "created_by": current_user["uid"],
@@ -1166,7 +1121,6 @@ async def smart_chat(
                 result = response.json()
                 content = result.get("choices", [{}])[0].get(
                     "message", {}).get("content", "")
-
                 return SmartResponse(
                     detected_intent="social_media",
                     result=TextGenerationResult(
@@ -1472,3 +1426,38 @@ async def get_generation_task_status(
     except Exception as e:
         logger.error(f"Error checking task status: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Add this function after the detect_intent function
+def check_social_media_intent(message: str) -> bool:
+    """Special check for social media content creation intents."""
+    # Check for common social media creation phrases
+    instagram_patterns = [
+        r'(?i)create\s+a\s+(instagram|ig)\s+post',
+        r'(?i)create\s+an?\s+(instagram|ig)\s+post',
+        r'(?i)make\s+an?\s+(instagram|ig)\s+post',
+        r'(?i)write\s+an?\s+(instagram|ig)\s+post',
+        r'(?i)post\s+on\s+(instagram|ig)',
+        r'(?i)new\s+(instagram|ig)\s+post',
+        # Shorter variations
+        r'(?i)ig\s+post',
+        r'(?i)instagram\s+post'
+    ]
+    
+    for pattern in instagram_patterns:
+        if re.search(pattern, message):
+            logger.info(f"✅ Explicit social media intent detected with pattern: {pattern}")
+            return True
+            
+    # Check other platforms similarly
+    other_platforms = [
+        r'(?i)(facebook|fb|twitter|linkedin|tiktok)\s+post',
+        r'(?i)post\s+on\s+(facebook|fb|twitter|linkedin|tiktok)',
+        r'(?i)create\s+a\s+(facebook|fb|twitter|linkedin|tiktok)\s+post'
+    ]
+    
+    for pattern in other_platforms:
+        if re.search(pattern, message):
+            logger.info(f"✅ Explicit social media intent detected with pattern: {pattern}")
+            return True
+    
+    return False
