@@ -1,7 +1,7 @@
 from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router
 # Add this import
-from app.routers.multivio import grok_router, linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router, together_router, smart_router, general_router, brave_search_router, direct_search_router, websearch_router, puppeteer_router
+from app.routers.multivio import grok_router, linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router, together_router, smart_router, general_router, brave_search_router, direct_search_router, websearch_router, puppeteer_router, pipeline_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
@@ -116,6 +116,7 @@ router_list = [
     (direct_search_router.router, "/api/v1/direct-search", ["direct_search"]),
     (websearch_router.router, "/api/v1/websearch", ["websearch"]),
     (puppeteer_router.router, "/api/v1/puppeteer", ["puppeteer"]),
+    (pipeline_router.router, "/api/v1/pipeline", ["pipeline"]),
     
 ]
 for router, prefix, tags in router_list:

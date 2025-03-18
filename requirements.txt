@@ -15,6 +15,7 @@ async-timeout==4.0.3
 asyncpg==0.29.0
 attrs==24.3.0
 av==12.3.0
+backoff==2.2.1
 beautifulsoup4==4.12.3
 billiard==4.2.0
 bleach==6.1.0
@@ -39,12 +40,14 @@ distro==1.9.0
 dnspython==2.6.1
 ecdsa==0.19.0
 email_validator==2.2.0
+eval_type_backport==0.2.2
 exceptiongroup==1.2.2
 executing==2.0.1
 fastapi==0.111.1
 fastapi-cli==0.0.4
 fastapi-limiter==0.1.6
 ffmpeg-python==0.2.0
+filelock==3.17.0
 firebase-admin==6.5.0
 flatbuffers==24.3.25
 frozenlist==1.5.0
@@ -108,7 +111,7 @@ packaging==24.1
 pandas==2.2.3
 parso==0.8.4
 pexpect==4.9.0
-pillow==10.4.0
+pillow==11.1.0
 platformdirs==4.2.2
 proglog==0.1.10
 prompt_toolkit==3.0.47
@@ -118,6 +121,7 @@ protobuf==4.25.4
 psutil==6.0.0
 ptyprocess==0.7.0
 pure_eval==0.2.3
+pyarrow==19.0.1
 pyasn1==0.6.0
 pyasn1_modules==0.4.0
 pycparser==2.22
@@ -140,9 +144,10 @@ pytz==2024.2
 PyYAML==6.0.1
 pyzmq==26.0.3
 redis==5.1.0b7
+replicate==1.0.4
 requests==2.32.3
 requests-oauthlib==2.0.0
-rich==13.7.1
+rich==13.9.4
 rsa==4.9
 s3transfer==0.10.2
 shellingham==1.5.4
@@ -152,12 +157,15 @@ soupsieve==2.5
 SQLAlchemy==2.0.31
 stack-data==0.6.3
 starlette==0.37.2
+tabulate==0.9.0
+tenacity==9.0.0
 tensorboard==2.17.0
 tensorboard-data-server==0.7.2
 tensorflow==2.17.0
 tensorflow-io-gcs-filesystem==0.37.1
 termcolor==2.4.0
 threadpoolctl==3.5.0
+together==1.4.1
 tornado==6.4.1
 tqdm==4.66.4
 traitlets==5.14.3
