@@ -13,10 +13,12 @@ logger = logging.getLogger(__name__)
 # Search patterns
 SEARCH_PATTERNS = [
     r"(?i)search\s+for",
-    r"(?i)search\s+the\s+(web|internet)\s+for",
+    r"(?i)search\s+the\s+(web|internet)",  # Removed '\s+for' requirement
     r"(?i)find\s+information\s+(about|on)",
     r"(?i)look\s+up",
     r"(?i)find\s+(me\s+)?(some\s+)?information",
+    # Added to match "find me top 10 news"
+    r"(?i)find\s+(me\s+)?(some\s+)?(top|best|latest)",
     r"(?i)what\s+are\s+the\s+latest",
     r"(?i)tell\s+me\s+about\s+recent",
     r"(?i)what\s+(is|are|was|were)",
@@ -27,6 +29,10 @@ SEARCH_PATTERNS = [
     r"(?i)who\s+(is|was)",
     r"(?i)when\s+(is|was|did)",
     r"(?i)why\s+(is|are|do|does)",
+    r"(?i)(top|best)\s+\d+",  # Added to match "top 10 news"
+    # Added to match "news happened in Hong Kong"
+    r"(?i)news\s+(about|in|from|happened)",
+    r"(?i)news.*?today",  # Added to match "news happened in Hong Kong today"
 ]
 
 # Local search patterns

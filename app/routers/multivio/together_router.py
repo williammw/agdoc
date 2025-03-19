@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from app.routers.ws_router import broadcast_to_conversation
 from app.dependencies import get_current_user, get_database
 from databases import Database
 from pydantic import BaseModel, Field
@@ -297,6 +298,31 @@ async def generate_image_task(
                 
                 logger.info(f"Updating conversation {conversation_id}, message {message_id} with image URL: {image_url}")
                 
+                # Send WebSocket notification about the new image
+                try:
+                    await broadcast_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "message_update",
+                            "messageId": message_id,
+                            "updates": {
+                                "imageUrl": image_url,
+                                "status": "completed",
+                                "metadata": {
+                                    "is_image": True,
+                                    "image_task_id": task_id,
+                                    "image_id": first_image.get("id"),
+                                    "imageGenerationStatus": "completed",
+                                    "prompt": prompt
+                                }
+                            }
+                        }
+                    )
+                    logger.info(f"Sent WebSocket notification for image in conversation {conversation_id}")
+                except Exception as ws_error:
+                    logger.error(f"WebSocket notification error: {str(ws_error)}")
+                    # Continue even if WebSocket notification fails
+                
                 # Create a message that references the image
                 # Use markdown image syntax: ![alt text](url)
                 message_content = f"![Generated image for: {prompt}]({image_url})"
@@ -483,7 +509,9 @@ async def generate_image(
     request: ImageGenerationRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db: Database = Depends(get_database),
+    conversation_id: Optional[str] = None,
+    message_id: Optional[str] = None
 ):
     try:
         # Ensure tasks table exists
@@ -542,6 +570,90 @@ async def generate_image(
         
         await db.execute(query=query, values=values)
         
+        # Create placeholder message if we have conversation_id and message_id
+        if conversation_id and message_id:
+            try:
+                # Create metadata with pending status
+                metadata = {
+                    "is_image": True,
+                    "image_task_id": task_id,
+                    "imageGenerationStatus": "pending",
+                    "prompt": request.prompt
+                }
+                
+                now = datetime.now(timezone.utc)
+                
+                # First check if the message exists
+                check_msg_query = "SELECT id FROM mo_llm_messages WHERE id = :message_id AND conversation_id = :conversation_id"
+                existing_msg = await db.fetch_one(
+                    query=check_msg_query,
+                    values={
+                        "message_id": message_id,
+                        "conversation_id": conversation_id
+                    }
+                )
+                
+                if not existing_msg:
+                    # Create a new message with pending status
+                    insert_query = """
+                    INSERT INTO mo_llm_messages (
+                        id, conversation_id, role, content, created_at, metadata
+                    ) VALUES (
+                        :id, :conversation_id, :role, :content, :created_at, :metadata
+                    )
+                    """
+                    
+                    await db.execute(
+                        query=insert_query,
+                        values={
+                            "id": message_id,
+                            "conversation_id": conversation_id,
+                            "role": "assistant",
+                            "content": f"Generating image for: {request.prompt}...",
+                            "created_at": now,
+                            "metadata": json.dumps(metadata)
+                        }
+                    )
+                else:
+                    # Update existing message with pending status
+                    update_query = """
+                    UPDATE mo_llm_messages
+                    SET content = :content,
+                        metadata = :metadata
+                    WHERE id = :message_id AND conversation_id = :conversation_id
+                    """
+                    
+                    await db.execute(
+                        query=update_query,
+                        values={
+                            "content": f"Generating image for: {request.prompt}...",
+                            "metadata": json.dumps(metadata),
+                            "message_id": message_id,
+                            "conversation_id": conversation_id
+                        }
+                    )
+                
+                # Send a WebSocket notification about the pending image
+                try:
+                    await broadcast_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "message_update",
+                            "messageId": message_id,
+                            "updates": {
+                                "content": f"Generating image for: {request.prompt}...",
+                                "status": "pending",
+                                "metadata": metadata
+                            }
+                        }
+                    )
+                    logger.info(f"Sent pending status WebSocket notification for image in conversation {conversation_id}")
+                except Exception as ws_error:
+                    logger.error(f"WebSocket notification error for pending status: {str(ws_error)}")
+            except Exception as e:
+                logger.error(f"Error creating pending image message: {str(e)}")
+                # Continue even if message creation fails
+        
         # Start background task
         background_tasks.add_task(
             generate_image_task,
@@ -549,7 +661,9 @@ async def generate_image(
             api_data,
             current_user["uid"],
             request.folder_id,
-            db
+            db,
+            conversation_id,
+            message_id
         )
         
         return ImageGenerationResponse(
