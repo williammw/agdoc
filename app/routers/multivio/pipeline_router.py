@@ -290,13 +290,15 @@ async def process_streaming_response(context: Dict[str, Any]):
     }
     yield f"data: {json.dumps(intents_message)}\n\n"
 
-    # Process each result
+    # Process each result individually with proper type signaling
     for result in context.get("results", []):
         # Skip general_knowledge as it will be part of the content stream
         if result.get("type") == "general_knowledge":
             continue
 
+        # Create a properly formatted result message with result_type field
         result_message = {
+            "result_type": result.get("type"),
             "result": result
         }
 
@@ -304,18 +306,38 @@ async def process_streaming_response(context: Dict[str, Any]):
         if "current_command" in context:
             result_message["current_command"] = context["current_command"]
 
+        # Send each result with clear completion marker
         yield f"data: {json.dumps(result_message)}\n\n"
+        # Add a small delay to ensure frontend processes each message
+        await asyncio.sleep(0.05)
+        
+        # Send a completion signal for this specific result
+        yield f"data: {json.dumps({'result_complete': result.get('type')})}\n\n"
+        await asyncio.sleep(0.05)
 
     # Finally stream the content if available
     if "general_knowledge_content" in context:
         content = context["general_knowledge_content"]
         # Stream in chunks
         chunk_size = 100
+        
+        # Signal start of content
+        yield f"data: {json.dumps({'content_start': True})}\n\n"
+        
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i+chunk_size]
             yield f"data: {json.dumps({'content': chunk})}\n\n"
             # Small delay for natural streaming effect
             await asyncio.sleep(0.02)
+    
+    # Send a final summary message with all completed results
+    summary = {
+        "summary": {
+            "completed_results": [r.get("type") for r in context.get("results", []) if r.get("type") != "general_knowledge"],
+            "all_complete": True
+        }
+    }
+    yield f"data: {json.dumps(summary)}\n\n"
 
     # End the stream
     yield "data: [DONE]\n\n"
@@ -336,7 +358,10 @@ async def process_multi_intent_request(
 
     # Detect intents in the message
     intents = detect_intents(request.message)
-    logger.info(f"Detected intents: {list(intents.keys())}")
+    
+    # Filter out low-confidence intents for logging
+    significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
+    logger.info(f"Detected intents: {list(significant_intents.keys())}")
 
     # Create or get conversation
     conversation_id = request.conversation_id
@@ -368,7 +393,7 @@ async def process_multi_intent_request(
             "role": "user",
             "content": request.message,
             "created_at": now,
-            "metadata": json.dumps({"multi_intent": True, "detected_intents": list(intents.keys())})
+            "metadata": json.dumps({"multi_intent": True, "detected_intents": list(significant_intents.keys())})
         }
     )
 
@@ -380,7 +405,7 @@ async def process_multi_intent_request(
         "db": db,
         "background_tasks": background_tasks,
         "current_user": current_user,
-        "intents": intents,
+        "intents": significant_intents,
         "model": request.model,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens
@@ -391,22 +416,29 @@ async def process_multi_intent_request(
 
     # Add commands based on detected intents in appropriate order
     # Web search and puppeteer first as they provide context for other commands
-    if "web_search" in intents or "local_search" in intents:
+    if "web_search" in significant_intents or "local_search" in significant_intents:
         pipeline.add_command(CommandFactory.create("web_search"))
 
-    if "puppeteer" in intents:
+    if "puppeteer" in significant_intents:
         pipeline.add_command(CommandFactory.create("puppeteer"))
 
     # Image generation next (if present)
-    if "image_generation" in intents:
+    if "image_generation" in significant_intents:
         pipeline.add_command(CommandFactory.create("image_generation"))
 
     # Social media content generation next
-    if "social_media" in intents:
+    if "social_media" in significant_intents:
         pipeline.add_command(CommandFactory.create("social_media"))
 
-    # Always add general knowledge as fallback
-    pipeline.add_command(CommandFactory.create("general_knowledge"))
+    # Calculate total confidence of specialized commands
+    specialized_intents = [intent_type for intent_type in significant_intents.keys() 
+                          if intent_type != "general_knowledge"]
+    specialized_confidences = [significant_intents[intent_type]["confidence"] for intent_type in specialized_intents]
+    
+    # Only add general knowledge if confidence is above threshold
+    # This now relies on the smarter confidence calculation in detect_intents
+    if significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
+        pipeline.add_command(CommandFactory.create("general_knowledge"))
 
     # Execute the pipeline
     result_context = await pipeline.execute(context)
@@ -564,9 +596,61 @@ async def multi_intent_chat(
         # Format the response
         response_data = await format_pipeline_response(result_context)
 
-        # Create message ID
+        # Create message ID and timestamp
         message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
         response_data["message_id"] = message_id
+
+        # Extract content for database storage
+        response_content = response_data.get("content", "")
+        
+        # Create metadata for storage
+        metadata = {
+            "multi_intent": True,
+            "detected_intents": [intent for intent in result_context.get("intents", {}).keys() 
+                               if result_context["intents"][intent]["confidence"] > 0.3],
+            "results": result_context.get("results", []),
+            "message_id": message_id
+        }
+        
+        # Check if this message already exists to prevent duplicates
+        check_query = """
+        SELECT id FROM mo_llm_messages
+        WHERE conversation_id = :conversation_id
+        AND created_at > now() - interval '5 seconds'
+        AND role = 'assistant'
+        """
+        
+        existing_message = await db.fetch_one(
+            query=check_query,
+            values={"conversation_id": result_context["conversation_id"]}
+        )
+        
+        # Only insert if no recent message exists
+        if not existing_message:
+            # Store the assistant message
+            await db.execute(
+                """
+                INSERT INTO mo_llm_messages (
+                    id, conversation_id, role, content, created_at, metadata
+                ) VALUES (
+                    :id, :conversation_id, :role, :content, :created_at, :metadata
+                )
+                """,
+                {
+                    "id": message_id,
+                    "conversation_id": result_context["conversation_id"],
+                    "role": "assistant",
+                    "content": response_content,
+                    "created_at": now,
+                    "metadata": json.dumps(metadata)
+                }
+            )
+        else:
+            # Use existing message ID
+            message_id = existing_message["id"]
+            response_data["message_id"] = message_id
+            logger.info(f"Using existing message: {message_id}")
 
         return response_data
 
@@ -589,11 +673,76 @@ async def stream_multi_intent_chat(
     try:
         # Process the request
         result_context = await process_multi_intent_request(request, background_tasks, current_user, db)
+        
+        # Store results in DB before streaming
+        message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        
+        # Create assistant message record
+        response_content = ""
+        # Extract content from general knowledge if available
+        if "general_knowledge_content" in result_context:
+            response_content = result_context["general_knowledge_content"]
+        
+        # Create metadata with all results for later retrieval
+        metadata = {
+            "multi_intent": True,
+            "detected_intents": [intent for intent in result_context.get("intents", {}).keys() 
+                               if result_context["intents"][intent]["confidence"] > 0.3],
+            "results": result_context.get("results", []),
+            "message_id": message_id
+        }
+        
+        # Check if this message already exists to prevent duplicates
+        check_query = """
+        SELECT id FROM mo_llm_messages
+        WHERE conversation_id = :conversation_id
+        AND created_at > now() - interval '5 seconds'
+        AND role = 'assistant'
+        """
+        
+        existing_message = await db.fetch_one(
+            query=check_query,
+            values={"conversation_id": result_context["conversation_id"]}
+        )
+        
+        # Only insert if no recent message exists
+        if not existing_message:
+            # Store the assistant message
+            await db.execute(
+                """
+                INSERT INTO mo_llm_messages (
+                    id, conversation_id, role, content, created_at, metadata
+                ) VALUES (
+                    :id, :conversation_id, :role, :content, :created_at, :metadata
+                )
+                """,
+                {
+                    "id": message_id,
+                    "conversation_id": result_context["conversation_id"],
+                    "role": "assistant",
+                    "content": response_content,
+                    "created_at": now,
+                    "metadata": json.dumps(metadata)
+                }
+            )
+            
+            # Update the message_id in the context
+            result_context["message_id"] = message_id
+        else:
+            # Use existing message ID
+            result_context["message_id"] = existing_message["id"]
+            logger.info(f"Using existing message: {existing_message['id']}")
 
-        # Return streaming response
+        # Return streaming response with proper headers to prevent caching
         return StreamingResponse(
             process_streaming_response(result_context),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive"
+            }
         )
 
     except Exception as e:
@@ -612,3 +761,63 @@ async def list_available_commands():
     """
     commands = CommandFactory.get_available_commands()
     return {"commands": commands}
+
+
+@router.get("/message/{message_id}")
+async def get_message_by_id(
+    message_id: str,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Get a specific message with all its results by ID.
+    This is useful as a fallback mechanism if streaming fails.
+    """
+    try:
+        # Get the message
+        message_query = """
+        SELECT id, conversation_id, role, content, created_at, metadata
+        FROM mo_llm_messages
+        WHERE id = :message_id
+        """
+        message = await db.fetch_one(
+            query=message_query,
+            values={"message_id": message_id}
+        )
+        
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+            
+        # Convert to dict
+        message_dict = dict(message)
+        
+        # Parse metadata if present
+        if message_dict.get("metadata"):
+            try:
+                message_dict["metadata"] = json.loads(message_dict["metadata"])
+            except:
+                pass
+                
+        # Get the conversation to check permission
+        conversation_id = message_dict["conversation_id"]
+        conversation = await get_conversation_by_id(db, conversation_id)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        # Check user permission
+        user_id = current_user.get('id', current_user.get('uid'))
+        if conversation["user_id"] != user_id:
+            raise HTTPException(
+                status_code=403, 
+                detail="You don't have permission to access this message"
+            )
+            
+        return {"message": message_dict}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting message: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))

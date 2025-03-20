@@ -343,8 +343,7 @@ async def add_message(db: Database, conversation_id: str, role: str, content: st
     return message_id
 
 
-async def store_function_call(db: Database, message_id: str, function_name: str,
-                              arguments: Dict[str, Any], result: Optional[Dict[str, Any]] = None):
+async def store_function_call(db: Database, message_id: str, function_name: str, arguments: Dict[str, Any], result: Optional[Dict[str, Any]] = None):
     """Store a function call and result"""
     function_call_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)

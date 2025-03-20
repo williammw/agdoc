@@ -78,12 +78,12 @@ LINKEDIN_SCOPES = {
     ],
     "social": [
         "w_member_social",     # Create posts on behalf of member
-        "r_organization_social",  # Read org posts
-        "w_organization_social",  # Create org pw_organization_socialosts
+        "r_organization_social", # Read org posts
+        "w_organization_social", # Create org pw_organization_socialosts
     ],
     "organization": [
         "r_organization_admin",  # Read org pages and analytics
-        "rw_organization_admin",  # Manage org pages
+        "rw_organization_admin", # Manage org pages
     ],
     "advertising": [
         "r_ads",               # Read ad accounts
@@ -91,7 +91,7 @@ LINKEDIN_SCOPES = {
         "r_ads_reporting",     # Read ad reporting
     ],
     "connections": [
-        "r_1st_connections_size",  # Number of connections
+        "r_1st_connections_size", # Number of connections
     ]
 }
 
@@ -103,8 +103,6 @@ REQUIRED_SCOPES = [
 ]
 
 # Add this enum class
-
-
 class SocialPlatform(str, Enum):
     LINKEDIN = "linkedin"
     FACEBOOK = "facebook"
@@ -115,13 +113,10 @@ class SocialPlatform(str, Enum):
     THREADS = "threads"
 
 # Models
-
-
 class TokenResponse(BaseModel):
     access_token: str
     expires_in: int
     refresh_token: Optional[str] = None
-
 
 class UserProfile(BaseModel):
     id: str
@@ -130,17 +125,14 @@ class UserProfile(BaseModel):
     profilePicture: Optional[str] = None
     email: Optional[str] = None
 
-
 class SharePost(BaseModel):
     text: str
     visibility: str = "PUBLIC"
     article_url: Optional[str] = None
     organization_id: Optional[str] = None
 
-
 class ArticleMetadata(BaseModel):
     url: str
-
 
 class OAuthState(BaseModel):
     state: str
@@ -149,7 +141,6 @@ class OAuthState(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime
     code_verifier: str = ""
-
 
 class SocialAccount(BaseModel):
     id: Optional[UUID] = None
@@ -165,16 +156,13 @@ class SocialAccount(BaseModel):
     media_type: Optional[str] = None
     media_count: Optional[int] = 0
 
-
 # State management for CSRF protection
 active_states = {}
-
 
 def generate_state():
     state = secrets.token_urlsafe(32)
     active_states[state] = time.time()
     return state
-
 
 def validate_state(state: str) -> bool:
     timestamp = active_states.get(state)
@@ -184,7 +172,6 @@ def validate_state(state: str) -> bool:
     current_time = time.time()
     active_states.clear()
     return (current_time - timestamp) < 3600
-
 
 @router.get("/auth/init")
 async def linkedin_auth(
@@ -196,19 +183,18 @@ async def linkedin_auth(
         # Get the user ID - depending on how it's set in the current_user dict
         user_id = current_user.get('uid') or current_user.get('id')
         logger.debug(f"Initializing LinkedIn auth for user: {user_id}")
-
+        
         # Generate state for CSRF protection
         state = generate_state()
-
+        
         # Generate code verifier and challenge for PKCE
         # Length should be between 43 and 128 characters - use 64 for good security
         code_verifier = secrets.token_urlsafe(48)  # This gives about 64 chars
-
+        
         # Generate code challenge with S256 method as recommended by OAuth2 standards
         code_challenge_bytes = hashlib.sha256(code_verifier.encode()).digest()
-        code_challenge = base64.urlsafe_b64encode(
-            code_challenge_bytes).decode().rstrip("=")
-
+        code_challenge = base64.urlsafe_b64encode(code_challenge_bytes).decode().rstrip("=")
+        
         # Store state and code_verifier in database
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(minutes=10)
@@ -251,13 +237,12 @@ async def linkedin_auth(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256"
         }
-
-        logger.info(
-            f"Authorization parameters: {json.dumps(auth_params, indent=2)}")
-
+        
+        logger.info(f"Authorization parameters: {json.dumps(auth_params, indent=2)}")
+        
         auth_url = f"{ENDPOINTS['auth']}?{urlencode(auth_params)}"
         logger.debug(f"Generated LinkedIn auth URL: {auth_url}")
-
+        
         return {
             "url": auth_url,
             "state": state
@@ -269,7 +254,6 @@ async def linkedin_auth(
             status_code=500,
             detail="Failed to initialize LinkedIn authentication"
         )
-
 
 @router.post("/auth/callback")
 async def linkedin_callback(
@@ -286,14 +270,11 @@ async def linkedin_callback(
 
         if not code or not state:
             logger.error("Missing code or state parameter in callback")
-            raise HTTPException(
-                status_code=400, detail="Missing required parameters (code or state)")
-
-        logger.info(
-            f"Received callback with code: {code[:10] if code else None}... (length: {len(code) if code else 0}) and state: {state}")
-        logger.info(
-            f"Current user ID: {current_user.get('uid') or current_user.get('id')}")
-
+            raise HTTPException(status_code=400, detail="Missing required parameters (code or state)")
+            
+        logger.info(f"Received callback with code: {code[:10] if code else None}... (length: {len(code) if code else 0}) and state: {state}")
+        logger.info(f"Current user ID: {current_user.get('uid') or current_user.get('id')}")
+        
         # Safely convert current_user to JSON-serializable dict
         safe_user_dict = {}
         for k, v in current_user.items():
@@ -302,9 +283,8 @@ async def linkedin_callback(
                     safe_user_dict[k] = v.isoformat()
                 else:
                     safe_user_dict[k] = v
-        logger.info(
-            f"Current user details: {json.dumps(safe_user_dict, indent=2)}")
-
+        logger.info(f"Current user details: {json.dumps(safe_user_dict, indent=2)}")
+        
         # Verify state from database and get code_verifier
         stored_state_query = """
         SELECT 
@@ -319,18 +299,16 @@ async def linkedin_callback(
         AND platform = 'linkedin'
         AND expires_at > CURRENT_TIMESTAMP
         """
-
+        
         stored_state = await db.fetch_one(stored_state_query, {"state": state})
-
+        
         logger.info(f"Found state: {stored_state is not None}")
-
+        
         # Additional logging for debugging
         if stored_state:
             current_time = datetime.now(timezone.utc)
-            logger.info(
-                f"State expiration time: {stored_state['expires_at']}, Current time: {current_time}")
-            logger.info(
-                f"State created for user: {stored_state['user_id']}, Current user: {current_user.get('uid') or current_user.get('id')}")
+            logger.info(f"State expiration time: {stored_state['expires_at']}, Current time: {current_time}")
+            logger.info(f"State created for user: {stored_state['user_id']}, Current user: {current_user.get('uid') or current_user.get('id')}")
         else:
             # Try to find why the state is invalid
             all_states = await db.fetch_all(
@@ -340,40 +318,35 @@ async def linkedin_callback(
             )
             if all_states:
                 for s in all_states:
-                    logger.error(
-                        f"Found state but it may be expired or for wrong platform: {dict(s)}")
+                    logger.error(f"Found state but it may be expired or for wrong platform: {dict(s)}")
             else:
                 logger.error(f"No state record found with state={state}")
-
+        
         if not stored_state:
-            raise HTTPException(
-                status_code=400, detail="Invalid or expired state parameter")
-
+            raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
+            
         # Verify the user matches
         user_id = current_user.get('uid') or current_user.get('id')
         if stored_state["user_id"] != user_id:
-            logger.error(
-                f"User mismatch: {stored_state['user_id']} != {user_id}")
-            raise HTTPException(
-                status_code=400, detail="User mismatch in state verification")
-
+            logger.error(f"User mismatch: {stored_state['user_id']} != {user_id}")
+            raise HTTPException(status_code=400, detail="User mismatch in state verification")
+            
         # Get code_verifier from stored state
         code_verifier = stored_state["code_verifier"]
-
+        
         if not code_verifier:
             logger.error(f"No code_verifier found for state={state}")
-            raise HTTPException(
-                status_code=400, detail="Invalid OAuth state: missing code_verifier")
-
+            raise HTTPException(status_code=400, detail="Invalid OAuth state: missing code_verifier")
+            
         # Delete the state after use to prevent replay attacks
         await db.execute(
             "DELETE FROM mo_oauth_states WHERE state = :state",
             {"state": state}
         )
-
+        
         # Exchange code for access token using code_verifier for PKCE
         # LinkedIn's OAuth implementation is inconsistent - try standard form with exact data format
-
+        
         # Use x-www-form-urlencoded with properly formatted data
         token_request_data = {
             "grant_type": "authorization_code",
@@ -382,93 +355,85 @@ async def linkedin_callback(
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
         }
-
+        
         # Add code_verifier if it exists
         if code_verifier:
             token_request_data["code_verifier"] = code_verifier
-
+        
         # Detailed logging to help debug
         debug_data = token_request_data.copy()
         if "client_secret" in debug_data:
             debug_data["client_secret"] = "***REDACTED***"
         if "code" in debug_data:
-            debug_data["code"] = debug_data["code"][:10] + \
-                "..." if debug_data["code"] else None
+            debug_data["code"] = debug_data["code"][:10] + "..." if debug_data["code"] else None
         if "code_verifier" in debug_data:
-            debug_data["code_verifier"] = debug_data["code_verifier"][:5] + \
-                "..." if debug_data["code_verifier"] else None
-
+            debug_data["code_verifier"] = debug_data["code_verifier"][:5] + "..." if debug_data["code_verifier"] else None
+        
         logger.info(f"Token request data: {json.dumps(debug_data, indent=2)}")
-
+        
         # Ensure proper encoding and headers
         encoded_data = urlencode(token_request_data)
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json"
         }
-
+        
         # Log the exact URL and headers being used
         logger.info(f"Token endpoint: {ENDPOINTS['token']}")
         logger.info(f"Headers: {headers}")
-
+        
         # Use native requests without any extra modifications
         token_response = requests.post(
             ENDPOINTS["token"],
             data=encoded_data,
             headers=headers
         )
-
-        logger.debug(
-            f"Token exchange response status: {token_response.status_code}")
+        
+        logger.debug(f"Token exchange response status: {token_response.status_code}")
         logger.debug(f"Token exchange response: {token_response.text}")
-
+        
         if not token_response.ok:
             try:
-                error_data = token_response.json() if token_response.text else {
-                    "error": "Unknown error"}
-                error_msg = error_data.get(
-                    'error_description', error_data.get('error', 'Unknown error'))
+                error_data = token_response.json() if token_response.text else {"error": "Unknown error"}
+                error_msg = error_data.get('error_description', error_data.get('error', 'Unknown error'))
             except:
                 error_msg = token_response.text or "Unknown error"
-
+                
             logger.error(f"Token exchange error: {error_msg}")
             logger.error(f"Full error response: {token_response.text}")
             raise HTTPException(
                 status_code=token_response.status_code,
                 detail=f"LinkedIn API error: {error_msg}"
             )
-
+            
         token_data = token_response.json()
         headers = {"Authorization": f"Bearer {token_data['access_token']}"}
 
         # Get user profile
         profile_response = requests.get(ENDPOINTS["profile"], headers=headers)
         profile_data = profile_response.json()
-
+        
         # Get email
         email_response = requests.get(ENDPOINTS["email"], headers=headers)
         email_data = email_response.json()
 
         # Get organization data
-        org_response = requests.get(
-            ENDPOINTS["organizations"], headers=headers)
+        org_response = requests.get(ENDPOINTS["organizations"], headers=headers)
         org_data = org_response.json()
         logger.info(f"Organization Data: {json.dumps(org_data, indent=2)}")
 
         # Get detailed organization info
         org_details = []
         for org in org_data.get("elements", []):
-            org_id = org["organizationalTarget"].split(
-                ":")[-1]  # Extract ID from URN
+            org_id = org["organizationalTarget"].split(":")[-1]  # Extract ID from URN
             org_detail_response = requests.get(
                 ENDPOINTS["organization_details"].format(id=org_id),
                 headers=headers
             )
             if org_detail_response.ok:
                 org_details.append(org_detail_response.json())
-
-        logger.info(
-            f"Organization Details: {json.dumps(org_details, indent=2)}")
+        
+        logger.info(f"Organization Details: {json.dumps(org_details, indent=2)}")
 
         # Add these logging statements:
         logger.info("LinkedIn Authorization Response Data:")
@@ -476,8 +441,7 @@ async def linkedin_callback(
         logger.info(f"Profile Data: {json.dumps(profile_data, indent=2)}")
         logger.info(f"Email Data: {json.dumps(email_data, indent=2)}")
 
-        email = email_data.get("elements", [{}])[0].get(
-            "handle~", {}).get("emailAddress")
+        email = email_data.get("elements", [{}])[0].get("handle~", {}).get("emailAddress")
 
         logger.debug(f"Creating social account with data: {profile_data}")
 
@@ -488,7 +452,7 @@ async def linkedin_callback(
             if not user_id:
                 logger.error("User ID missing from current_user object")
                 raise HTTPException(status_code=400, detail="User ID missing")
-
+                
             social_account = SocialAccount(
                 user_id=user_id,
                 platform_account_id=profile_data["id"],
@@ -496,8 +460,7 @@ async def linkedin_callback(
                 profile_picture_url=None,
                 access_token=token_data["access_token"],
                 refresh_token=token_data.get("refresh_token"),
-                expires_at=datetime.utcnow() +
-                timedelta(seconds=token_data["expires_in"]),
+                expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"]),
                 metadata={
                     "firstName": profile_data["firstName"]["localized"]["en_US"],
                     "lastName": profile_data["lastName"]["localized"]["en_US"],
@@ -506,12 +469,10 @@ async def linkedin_callback(
                     "organization_details": org_details
                 }
             )
-            logger.debug(
-                f"Created social account object: {social_account.dict()}")
+            logger.debug(f"Created social account object: {social_account.dict()}")
         except Exception as e:
             logger.error(f"Error creating social account: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail=f"Failed to create social account: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to create social account: {str(e)}")
 
         # Try to get profile picture
         try:
@@ -531,23 +492,22 @@ async def linkedin_callback(
                         key=lambda x: x.get("data", {}).get("width", 0),
                         reverse=True
                     )
-                    social_account.profile_picture_url = picture_elements[
-                        0]["identifiers"][0]["identifier"]
+                    social_account.profile_picture_url = picture_elements[0]["identifiers"][0]["identifier"]
         except:
             pass
 
         # Upsert account in database
         account_data = social_account.dict(exclude={'id'})
-
+        
         # Convert datetime objects to strings for database operations
         for key, value in account_data.items():
             if isinstance(value, datetime):
                 account_data[key] = value.isoformat()
-
+        
         # Convert metadata to JSON string just before database operation
         if account_data.get('metadata'):
             account_data['metadata'] = json.dumps(account_data['metadata'])
-
+            
         logger.debug(f"Account data for database: {account_data}")
 
         query = """
@@ -645,12 +605,11 @@ async def share_post(
             "account_id": account_id,
             "user_id": current_user["id"]
         }
-
+        
         account = await db.fetch_one(query=query, values=values)
-
+        
         if not account:
-            raise HTTPException(
-                status_code=404, detail="LinkedIn account not found")
+            raise HTTPException(status_code=404, detail="LinkedIn account not found")
 
         headers = {
             "Authorization": f"Bearer {account['access_token']}",
@@ -677,22 +636,21 @@ async def share_post(
         # Set author based on whether it's an organization post
         if post.organization_id:
             # Verify user has permission to post as this organization
-            metadata = json.loads(
-                account['metadata']) if account['metadata'] else {}
+            metadata = json.loads(account['metadata']) if account['metadata'] else {}
             org_roles = metadata.get('organizations', [])
             has_permission = False
             for org_role in org_roles:
-                if (org_role['organizationalTarget'] == f"urn:li:organization:{post.organization_id}"
-                        and org_role['role'] in ['ADMINISTRATOR', 'OWNER']):
+                if (org_role['organizationalTarget'] == f"urn:li:organization:{post.organization_id}" 
+                    and org_role['role'] in ['ADMINISTRATOR', 'OWNER']):
                     has_permission = True
                     break
-
+            
             if not has_permission:
                 raise HTTPException(
                     status_code=403,
                     detail="You don't have permission to post as this organization"
                 )
-
+            
             post_data["author"] = f"urn:li:organization:{post.organization_id}"
         else:
             post_data["author"] = f"urn:li:person:{account['platform_account_id']}"
@@ -814,22 +772,20 @@ async def refresh_token_endpoint(
     try:
         data = await request.json()
         refresh_token = data.get("refresh_token")
-
+        
         if not refresh_token:
-            raise HTTPException(
-                status_code=400, detail="Refresh token is required")
-
+            raise HTTPException(status_code=400, detail="Refresh token is required")
+            
         # Get the user ID
         user_id = current_user.get('uid') or current_user.get('id')
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is missing")
-
+            
         # Get new tokens
         new_tokens = await get_new_tokens(refresh_token)
-
+        
         # Calculate expiration datetime
-        expires_at = datetime.utcnow(
-        ) + timedelta(seconds=new_tokens["expires_in"])
+        expires_at = datetime.utcnow() + timedelta(seconds=new_tokens["expires_in"])
 
         # Update DB
         try:
@@ -847,24 +803,21 @@ async def refresh_token_endpoint(
                 "expires_at": expires_at,
                 "user_id": user_id
             })
-
+            
             # Add expiration info to the response
             new_tokens["expires_at"] = expires_at.isoformat()
             return new_tokens
-
+            
         except Exception as db_error:
-            logger.error(
-                f"Database error during token refresh: {str(db_error)}")
-            raise HTTPException(
-                status_code=500, detail=f"Failed to update token in database: {str(db_error)}")
-
+            logger.error(f"Database error during token refresh: {str(db_error)}")
+            raise HTTPException(status_code=500, detail=f"Failed to update token in database: {str(db_error)}")
+            
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error refreshing token: {str(e)}")
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500, detail=f"Failed to refresh token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to refresh token: {str(e)}")
 
 
 async def get_new_tokens(refresh_token: str) -> dict:
@@ -882,18 +835,18 @@ async def get_new_tokens(refresh_token: str) -> dict:
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
         }
-
+        
         logger.debug(f"Refreshing token with data: {data}")
-
+        
         # Ensure proper encoding and headers
         encoded_data = urlencode(data)
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json"
         }
-
+        
         response = requests.post(
-            ENDPOINTS["token"],
+            ENDPOINTS["token"], 
             data=encoded_data,
             headers=headers
         )
@@ -901,11 +854,10 @@ async def get_new_tokens(refresh_token: str) -> dict:
         if not response.ok:
             try:
                 error_data = response.json()
-                error_msg = error_data.get(
-                    'error_description', error_data.get('error', 'Unknown error'))
+                error_msg = error_data.get('error_description', error_data.get('error', 'Unknown error'))
             except Exception:
                 error_msg = f"Error response: {response.status_code} - {response.text}"
-
+                
             logger.error(f"Token refresh error: {error_msg}")
             raise HTTPException(
                 status_code=response.status_code,
@@ -914,14 +866,12 @@ async def get_new_tokens(refresh_token: str) -> dict:
 
         token_data = response.json()
         logger.debug(f"Got new token data: {token_data}")
-
+        
         return {
             "access_token": token_data["access_token"],
             # LinkedIn might not always return new refresh token
-            # Use old token if no new one
-            "refresh_token": token_data.get("refresh_token", refresh_token),
-            # Default to 1 hour if not provided
-            "expires_in": token_data.get("expires_in", 3600)
+            "refresh_token": token_data.get("refresh_token", refresh_token),  # Use old token if no new one
+            "expires_in": token_data.get("expires_in", 3600)  # Default to 1 hour if not provided
         }
 
     except requests.RequestException as e:
@@ -938,7 +888,6 @@ async def get_new_tokens(refresh_token: str) -> dict:
             detail="Failed to refresh token"
         )
 
-
 @router.post("/disconnect/{account_id}")
 async def disconnect_account(
     account_id: UUID,
@@ -947,9 +896,8 @@ async def disconnect_account(
 ):
     """Disconnect a LinkedIn account"""
     try:
-        logger.debug(
-            f"Disconnecting LinkedIn account {account_id} for user {current_user['id']}")
-
+        logger.debug(f"Disconnecting LinkedIn account {account_id} for user {current_user['id']}")
+        
         # First, get the account to verify ownership and get access token
         account = await db.fetch_one(
             """
@@ -1009,7 +957,6 @@ async def disconnect_account(
             detail=f"Failed to disconnect LinkedIn account: {str(e)}"
         )
 
-
 @router.get("/user")
 async def get_user_accounts(
     current_user: dict = Depends(get_current_user),
@@ -1027,13 +974,13 @@ async def get_user_accounts(
         WHERE user_id = :user_id AND platform = 'linkedin'
         """
         accounts = await db.fetch_all(query, {"user_id": current_user["id"]})
-
+        
         # Convert accounts to list of SocialAccount models
         account_list = []
         for acc in accounts:
             # Parse metadata if it exists
             metadata = json.loads(acc["metadata"]) if acc["metadata"] else None
-
+            
             account = SocialAccount(
                 id=acc["id"],
                 user_id=acc["user_id"],
@@ -1061,8 +1008,6 @@ async def get_user_accounts(
         )
 
 # Add debugging endpoint to help troubleshoot LinkedIn OAuth issues
-
-
 @router.get("/debug-config")
 async def debug_linkedin_config():
     """Debug LinkedIn OAuth configuration"""
@@ -1078,27 +1023,26 @@ async def debug_linkedin_config():
             "token_endpoint": ENDPOINTS["token"],
             "auth_endpoint": ENDPOINTS["auth"],
         }
-
+        
         # Check if credentials start/end with whitespace (common error)
         if CLIENT_ID and (CLIENT_ID.strip() != CLIENT_ID):
             config["warning"] = "CLIENT_ID contains leading or trailing whitespace"
         if CLIENT_SECRET and (CLIENT_SECRET.strip() != CLIENT_SECRET):
             config["warning"] = "CLIENT_SECRET contains leading or trailing whitespace"
-
+            
         # Test connection to LinkedIn API
         try:
             # Simple test with invalid token to see if we can reach the API
             response = requests.get(
-                "https://api.linkedin.com/v2/me",
-                headers={
-                    "Authorization": "Bearer invalid_token_just_testing_connectivity"},
+                "https://api.linkedin.com/v2/me", 
+                headers={"Authorization": "Bearer invalid_token_just_testing_connectivity"},
                 timeout=5
             )
             config["api_connectivity"] = {
                 "status_code": response.status_code,
                 "reason": response.reason
             }
-
+            
             # Test a dummy token request with valid credentials (but invalid code)
             test_data = {
                 "grant_type": "authorization_code",
@@ -1107,44 +1051,43 @@ async def debug_linkedin_config():
                 "client_id": CLIENT_ID,
                 "client_secret": CLIENT_SECRET,
             }
-
+            
             # Redact secret for logging
             test_data_log = test_data.copy()
             test_data_log["client_secret"] = "***REDACTED***"
-            logger.info(
-                f"Test token request data: {json.dumps(test_data_log)}")
-
+            logger.info(f"Test token request data: {json.dumps(test_data_log)}")
+            
             # Encode data properly
             encoded_data = urlencode(test_data)
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json"
             }
-
+            
             token_response = requests.post(
                 ENDPOINTS["token"],
                 data=encoded_data,
                 headers=headers,
                 timeout=5
             )
-
+            
             config["token_endpoint_test"] = {
                 "status_code": token_response.status_code,
                 "reason": token_response.reason,
                 "body": token_response.text[:200] + "..." if len(token_response.text) > 200 else token_response.text
             }
-
+            
         except Exception as e:
             config["api_connectivity"] = {"error": str(e)}
-
+        
         # Check redirect URI format
         if REDIRECT_URI:
             if not REDIRECT_URI.startswith("https://"):
                 config["redirect_warning"] = "Redirect URI should use HTTPS"
-
+            
             if " " in REDIRECT_URI:
                 config["redirect_warning"] = "Redirect URI contains spaces"
-
+        
         return config
     except Exception as e:
         logger.error(f"Error in debug endpoint: {str(e)}")

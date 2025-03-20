@@ -107,7 +107,7 @@ SOCIAL_MEDIA_PATTERNS = [
     r"(?i)help\s+(me|with)\s+(my)?\s+social\s+media",
 ]
 
-def detect_intents(message: str) -> Dict[str, Dict[str, Any]]:
+def detect_intents(message: str) -> Dict[str, Any]:
     """
     Detect multiple intents from a user message.
     
@@ -170,17 +170,34 @@ def detect_intents(message: str) -> Dict[str, Dict[str, Any]]:
             "details": social_media_data
         }
     
-    # Always include general knowledge with lower confidence as fallback
-    if not intents:
-        intents["general_knowledge"] = {
-            "confidence": 1.0,
-            "query": message
-        }
+    # Calculate general knowledge confidence based on other intents
+    specialized_intents = list(intents.keys())
+    
+    # If we have specialized intents with high confidence, reduce general knowledge confidence
+    if specialized_intents:
+        # Check if specialized intents cover the message comprehensively
+        has_high_confidence = any(intents[intent]["confidence"] > 0.7 for intent in specialized_intents)
+        has_comprehensive_coverage = (("web_search" in intents or "local_search" in intents) and 
+                                     "social_media" in intents)
+        
+        if has_high_confidence and has_comprehensive_coverage:
+            # Low confidence when specialized intents cover the message well
+            general_knowledge_confidence = 0.2
+        elif has_high_confidence or has_comprehensive_coverage:
+            # Medium confidence when partial coverage
+            general_knowledge_confidence = 0.5
+        else:
+            # Higher confidence when specialized intents don't cover well
+            general_knowledge_confidence = 0.8
     else:
-        intents["general_knowledge"] = {
-            "confidence": 0.2,  # Low confidence as it's a fallback
-            "query": message
-        }
+        # Maximum confidence when no specialized intents
+        general_knowledge_confidence = 1.0
+    
+    # Add general knowledge with adjusted confidence
+    intents["general_knowledge"] = {
+        "confidence": general_knowledge_confidence,
+        "query": message
+    }
     
     return intents
 
