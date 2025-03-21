@@ -279,17 +279,30 @@ async def get_twitter_user(
 async def get_current_user_profile(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database),
-    authorization: str = Header(...)
+    authorization: str = Header(...),
+    x_twitter_token: Optional[str] = Header(None, alias="X-Twitter-Token")
 ):
     """Get current user's Twitter profile"""
     try:
-        if not authorization or not authorization.startswith('Bearer '):
+        # First try to get token from the X-Twitter-Token header
+        if x_twitter_token:
+            access_token = x_twitter_token
+        # Fall back to authorization header if needed (for backward compatibility)
+        elif authorization and authorization.startswith('Bearer '):
+            access_token = authorization.split(' ')[1]
+        else:
             raise HTTPException(
                 status_code=401,
-                detail="Missing or invalid authorization header"
+                detail="Missing Twitter token. Please provide X-Twitter-Token header."
             )
-
-        access_token = authorization.split(' ')[1]
+        
+        # Validate token before making API calls
+        is_valid = await check_token_validity(access_token)
+        if not is_valid:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired Twitter token"
+            )
 
         async with httpx.AsyncClient() as client:
             async def fetch_user_profile():
@@ -463,11 +476,29 @@ async def check_media_processing(
 @router.post("/media/upload", response_model=MediaUploadResponse)
 async def upload_media(
     file: UploadFile = File(...),
-    access_token: str = Form(...),
-    current_user: dict = Depends(get_current_user)
+    access_token: str = Form(None),  # Make this optional as we'll also check header
+    current_user: dict = Depends(get_current_user),
+    x_twitter_token: Optional[str] = Header(None, alias="X-Twitter-Token")
 ):
     """Upload media using chunked upload for Twitter"""
     try:
+        # Get access token from form or header
+        token = x_twitter_token or access_token
+        
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing Twitter token. Please provide X-Twitter-Token header or access_token in form data"
+            )
+            
+        # Validate token
+        is_valid = await check_token_validity(token)
+        if not is_valid:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired Twitter token"
+            )
+            
         # Validate file type
         content_type = file.content_type or mimetypes.guess_type(file.filename)[
             0]
@@ -513,7 +544,7 @@ async def upload_media(
             init_response = await client.post(
                 TWITTER_UPLOAD_API,
                 data=init_data,
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
 
             if init_response.status_code != 200:
@@ -547,7 +578,7 @@ async def upload_media(
                     TWITTER_UPLOAD_API,
                     data=append_data,
                     files=files,
-                    headers={"Authorization": f"Bearer {access_token}"}
+                    headers={"Authorization": f"Bearer {token}"}
                 )
 
                 if append_response.status_code != 200:
@@ -565,7 +596,7 @@ async def upload_media(
             finalize_response = await client.post(
                 TWITTER_UPLOAD_API,
                 data=finalize_data,
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
 
             if finalize_response.status_code != 200:
@@ -578,7 +609,7 @@ async def upload_media(
 
             # For videos, wait for processing
             if is_video and "processing_info" in result:
-                await check_media_processing(client, media_id, access_token)
+                await check_media_processing(client, media_id, token)
 
             return MediaUploadResponse(
                 media_id=media_id,
@@ -603,7 +634,7 @@ class TweetRequest(BaseModel):
     is_thread: Optional[bool] = Field(default=False)
     thread_texts: Optional[List[str]] = Field(default=[])
     reply_settings: Optional[str] = Field(default="mentionedUsers")
-    access_token: str
+    access_token: Optional[str] = None
 
     @field_validator('media_ids')
     def validate_media_ids(cls, v):
@@ -616,23 +647,29 @@ class TweetRequest(BaseModel):
 async def create_tweet(
     tweet_data: TweetRequest,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db: Database = Depends(get_database),
+    x_twitter_token: Optional[str] = Header(None, alias="X-Twitter-Token")
 ):
     """Create a new tweet with media support"""
     try:
-        # Validate access token first
+        # Get access token from request or header
+        access_token = x_twitter_token or tweet_data.access_token
+        
+        if not access_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing Twitter token. Please provide X-Twitter-Token header or access_token in body"
+            )
+            
+        # Validate access token
         try:
-            async with httpx.AsyncClient() as client:
-                auth_check = await client.get(
-                    f"{TWITTER_API_V2}/users/me",
-                    headers={"Authorization": f"Bearer {tweet_data.access_token}"}
+            is_valid = await check_token_validity(access_token)
+            if not is_valid:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or expired access token"
                 )
-                if auth_check.status_code != 200:
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Invalid or expired access token"
-                    )
-        except httpx.RequestError as e:
+        except Exception as e:
             logger.error(f"Token validation error: {str(e)}")
             raise HTTPException(
                 status_code=401,
@@ -661,7 +698,7 @@ async def create_tweet(
             response = await client.post(
                 f"{TWITTER_API_V2}/tweets",
                 headers={
-                    "Authorization": f"Bearer {tweet_data.access_token}",
+                    "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json"
                 },
                 json=payload
@@ -763,30 +800,13 @@ async def validate_token(
             except Exception as e:
                 logger.error(f"Token refresh failed: {str(e)}")
                 return {"valid": False, "error": "Token refresh failed"}
-
-        # Test the current token if not expired
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{TWITTER_API_V2}/users/me",
-                headers={"Authorization": f"Bearer {account['access_token']}"}
-            )
-
-            if response.status_code != 200 and account["refresh_token"]:
-                try:
-                    # Token invalid but we have refresh token, try refreshing
-                    refresh_result = await refresh_token(account_id, current_user, db)
-                    return {
-                        "valid": True,
-                        "access_token": refresh_result["access_token"]
-                    }
-                except Exception as e:
-                    logger.error(f"Token refresh failed: {str(e)}")
-                    return {"valid": False, "error": "Token refresh failed"}
-
-            return {
-                "valid": response.status_code == 200,
-                "access_token": account["access_token"] if response.status_code == 200 else None
-            }
+                
+        # If not expired, return the existing token without validating against Twitter API
+        # This avoids unnecessary API calls that could lead to rate limiting
+        return {
+            "valid": True, 
+            "access_token": account["access_token"]
+        }
 
     except Exception as e:
         logger.error(f"Error validating token: {str(e)}")
@@ -795,6 +815,7 @@ async def validate_token(
             "error": f"Token validation failed: {str(e)}"
         }
 
+
 def generate_code_challenge(code_verifier: str) -> str:
     """Generate PKCE code challenge from verifier"""
     import base64
@@ -802,6 +823,7 @@ def generate_code_challenge(code_verifier: str) -> str:
 
     sha256_hash = hashlib.sha256(code_verifier.encode()).digest()
     return base64.urlsafe_b64encode(sha256_hash).decode().rstrip("=")
+
 
 async def retry_with_backoff(func, max_retries=2, initial_delay=5):
     """Improved retry with better backoff strategy"""
@@ -839,6 +861,7 @@ async def retry_with_backoff(func, max_retries=2, initial_delay=5):
             continue
     
     raise last_error
+
 
 async def exchange_code(
     code: str,
@@ -886,6 +909,7 @@ async def exchange_code(
             status_code=503,
             detail=f"Error communicating with Twitter API: {str(e)}"
         )
+
 
 async def get_user_info(access_token: str) -> dict:
     async def fetch_user_info():
@@ -955,6 +979,7 @@ async def get_user_info(access_token: str) -> dict:
             status_code=503,
             detail="Failed to get user info. Please try again later."
         )
+
 
 async def store_tokens(user_info: dict, token_data: dict, db: Database, current_user_id: str):
     """Store tokens and user info in database"""
@@ -1060,8 +1085,20 @@ async def store_tokens(user_info: dict, token_data: dict, db: Database, current_
             detail=f"Failed to store tokens: {str(e)}"
         )
 
-# Add this before the user.me call
-async def validate_token(token: str) -> bool:
+
+# Helper function to check if a token is valid with Twitter's API
+async def check_token_validity(token: str) -> bool:
+    """Check if a token is still valid with Twitter's API
+    
+    This function calls Twitter's token_info endpoint to verify
+    if a token is still valid.
+    
+    Args:
+        token: The access token to check
+        
+    Returns:
+        bool: True if the token is valid, False otherwise
+    """
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
@@ -1074,6 +1111,7 @@ async def validate_token(token: str) -> bool:
         except Exception as e:
             logger.error(f"Token validation error: {e}")
             return False
+
 
 @router.post("/auth/refresh-token/{account_id}")
 async def refresh_token(
@@ -1182,6 +1220,3 @@ async def refresh_token(
             status_code=500,
             detail=f"Failed to refresh token: {str(e)}"
         )
-
-
-
