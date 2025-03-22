@@ -1,6 +1,5 @@
 """
-This is a fixed version of your LinkedIn router. Replace linkedin_router.py with this file.
-It includes all the OAuth fixes and a debug endpoint to help diagnose issues.
+LinkedIn router implementation aligned with official LinkedIn OAuth documentation.
 """
 
 from fastapi import APIRouter, HTTPException, Request, Depends
@@ -37,6 +36,10 @@ CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
+# Define the type of your LinkedIn app (affects OAuth flow)
+# Should be either "web" or "native" - based on your LinkedIn Developer Portal settings
+LINKEDIN_APP_TYPE = os.getenv("LINKEDIN_APP_TYPE", "web")  # Default to web application
+
 # Define redirect URIs for different environments
 REDIRECT_URIS = {
     "production": "https://www.multivio.com/linkedin/callback",
@@ -45,7 +48,7 @@ REDIRECT_URIS = {
 }
 
 # Get the appropriate redirect URI based on environment
-# Note: Make sure this exact URI is registered with LinkedIn
+# IMPORTANT: Use LINKEDIN_REDIRECT_URI env var, not REDIRECT_URI
 REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI", REDIRECT_URIS.get(
     ENVIRONMENT, REDIRECT_URIS["development"]))
 
@@ -53,6 +56,7 @@ logger.info(f"LinkedIn OAuth Configuration:")
 logger.info(f"Client ID: {CLIENT_ID[:5]}... (truncated)")
 logger.info(f"Redirect URI: {REDIRECT_URI}")
 logger.info(f"Environment: {ENVIRONMENT}")
+logger.info(f"App Type: {LINKEDIN_APP_TYPE}")
 
 # LinkedIn API endpoints
 API_BASE = "https://api.linkedin.com/v2"
@@ -103,8 +107,6 @@ REQUIRED_SCOPES = [
 ]
 
 # Add this enum class
-
-
 class SocialPlatform(str, Enum):
     LINKEDIN = "linkedin"
     FACEBOOK = "facebook"
@@ -115,13 +117,10 @@ class SocialPlatform(str, Enum):
     THREADS = "threads"
 
 # Models
-
-
 class TokenResponse(BaseModel):
     access_token: str
     expires_in: int
     refresh_token: Optional[str] = None
-
 
 class UserProfile(BaseModel):
     id: str
@@ -130,17 +129,14 @@ class UserProfile(BaseModel):
     profilePicture: Optional[str] = None
     email: Optional[str] = None
 
-
 class SharePost(BaseModel):
     text: str
     visibility: str = "PUBLIC"
     article_url: Optional[str] = None
     organization_id: Optional[str] = None
 
-
 class ArticleMetadata(BaseModel):
     url: str
-
 
 class OAuthState(BaseModel):
     state: str
@@ -149,7 +145,6 @@ class OAuthState(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime
     code_verifier: str = ""
-
 
 class SocialAccount(BaseModel):
     id: Optional[UUID] = None
@@ -165,16 +160,13 @@ class SocialAccount(BaseModel):
     media_type: Optional[str] = None
     media_count: Optional[int] = 0
 
-
 # State management for CSRF protection
 active_states = {}
-
 
 def generate_state():
     state = secrets.token_urlsafe(32)
     active_states[state] = time.time()
     return state
-
 
 def validate_state(state: str) -> bool:
     timestamp = active_states.get(state)
@@ -185,13 +177,12 @@ def validate_state(state: str) -> bool:
     active_states.clear()
     return (current_time - timestamp) < 3600
 
-
 @router.get("/auth/init")
 async def linkedin_auth(
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
-    """Initialize LinkedIn OAuth flow"""
+    """Initialize LinkedIn OAuth flow based on app type (web or native)"""
     try:
         # Get the user ID - depending on how it's set in the current_user dict
         user_id = current_user.get('uid') or current_user.get('id')
@@ -200,18 +191,35 @@ async def linkedin_auth(
         # Generate state for CSRF protection
         state = generate_state()
 
-        # Generate code verifier and challenge for PKCE
-        # Length should be between 43 and 128 characters - use 64 for good security
-        code_verifier = secrets.token_urlsafe(48)  # This gives about 64 chars
+        # Generate code verifier and challenge for PKCE - only used for native apps
+        code_verifier = None
+        code_challenge = None
+        
+        if LINKEDIN_APP_TYPE.lower() == "native":
+            # For native apps, PKCE is required
+            code_verifier = secrets.token_urlsafe(48)  # This gives about 64 chars
+            code_challenge_bytes = hashlib.sha256(code_verifier.encode()).digest()
+            code_challenge = base64.urlsafe_b64encode(
+                code_challenge_bytes).decode().rstrip("=")
+            logger.info("Using PKCE flow for native app")
+        else:
+            # For web apps, PKCE is not needed
+            logger.info("Using standard OAuth flow for web app")
 
-        # Generate code challenge with S256 method as recommended by OAuth2 standards
-        code_challenge_bytes = hashlib.sha256(code_verifier.encode()).digest()
-        code_challenge = base64.urlsafe_b64encode(
-            code_challenge_bytes).decode().rstrip("=")
-
-        # Store state and code_verifier in database
+        # Store state and optional code_verifier in database
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(minutes=10)
+        
+        # Prepare for database storage
+        insert_values = {
+            "state": state,
+            "platform": "linkedin",
+            "user_id": user_id,
+            "created_at": now,
+            "expires_at": expires_at,
+            "code_verifier": code_verifier or ""  # Store empty string if None
+        }
+        
         await db.execute(
             """
             INSERT INTO mo_oauth_states (
@@ -231,29 +239,26 @@ async def linkedin_auth(
                 :code_verifier
             )
             """,
-            {
-                "state": state,
-                "platform": "linkedin",
-                "user_id": user_id,
-                "created_at": now,
-                "expires_at": expires_at,
-                "code_verifier": code_verifier
-            }
+            insert_values
         )
 
-        # Construct auth URL with PKCE - ensure we use exactly the registered redirect URI
+        # Construct auth URL - add PKCE parameters only for native apps
         auth_params = {
             "response_type": "code",
             "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
             "state": state,
             "scope": " ".join(REQUIRED_SCOPES),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256"
         }
+        
+        # Add code challenge for native apps (PKCE flow)
+        if LINKEDIN_APP_TYPE.lower() == "native" and code_challenge:
+            auth_params.update({
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256"
+            })
 
-        logger.info(
-            f"Authorization parameters: {json.dumps(auth_params, indent=2)}")
+        logger.info(f"Authorization parameters: {json.dumps(auth_params, indent=2)}")
 
         auth_url = f"{ENDPOINTS['auth']}?{urlencode(auth_params)}"
         logger.debug(f"Generated LinkedIn auth URL: {auth_url}")
@@ -269,7 +274,6 @@ async def linkedin_auth(
             status_code=500,
             detail="Failed to initialize LinkedIn authentication"
         )
-
 
 @router.post("/auth/callback")
 async def linkedin_callback(
@@ -293,17 +297,6 @@ async def linkedin_callback(
             f"Received callback with code: {code[:10] if code else None}... (length: {len(code) if code else 0}) and state: {state}")
         logger.info(
             f"Current user ID: {current_user.get('uid') or current_user.get('id')}")
-
-        # Safely convert current_user to JSON-serializable dict
-        safe_user_dict = {}
-        for k, v in current_user.items():
-            if k != 'access_token':
-                if isinstance(v, datetime):
-                    safe_user_dict[k] = v.isoformat()
-                else:
-                    safe_user_dict[k] = v
-        logger.info(
-            f"Current user details: {json.dumps(safe_user_dict, indent=2)}")
 
         # Verify state from database and get code_verifier
         stored_state_query = """
@@ -360,112 +353,254 @@ async def linkedin_callback(
         # Get code_verifier from stored state
         code_verifier = stored_state["code_verifier"]
 
-        if not code_verifier:
-            logger.error(f"No code_verifier found for state={state}")
-            raise HTTPException(
-                status_code=400, detail="Invalid OAuth state: missing code_verifier")
+        # Clean up credentials to remove whitespace
+        clean_client_id = CLIENT_ID.strip() if CLIENT_ID else ""
+        clean_client_secret = CLIENT_SECRET.strip() if CLIENT_SECRET else ""
 
-        # Delete the state after use to prevent replay attacks
-        await db.execute(
-            "DELETE FROM mo_oauth_states WHERE state = :state",
-            {"state": state}
-        )
-
-        # Exchange code for access token using code_verifier for PKCE
-        # LinkedIn's OAuth implementation is inconsistent - try standard form with exact data format
-
-        # Use x-www-form-urlencoded with properly formatted data
-        token_request_data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET
-        }
-
-        # Add code_verifier if it exists
-        if code_verifier:
-            token_request_data["code_verifier"] = code_verifier
-
-        # Detailed logging to help debug
-        debug_data = token_request_data.copy()
-        if "client_secret" in debug_data:
+        # Add detailed logging for troubleshooting
+        logger.info(f"Token exchange parameters:")
+        logger.info(f"- Client ID: {clean_client_id[:5]}... (length: {len(clean_client_id)})")
+        logger.info(f"- Client Secret length: {len(clean_client_secret)}")
+        logger.info(f"- Redirect URI: {REDIRECT_URI}")
+        logger.info(f"- Code length: {len(code)}")
+        logger.info(f"- Code verifier length: {len(code_verifier) if code_verifier else 0}")
+        logger.info(f"- App type: {LINKEDIN_APP_TYPE}")
+        
+        # Choose the appropriate token request based on app type
+        token_response = None
+        
+        if LINKEDIN_APP_TYPE.lower() == "web":
+            # For web app - use client_id and client_secret in body (no PKCE)
+            logger.info("Using web app OAuth flow with client credentials in body")
+            token_request_data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": clean_client_id,
+                "client_secret": clean_client_secret,
+            }
+            
+            # Debug data for logging (hide secret)
+            debug_data = token_request_data.copy()
             debug_data["client_secret"] = "***REDACTED***"
-        if "code" in debug_data:
-            debug_data["code"] = debug_data["code"][:10] + \
-                "..." if debug_data["code"] else None
-        if "code_verifier" in debug_data:
-            debug_data["code_verifier"] = debug_data["code_verifier"][:5] + \
-                "..." if debug_data["code_verifier"] else None
-
-        logger.info(f"Token request data: {json.dumps(debug_data, indent=2)}")
-
-        # Ensure proper encoding and headers
-        encoded_data = urlencode(token_request_data)
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json"
-        }
-
-        # Log the exact URL and headers being used
-        logger.info(f"Token endpoint: {ENDPOINTS['token']}")
-        logger.info(f"Headers: {headers}")
-
-        # Use native requests without any extra modifications
-        token_response = requests.post(
-            ENDPOINTS["token"],
-            data=encoded_data,
-            headers=headers
-        )
-
-        logger.debug(
-            f"Token exchange response status: {token_response.status_code}")
-        logger.debug(f"Token exchange response: {token_response.text}")
-
-        if not token_response.ok:
+            logger.info(f"Token request data: {json.dumps(debug_data, indent=2)}")
+            
+            # Make the request
+            token_response = requests.post(
+                ENDPOINTS["token"],
+                data=urlencode(token_request_data),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json"
+                },
+                timeout=10
+            )
+            
+        else:  # Native app
+            # For native app - use PKCE flow without client_secret
+            logger.info("Using native app OAuth flow with PKCE")
+            
+            if not code_verifier:
+                logger.error("Missing code_verifier for PKCE flow")
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid OAuth state: missing code_verifier for PKCE flow"
+                )
+                
+            token_request_data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": clean_client_id,
+                "code_verifier": code_verifier
+            }
+            
+            logger.info(f"Token request data: {json.dumps(token_request_data, indent=2)}")
+            
+            # Make the request
+            token_response = requests.post(
+                ENDPOINTS["token"],
+                data=urlencode(token_request_data),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json"
+                },
+                timeout=10
+            )
+        
+        # If primary flow fails, try fallback options
+        if not token_response or not token_response.ok:
+            logger.warning(f"Primary authentication flow failed: {token_response.status_code if token_response else 'No response'}")
+            logger.warning(f"Response content: {token_response.text if token_response else 'None'}")
+            
+            # Fallback strategies
+            fallback_strategies = []
+            
+            if LINKEDIN_APP_TYPE.lower() == "web":
+                # For web app fallbacks:
+                # 1. Try with Basic Auth header
+                fallback_strategies.append({
+                    "name": "Web app with Basic Auth",
+                    "data": {
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                    },
+                    "auth": requests.auth.HTTPBasicAuth(clean_client_id, clean_client_secret)
+                })
+                
+                # 2. Try without PKCE 
+                fallback_strategies.append({
+                    "name": "Web app without PKCE (alt format)",
+                    "data": {
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                        "client_id": clean_client_id,
+                        "client_secret": clean_client_secret,
+                    },
+                    "auth": None
+                })
+            else:
+                # For native app fallbacks:
+                # 1. Try with client_secret (not recommended by LinkedIn but might work)
+                fallback_strategies.append({
+                    "name": "Native app with client secret (non-standard)",
+                    "data": {
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                        "client_id": clean_client_id,
+                        "client_secret": clean_client_secret,
+                        "code_verifier": code_verifier
+                    },
+                    "auth": None
+                })
+                
+                # 2. Try without code_verifier
+                fallback_strategies.append({
+                    "name": "Native app without code_verifier (non-standard)",
+                    "data": {
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                        "client_id": clean_client_id,
+                    },
+                    "auth": None
+                })
+            
+            # Try each fallback strategy
+            for strategy in fallback_strategies:
+                logger.info(f"Trying fallback: {strategy['name']}")
+                
+                # Debug log without exposing secrets
+                debug_data = strategy['data'].copy()
+                if "client_secret" in debug_data:
+                    debug_data["client_secret"] = "***REDACTED***"
+                logger.info(f"Fallback request data: {json.dumps(debug_data, indent=2)}")
+                
+                try:
+                    fallback_response = requests.post(
+                        ENDPOINTS["token"],
+                        data=urlencode(strategy['data']),
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json"
+                        },
+                        auth=strategy['auth'],
+                        timeout=10
+                    )
+                    
+                    logger.info(f"Fallback {strategy['name']} response: {fallback_response.status_code}")
+                    logger.info(f"Response content: {fallback_response.text[:200]}")
+                    
+                    if fallback_response.ok:
+                        token_response = fallback_response
+                        logger.info(f"Fallback {strategy['name']} succeeded!")
+                        break
+                except Exception as e:
+                    logger.error(f"Error in fallback {strategy['name']}: {str(e)}")
+        
+        # Final result handling
+        if not token_response or not token_response.ok:
             try:
-                error_data = token_response.json() if token_response.text else {
-                    "error": "Unknown error"}
-                error_msg = error_data.get(
-                    'error_description', error_data.get('error', 'Unknown error'))
+                error_data = token_response.json() if token_response and token_response.text else {"error": "Unknown error"}
+                error_msg = error_data.get('error_description', error_data.get('error', 'Unknown error'))
             except:
-                error_msg = token_response.text or "Unknown error"
+                error_msg = token_response.text if token_response else "No response from LinkedIn"
 
             logger.error(f"Token exchange error: {error_msg}")
-            logger.error(f"Full error response: {token_response.text}")
+            
+            # Add some LinkedIn-specific error interpretation
+            if token_response and "invalid_client" in token_response.text:
+                logger.error("LinkedIn 'invalid_client' error typically means:")
+                logger.error("1. Client ID or client secret is incorrect")
+                logger.error("2. Client ID might not be recognized by LinkedIn")
+                logger.error("3. Application might be disabled or restricted")
+                logger.error("4. App type setting might be incorrect (web vs native)")
+                logger.error("Check your LinkedIn Developer portal settings")
+            
+            status_code = token_response.status_code if token_response else 500
             raise HTTPException(
-                status_code=token_response.status_code,
+                status_code=status_code,
                 detail=f"LinkedIn API error: {error_msg}"
             )
 
         token_data = token_response.json()
+        
+        # Now it's safe to delete the state since authentication succeeded
+        await db.execute(
+            "DELETE FROM mo_oauth_states WHERE state = :state",
+            {"state": state}
+        )
+        
         headers = {"Authorization": f"Bearer {token_data['access_token']}"}
 
         # Get user profile
         profile_response = requests.get(ENDPOINTS["profile"], headers=headers)
+        if not profile_response.ok:
+            logger.error(f"Failed to get profile data: {profile_response.text}")
+            raise HTTPException(
+                status_code=401,
+                detail=f"LinkedIn API error: Failed to get profile data"
+            )
+            
         profile_data = profile_response.json()
+        
+        # Check if profile data has the required fields
+        if not profile_data.get("id"):
+            logger.error("Profile data doesn't contain user ID")
+            logger.error(f"Profile data: {json.dumps(profile_data, indent=2)}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid profile data received from LinkedIn"
+            )
 
         # Get email
         email_response = requests.get(ENDPOINTS["email"], headers=headers)
-        email_data = email_response.json()
+        email_data = email_response.json() if email_response.ok else {"elements": []}
 
         # Get organization data
         org_response = requests.get(
             ENDPOINTS["organizations"], headers=headers)
-        org_data = org_response.json()
+        org_data = org_response.json() if org_response.ok else {"elements": []}
         logger.info(f"Organization Data: {json.dumps(org_data, indent=2)}")
 
         # Get detailed organization info
         org_details = []
-        for org in org_data.get("elements", []):
-            org_id = org["organizationalTarget"].split(
-                ":")[-1]  # Extract ID from URN
-            org_detail_response = requests.get(
-                ENDPOINTS["organization_details"].format(id=org_id),
-                headers=headers
-            )
-            if org_detail_response.ok:
-                org_details.append(org_detail_response.json())
+        if org_response.ok and "elements" in org_data:
+            for org in org_data.get("elements", []):
+                if "organizationalTarget" not in org:
+                    continue
+                    
+                org_id = org["organizationalTarget"].split(
+                    ":")[-1]  # Extract ID from URN
+                org_detail_response = requests.get(
+                    ENDPOINTS["organization_details"].format(id=org_id),
+                    headers=headers
+                )
+                if org_detail_response.ok:
+                    org_details.append(org_detail_response.json())
 
         logger.info(
             f"Organization Details: {json.dumps(org_details, indent=2)}")
@@ -476,8 +611,12 @@ async def linkedin_callback(
         logger.info(f"Profile Data: {json.dumps(profile_data, indent=2)}")
         logger.info(f"Email Data: {json.dumps(email_data, indent=2)}")
 
-        email = email_data.get("elements", [{}])[0].get(
-            "handle~", {}).get("emailAddress")
+        # Safely extract email (with error handling)
+        try:
+            email = email_data.get("elements", [{}])[0].get(
+                "handle~", {}).get("emailAddress")
+        except (IndexError, KeyError):
+            email = None
 
         logger.debug(f"Creating social account with data: {profile_data}")
 
@@ -489,18 +628,43 @@ async def linkedin_callback(
                 logger.error("User ID missing from current_user object")
                 raise HTTPException(status_code=400, detail="User ID missing")
 
+            # Safely extract first name and last name with fallbacks
+            first_name = "Unknown"
+            last_name = "User"
+            
+            try:
+                first_name = profile_data.get("firstName", {}).get("localized", {}).get("en_US", "Unknown")
+                last_name = profile_data.get("lastName", {}).get("localized", {}).get("en_US", "User")
+            except (KeyError, AttributeError, TypeError) as e:
+                logger.warning(f"Error extracting name data: {str(e)}")
+                # If detailed localized name info isn't available, try simpler fallbacks
+                if isinstance(profile_data.get("firstName"), str):
+                    first_name = profile_data.get("firstName")
+                if isinstance(profile_data.get("lastName"), str):
+                    last_name = profile_data.get("lastName")
+            
+            username = f"{first_name} {last_name}"
+            
+            # Extract LinkedIn ID safely
+            linkedin_id = profile_data.get("id")
+            if not linkedin_id:
+                raise ValueError("LinkedIn profile ID is missing")
+
+            # Current time and expiration time for the token
+            now = datetime.now(timezone.utc)
+            expires_at = now + timedelta(seconds=token_data.get("expires_in", 3600))
+
             social_account = SocialAccount(
                 user_id=user_id,
-                platform_account_id=profile_data["id"],
-                username=f"{profile_data['firstName']['localized']['en_US']} {profile_data['lastName']['localized']['en_US']}",
+                platform_account_id=linkedin_id,
+                username=username,
                 profile_picture_url=None,
                 access_token=token_data["access_token"],
                 refresh_token=token_data.get("refresh_token"),
-                expires_at=datetime.utcnow() +
-                timedelta(seconds=token_data["expires_in"]),
+                expires_at=expires_at,
                 metadata={
-                    "firstName": profile_data["firstName"]["localized"]["en_US"],
-                    "lastName": profile_data["lastName"]["localized"]["en_US"],
+                    "firstName": first_name,
+                    "lastName": last_name,
                     "email": email,
                     "organizations": org_data.get("elements", []),
                     "organization_details": org_details
@@ -510,6 +674,7 @@ async def linkedin_callback(
                 f"Created social account object: {social_account.dict()}")
         except Exception as e:
             logger.error(f"Error creating social account: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise HTTPException(
                 status_code=500, detail=f"Failed to create social account: {str(e)}")
 
@@ -533,22 +698,20 @@ async def linkedin_callback(
                     )
                     social_account.profile_picture_url = picture_elements[
                         0]["identifiers"][0]["identifier"]
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Error getting profile picture: {str(e)}")
+            # Continue without profile picture if there's an error
 
         # Upsert account in database
         account_data = social_account.dict(exclude={'id'})
-
-        # Convert datetime objects to strings for database operations
-        for key, value in account_data.items():
-            if isinstance(value, datetime):
-                account_data[key] = value.isoformat()
 
         # Convert metadata to JSON string just before database operation
         if account_data.get('metadata'):
             account_data['metadata'] = json.dumps(account_data['metadata'])
 
-        logger.debug(f"Account data for database: {account_data}")
+        # Log the exact type of expires_at to help debug
+        logger.info(f"Type of expires_at: {type(account_data.get('expires_at'))}")
+        logger.info(f"Value of expires_at: {account_data.get('expires_at')}")
 
         query = """
         INSERT INTO mo_social_accounts (
@@ -605,9 +768,6 @@ async def linkedin_callback(
 
         # Update the social_account with the returned data
         social_account.id = created_account["id"]
-
-        # State has already been cleaned up earlier after verification
-        # No need to delete again
 
         # Make sure to serialize datetime objects in the response
         response_dict = social_account.dict()
@@ -1075,6 +1235,7 @@ async def debug_linkedin_config():
             "client_secret_length": len(CLIENT_SECRET) if CLIENT_SECRET else 0,
             "redirect_uri": REDIRECT_URI,
             "environment": ENVIRONMENT,
+            "app_type": LINKEDIN_APP_TYPE,
             "token_endpoint": ENDPOINTS["token"],
             "auth_endpoint": ENDPOINTS["auth"],
         }
@@ -1146,6 +1307,178 @@ async def debug_linkedin_config():
                 config["redirect_warning"] = "Redirect URI contains spaces"
 
         return config
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {"error": str(e)}
+
+
+@router.get("/debug-credentials")
+async def debug_linkedin_credentials():
+    """Comprehensive debug tool for LinkedIn OAuth issues"""
+    try:
+        # Test without exposing sensitive data
+        clean_client_id = CLIENT_ID.strip() if CLIENT_ID else ""
+        clean_client_secret = CLIENT_SECRET.strip() if CLIENT_SECRET else ""
+        
+        debug_info = {
+            "credentials": {
+                "client_id_first_chars": clean_client_id[:5] + "..." if clean_client_id else None,
+                "client_id_length": len(clean_client_id),
+                "client_secret_first_chars": clean_client_secret[:3] + "..." if clean_client_secret else None,
+                "client_secret_length": len(clean_client_secret),
+                "contains_whitespace": {
+                    "client_id": clean_client_id != CLIENT_ID if CLIENT_ID else False,
+                    "client_secret": clean_client_secret != CLIENT_SECRET if CLIENT_SECRET else False,
+                }
+            },
+            "app_config": {
+                "app_type": LINKEDIN_APP_TYPE,
+                "recommended_flow": "Standard OAuth" if LINKEDIN_APP_TYPE.lower() == "web" else "PKCE flow"
+            },
+            "redirect_uri": {
+                "value": REDIRECT_URI,
+                "starts_with_https": REDIRECT_URI.startswith("https://") if REDIRECT_URI else False,
+                "contains_spaces": " " in REDIRECT_URI if REDIRECT_URI else False,
+                "possible_issues": []
+            },
+            "environment": {
+                "current": ENVIRONMENT,
+                "valid_environments": list(REDIRECT_URIS.keys())
+            },
+            "test_connections": {}
+        }
+        
+        # Check for common redirect URI issues
+        if REDIRECT_URI:
+            if not REDIRECT_URI.startswith("https://"):
+                debug_info["redirect_uri"]["possible_issues"].append(
+                    "LinkedIn OAuth usually requires HTTPS for redirect URIs"
+                )
+            if " " in REDIRECT_URI:
+                debug_info["redirect_uri"]["possible_issues"].append(
+                    "Redirect URI contains spaces, which will cause encoding issues"
+                )
+            if REDIRECT_URI.endswith("/"):
+                debug_info["redirect_uri"]["possible_issues"].append(
+                    "Trailing slash in redirect URI - must match exactly with LinkedIn settings"
+                )
+
+        # Test connectivity to LinkedIn API endpoints
+        try:
+            # Test authorization endpoint
+            auth_response = requests.head(
+                ENDPOINTS["auth"],
+                timeout=5,
+                allow_redirects=False
+            )
+            debug_info["test_connections"]["auth_endpoint"] = {
+                "url": ENDPOINTS["auth"],
+                "status_code": auth_response.status_code,
+                "response_time_ms": auth_response.elapsed.total_seconds() * 1000
+            }
+            
+            # Test token endpoint
+            token_response = requests.head(
+                ENDPOINTS["token"],
+                timeout=5,
+                allow_redirects=False
+            )
+            debug_info["test_connections"]["token_endpoint"] = {
+                "url": ENDPOINTS["token"],
+                "status_code": token_response.status_code,
+                "response_time_ms": token_response.elapsed.total_seconds() * 1000
+            }
+            
+            # Test invalid client credentials request
+            # This should fail with 401, but will show if we can reach the endpoint
+            test_body = {
+                "grant_type": "client_credentials",
+                "client_id": "test_client_id",
+                "client_secret": "test_client_secret"
+            }
+            test_headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
+            }
+            test_response = requests.post(
+                ENDPOINTS["token"],
+                data=urlencode(test_body),
+                headers=test_headers,
+                timeout=5
+            )
+            debug_info["test_connections"]["invalid_credentials_test"] = {
+                "status_code": test_response.status_code,
+                "response_body": test_response.text[:200] + "..." if len(test_response.text) > 200 else test_response.text,
+                "expected_error": "invalid_client",
+                "contains_expected_error": "invalid_client" in test_response.text
+            }
+            
+            # Now try with actual client id but fake secret
+            # This helps verify if our client ID is recognized by LinkedIn
+            test_body = {
+                "grant_type": "client_credentials",
+                "client_id": clean_client_id,
+                "client_secret": "fake_secret_for_testing"
+            }
+            test_response = requests.post(
+                ENDPOINTS["token"],
+                data=urlencode(test_body),
+                headers=test_headers,
+                timeout=5
+            )
+            debug_info["test_connections"]["real_client_id_test"] = {
+                "status_code": test_response.status_code,
+                "response_body": test_response.text[:200] + "..." if len(test_response.text) > 200 else test_response.text,
+                "contains_invalid_client": "invalid_client" in test_response.text
+            }
+            
+        except Exception as e:
+            debug_info["test_connections"]["error"] = str(e)
+        
+        # Add recommendations based on debug info
+        debug_info["recommendations"] = []
+        
+        # App type recommendations
+        if LINKEDIN_APP_TYPE.lower() not in ["web", "native"]:
+            debug_info["recommendations"].append(
+                "LINKEDIN_APP_TYPE should be set to either 'web' or 'native' based on your LinkedIn app configuration."
+            )
+        
+        # Client ID/Secret recommendations
+        if debug_info["credentials"]["client_id_length"] == 0:
+            debug_info["recommendations"].append(
+                "CLIENT_ID is missing. Check your environment variables."
+            )
+        elif debug_info["credentials"]["client_id_length"] < 10:
+            debug_info["recommendations"].append(
+                "CLIENT_ID seems too short. Verify it's correct in the LinkedIn Developer portal."
+            )
+            
+        if debug_info["credentials"]["client_secret_length"] == 0:
+            debug_info["recommendations"].append(
+                "CLIENT_SECRET is missing. Check your environment variables."
+            )
+        
+        if debug_info["credentials"]["contains_whitespace"]["client_id"]:
+            debug_info["recommendations"].append(
+                "CLIENT_ID contains whitespace. Remove any leading/trailing spaces."
+            )
+            
+        if debug_info["credentials"]["contains_whitespace"]["client_secret"]:
+            debug_info["recommendations"].append(
+                "CLIENT_SECRET contains whitespace. Remove any leading/trailing spaces."
+            )
+        
+        # Add test result recommendations
+        if "real_client_id_test" in debug_info["test_connections"]:
+            test_result = debug_info["test_connections"]["real_client_id_test"]
+            if not test_result["contains_invalid_client"]:
+                debug_info["recommendations"].append(
+                    "LinkedIn doesn't recognize your client ID. Double-check it in the LinkedIn Developer portal."
+                )
+        
+        return debug_info
     except Exception as e:
         logger.error(f"Error in debug endpoint: {str(e)}")
         logger.error(traceback.format_exc())
