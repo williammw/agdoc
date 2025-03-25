@@ -452,41 +452,68 @@ async def get_video_status(
         print(f"Status check error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.post("/disconnect")
+@router.post("/auth/disconnect")
 async def disconnect_youtube(
     request: DisconnectRequest,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
     try:
-        # Get credentials to revoke
-        credentials = await get_youtube_credentials(db, current_user["id"], request.account_id)
+        print(f"Attempting to disconnect YouTube account: {request.account_id} for user: {current_user['id']}")
         
-        # Revoke access
-        if credentials.refresh_token:
-            requests.post('https://oauth2.googleapis.com/revoke',
-                params={'token': credentials.refresh_token},
-                headers={'content-type': 'application/x-www-form-urlencoded'})
+        # First check if the account exists
+        check_query = """
+            SELECT access_token, refresh_token, platform_account_id 
+            FROM mo_social_accounts 
+            WHERE user_id = :user_id 
+            AND platform = 'youtube' 
+            AND (platform_account_id = :account_id OR id::text = :account_id)
+        """
+        account = await db.fetch_one(
+            query=check_query,
+            values={
+                "user_id": current_user["id"],
+                "account_id": request.account_id
+            }
+        )
+        
+        if not account:
+            print(f"YouTube account not found: {request.account_id}")
+            return {"status": "success", "message": "Account already disconnected"}
+            
+        # Revoke access if we have a refresh token
+        if account["refresh_token"]:
+            try:
+                requests.post('https://oauth2.googleapis.com/revoke',
+                    params={'token': account["refresh_token"]},
+                    headers={'content-type': 'application/x-www-form-urlencoded'})
+                print(f"Successfully revoked token for account: {account['platform_account_id']}")
+            except Exception as token_error:
+                print(f"Error revoking token: {str(token_error)}")
+                # Continue with database removal even if token revocation fails
 
         # Remove from database
         query = """
             DELETE FROM mo_social_accounts
             WHERE user_id = :user_id
             AND platform = 'youtube'
-            AND platform_account_id = :account_id
+            AND (platform_account_id = :account_id OR id::text = :account_id)
         """
-        await db.execute(
+        deletion_result = await db.execute(
             query=query,
             values={
                 "user_id": current_user["id"],
                 "account_id": request.account_id
             }
         )
+        print(f"Deletion result: {deletion_result}")
 
         return {"status": "success", "message": "Account disconnected successfully"}
     except Exception as e:
         print(f"Disconnect error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Failed to disconnect YouTube account: {str(e)}")
 
 @router.post("/post")
 async def create_post(
@@ -507,7 +534,7 @@ async def get_user_accounts(
     try:
         query = """
             SELECT platform_account_id as id, username, profile_picture_url, metadata,
-                   created_at, updated_at, media_type, media_count
+            created_at, updated_at, media_type, media_count
             FROM mo_social_accounts 
             WHERE user_id = :user_id 
             AND platform = 'youtube'

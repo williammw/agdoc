@@ -1,7 +1,28 @@
 from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router
 # Add this import
-from app.routers.multivio import grok_router, linkedin_router, media_router, twitter_router, userinfo_router, content_router, facebook_router, instagram_router, threads_router, youtube_router, folders_router, recycle_router, together_router, smart_router, general_router, brave_search_router, direct_search_router, websearch_router, puppeteer_router, pipeline_router
+# Import individual router modules from multivio directory
+from app.routers.multivio.grok_router import router as grok_router
+from app.routers.multivio.linkedin_router import router as linkedin_router
+from app.routers.multivio.media_router import router as media_router
+from app.routers.multivio.twitter_router import router as twitter_router
+from app.routers.multivio.userinfo_router import router as userinfo_router
+from app.routers.multivio.content_router import router as content_router
+from app.routers.multivio.facebook_router import router as facebook_router
+from app.routers.multivio.instagram_router import router as instagram_router
+from app.routers.multivio.threads_router import router as threads_router
+from app.routers.multivio.youtube_router import router as youtube_router
+from app.routers.multivio.folders_router import router as folders_router
+from app.routers.multivio.recycle_router import router as recycle_router
+from app.routers.multivio.together_router import router as together_router
+from app.routers.multivio.smart_router import router as smart_router
+from app.routers.multivio.general_router import router as general_router
+from app.routers.multivio.brave_search_router import router as brave_search_router
+from app.routers.multivio.direct_search_router import router as direct_search_router
+from app.routers.multivio.websearch_router import router as websearch_router
+from app.routers.multivio.puppeteer_router import router as puppeteer_router
+from app.routers.multivio.pipeline_router import router as pipeline_router
+from app.routers.multivio.patreon_router import router as patreon_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
@@ -25,6 +46,9 @@ load_dotenv()
 # Check for required API keys
 required_keys = {
     "BRAVE_API_KEY": "Brave Web Search - required for web search functionality",
+    "PATREON_CLIENT_ID": "Patreon OAuth - required for Patreon integration",
+    "PATREON_CLIENT_SECRET": "Patreon OAuth - required for Patreon integration",
+    "PATREON_REDIRECT_URI": "Patreon OAuth - required for Patreon integration"
     # Add other required keys here as needed
 }
 
@@ -94,30 +118,30 @@ router_list = [
     (posts_router.router, "/api/v1/posts", ["posts"]),
     (comment_router.router, "/api/v1/comments", ["comments"]),
     (videos_router.router, "/api/v1/videos", ["videos"]),
-    (grok_router.router, "/api/v1/grok", ["grok"]),
+    (grok_router, "/api/v1/grok", ["grok"]),
     (openai_router.router, "/api/v1/openai", ["openai"]),
     (ws_router.router, "/api/v1/ws", ["websocket"]),
-    (twitter_router.router, "/api/v1/twitter", ["twitter"]),
-    (linkedin_router.router, "/api/v1/linkedin", ["linkedin"]),
-    (youtube_router.router, "/api/v1/youtube", ["youtube"]),
+    (twitter_router, "/api/v1/twitter", ["twitter"]),
+    (linkedin_router, "/api/v1/linkedin", ["linkedin"]),
+    (youtube_router, "/api/v1/youtube", ["youtube"]),
     # Add the new user info router
-    (userinfo_router.router, "/api/v1/multivio/user-info", ["userinfo"]),
-    (content_router.router, "/api/v1/content", ["content"]),
-    (facebook_router.router, "/api/v1/facebook", ["facebook"]),
-    (instagram_router.router, "/api/v1/instagram", ["instagram"]),
-    (recycle_router.router, "/api/v1/recycle", ["recycle"]),
-    (folders_router.router, "/api/v1/folders", ["folders"]),
-    (media_router.router, "/api/v1/media", ["media"]),
-    (threads_router.router, "/api/v1/threads", ["threads"]),
-    (together_router.router, "/api/v1/together", ["together"]),
-    (smart_router.router, "/api/v1/smart", ["smart"]),
-    (general_router.router, "/api/v1/general", ["general"]),
-    (brave_search_router.router, "/api/v1/brave-search", ["brave_search"]),
-    (direct_search_router.router, "/api/v1/direct-search", ["direct_search"]),
-    (websearch_router.router, "/api/v1/websearch", ["websearch"]),
-    (puppeteer_router.router, "/api/v1/puppeteer", ["puppeteer"]),
-    (pipeline_router.router, "/api/v1/pipeline", ["pipeline"]),
-    
+    (userinfo_router, "/api/v1/multivio/user-info", ["userinfo"]),
+    (content_router, "/api/v1/content", ["content"]),
+    (facebook_router, "/api/v1/facebook", ["facebook"]),
+    (instagram_router, "/api/v1/instagram", ["instagram"]),
+    (recycle_router, "/api/v1/recycle", ["recycle"]),
+    (folders_router, "/api/v1/folders", ["folders"]),
+    (media_router, "/api/v1/media", ["media"]),
+    (threads_router, "/api/v1/threads", ["threads"]),
+    (together_router, "/api/v1/together", ["together"]),
+    (smart_router, "/api/v1/smart", ["smart"]),
+    (general_router, "/api/v1/general", ["general"]),
+    (brave_search_router, "/api/v1/brave-search", ["brave_search"]),
+    (direct_search_router, "/api/v1/direct-search", ["direct_search"]),
+    (websearch_router, "/api/v1/websearch", ["websearch"]),
+    (puppeteer_router, "/api/v1/puppeteer", ["puppeteer"]),
+    (pipeline_router, "/api/v1/pipeline", ["pipeline"]),
+    (patreon_router, "/api/v1/patreon", ["patreon"]),
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)

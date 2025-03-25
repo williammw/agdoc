@@ -372,7 +372,8 @@ async def get_all_social_accounts(
             "instagram": [],
             "linkedin": [],
             "youtube": [],
-            "threads": []
+            "threads": [],
+            "patreon": []
         }
 
         if accounts:
