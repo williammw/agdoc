@@ -155,6 +155,54 @@ async def update_content(
     except Exception as e:
         logger.error(f"Error in update_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+@router.patch("/content/{content_id}", response_model=ContentResponse)
+async def patch_content(
+    content_id: int,
+    content: ContentUpdate,
+    current_user: Dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    try:
+        # First check if content exists and belongs to user
+        check_query = """
+        SELECT id FROM mo_content 
+        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        """
+        exists = await db.fetch_one(
+            query=check_query,
+            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+        )
+        
+        if not exists:
+            raise HTTPException(status_code=404, detail="Content not found")
+
+        # Build update query dynamically based on provided fields
+        update_fields = []
+        values = {"content_id": content_id, "firebase_uid": current_user["uid"]}
+        
+        for field, value in content.dict(exclude_unset=True).items():
+            if value is not None:
+                update_fields.append(f"{field} = :{field}")
+                values[field] = value
+
+        if not update_fields:
+            return await get_content(content_id, current_user, db)
+
+        update_fields.append("updated_at = CURRENT_TIMESTAMP")
+        update_query = f"""
+        UPDATE mo_content 
+        SET {', '.join(update_fields)}
+        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        RETURNING *
+        """
+        
+        result = await db.fetch_one(query=update_query, values=values)
+        return dict(result)
+
+    except Exception as e:
+        logger.error(f"Error in patch_content: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.delete("/content/{content_id}")
 async def delete_content(
     content_id: str,
