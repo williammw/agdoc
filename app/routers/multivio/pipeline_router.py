@@ -763,7 +763,103 @@ async def list_available_commands():
     return {"commands": commands}
 
 
+@router.get("/debug-image-status/{task_id}")
+async def debug_image_status(task_id: str):
+    """
+    Debug endpoint for image status.
+    """
+    logger.info(f"Debug image status endpoint called for task: {task_id}")
+    return {
+        "message": "Debug endpoint reached",
+        "task_id": task_id,
+        "endpoint": "/api/v1/pipeline/debug-image-status/{task_id}",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 @router.get("/message/{message_id}")
+@router.get("/image-status/{task_id}")
+async def get_image_status(
+    task_id: str,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Get the status of an image generation task.
+    """
+    logger.info(f"Received request for image status, task_id: {task_id}")
+    try:
+        # Query the task table for the task
+        query = """
+        SELECT id, type, parameters, status, result, error, 
+               created_at AT TIME ZONE 'UTC' as created_at,
+               completed_at AT TIME ZONE 'UTC' as completed_at
+        FROM mo_ai_tasks 
+        WHERE id = :task_id
+        """
+        
+        logger.info(f"Executing DB query for task_id: {task_id}")
+        task = await db.fetch_one(
+            query=query,
+            values={
+                "task_id": task_id
+            }
+        )
+        
+        if not task:
+            logger.warning(f"Task not found: {task_id}")
+            raise HTTPException(status_code=404, detail="Image generation task not found")
+        
+        task_dict = dict(task)
+        logger.info(f"Found task with status: {task_dict['status']}")
+        
+        if task_dict["status"] == "completed" and task_dict["result"]:
+            # Parse the result JSON
+            result_data = json.loads(task_dict["result"])
+            
+            # Get the first image from the result
+            image = result_data.get("images", [])[0] if result_data.get("images") else None
+            
+            if image:
+                logger.info(f"Returning completed image: {image['id']}")
+                return {
+                    "status": "completed",
+                    "image_url": image["url"],
+                    "image_id": image["id"],
+                    "prompt": image["prompt"],
+                    "model": image["model"],
+                    "created_at": task_dict["created_at"].isoformat() if task_dict["created_at"] else None,
+                    "completed_at": task_dict["completed_at"].isoformat() if task_dict["completed_at"] else None
+                }
+            else:
+                # Result exists but no images found
+                logger.warning(f"Task {task_id} completed but no images found")
+                return {
+                    "status": "failed",
+                    "error": "No images found in completed result"
+                }
+                
+        elif task_dict["status"] == "failed":
+            logger.warning(f"Task {task_id} failed: {task_dict.get('error', 'Unknown error')}")
+            return {
+                "status": "failed",
+                "error": task_dict.get("error", "Unknown error occurred during image generation")
+            }
+        else:
+            # Still processing
+            logger.info(f"Task {task_id} is still processing")
+            return {
+                "status": "processing",
+                "message": "Image generation is still in progress"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting image status: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 async def get_message_by_id(
     message_id: str,
     current_user: dict = Depends(get_user),

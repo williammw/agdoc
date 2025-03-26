@@ -115,7 +115,15 @@ async def conversation_websocket(websocket: WebSocket, conversation_id: str):
         while True:
             # Wait for any client messages
             data = await websocket.receive_text()
-            # We're not expecting client messages, but we need to keep the connection open
+            
+            # Handle ping messages with pong responses to keep the connection alive
+            try:
+                message = json.loads(data)
+                if message.get('type') == 'ping':
+                    await websocket.send_text(json.dumps({'type': 'pong'}))
+            except Exception as e:
+                # If not valid JSON or other error, just ignore it
+                pass
     except WebSocketDisconnect:
         logger.info(f"WebSocket connection closed for conversation {conversation_id}")
         if conversation_id in conversation_connections and websocket in conversation_connections[conversation_id]:
