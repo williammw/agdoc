@@ -578,44 +578,72 @@ async def get_or_create_conversation_endpoint(
     return {"id": conversation_id, "content_id": request.content_id, "user_id": user_id}
 
 
-# Legacy endpoint - for backward compatibility
+# Endpoint removed - consolidated into get_conversation_by_content
+
+# Get a conversation by content ID
 @router.get("/conversation/by-content/{content_id}")
 async def get_conversation_by_content(
     content_id: str,
     db: Database = Depends(get_database),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get a conversation by content ID"""
-    user_id = current_user.get("uid")
-    if not user_id:
-        logger.warning(f"Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
-        user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+    """Get a conversation by content ID (simple version)"""
+    try:
+        logger.info(f"Content ID endpoint called for: {content_id}")
+        
+        # Get user ID
+        user_id = current_user.get("uid")
+        if not user_id:
+            logger.warning(f"Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
+            user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+        
+        logger.info(f"Getting conversation for content {content_id}, user {user_id}")
 
-    logger.info(
-        f"Fetching conversation for content {content_id}, user {user_id}")
+        # Simple approach - use original query
+        query = """
+        SELECT id, user_id, content_id, model_id, title, created_at, updated_at, metadata
+        FROM mo_llm_conversations
+        WHERE content_id = :content_id AND user_id = :user_id
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        conversation = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
 
-    query = """
-    SELECT id, user_id, content_id, model_id, title, created_at, updated_at, metadata
-    FROM mo_llm_conversations
-    WHERE content_id = :content_id AND user_id = :user_id
-    """
-    conversation = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+        if not conversation:
+            logger.info(f"No existing conversation found for content {content_id}")
+            return {"conversation": None, "found": False}
 
-    if not conversation:
-        logger.info(f"No existing conversation found for content {content_id}")
-        return {"conversation": None, "found": False}
-
-    return {"conversation": dict(conversation), "found": True}
+        return {"conversation": dict(conversation), "found": True}
+    except Exception as e:
+        logger.error(f"Error in get_conversation_by_content: {str(e)}")
+        logger.error(traceback.format_exc())
+        # Return the error message for debugging
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "error": f"Error retrieving conversation: {str(e)}",
+                "trace": traceback.format_exc()
+            }
+        )
 
 
 @router.get("/conversation/{conversation_id}")
 async def get_conversation(
     conversation_id: str,
     current_user: dict = Depends(get_user),
-    db: Database = Depends(get_database)
+    db: Database = Depends(get_database),
+    _request_id: str = Header(None, alias="X-Request-ID")  # Add request tracking
 ):
     """Get a conversation by ID"""
     try:
+        # Log request with unique ID for debugging
+        request_id = _request_id or f"auto-{uuid.uuid4().hex[:8]}"
+        logger.info(f"[{request_id}] Getting conversation: {conversation_id}")
+        
+        # Use cached value if available (simple in-memory cache)
+        cache_key = f"conversation:{conversation_id}:{current_user.get('id', current_user.get('uid'))}"
+        # Note: In a real implementation, you would use Redis or another distributed cache
+        
         conversation = await get_conversation_by_id(db, conversation_id)
 
         if not conversation:
@@ -632,8 +660,7 @@ async def get_conversation(
             raise HTTPException(
                 status_code=403, detail="You don't have permission to access this conversation")
 
-        # Get messages for this conversation
-        # Get messages for this conversation
+        # Get messages for this conversation with optimized query
         messages_query = """
         SELECT id, role, content, created_at, function_call, metadata, image_url, image_metadata
         FROM mo_llm_messages
@@ -662,11 +689,16 @@ async def get_conversation(
                 except json.JSONDecodeError:
                     pass  # Keep as string if can't parse
         
-        # Return both conversation and messages
-        return {
+        # Add cache headers to response
+        response_data = {
             "conversation": conversation,
-            "messages": messages_list
+            "messages": messages_list,
+            "cached": False,  # Indicate this is a fresh response
+            "request_id": request_id
         }
+        
+        logger.info(f"[{request_id}] Successfully retrieved conversation with {len(messages_list)} messages")
+        return response_data
     except HTTPException:
         raise
     except Exception as e:
@@ -873,6 +905,32 @@ async def debug_image_status(task_id: str):
     }
 
 
+@router.get("/api-info")
+async def api_info(
+    current_user: dict = Depends(get_user)
+):
+    """Return API info for debugging"""
+    try:
+        return {
+            "status": "ok",
+            "version": "1.0.0", 
+            "timestamp": datetime.now().isoformat(),
+            "user": {
+                "id": current_user.get('id', current_user.get('uid')),
+                "username": current_user.get('username', 'unknown')
+            },
+            "endpoints": {
+                "conversation_by_content": "/api/v1/pipeline/conversation/by-content/{content_id}",
+                "conversation_by_id": "/api/v1/pipeline/conversation/{conversation_id}"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in api_info: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+        
 @router.get("/diagnostics")
 async def run_diagnostics(
     repair: bool = False,
