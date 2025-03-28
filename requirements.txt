@@ -9,6 +9,7 @@ amqp==5.2.0
 annotated-types==0.7.0
 anyio==4.4.0
 appnope==0.1.4
+APScheduler==3.11.0
 asttokens==2.4.1
 astunparse==1.6.3
 async-timeout==4.0.3
@@ -173,6 +174,7 @@ tweepy==4.15.0
 typer==0.12.3
 typing_extensions==4.12.2
 tzdata==2024.1
+tzlocal==5.3.1
 uritemplate==4.1.1
 urllib3==2.2.2
 uvicorn==0.30.4
