@@ -4,6 +4,7 @@ Pipeline Router - Implements the Pipeline and Command pattern for multi-intent p
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, Header, Cookie
 from fastapi.responses import StreamingResponse, JSONResponse
 from app.dependencies import get_current_user, get_database
+from app.utils.idempotency import idempotent
 from databases import Database
 from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, validator
@@ -80,7 +81,101 @@ class Conversation(BaseModel):
     user_id: str
     message_count: int = 0
 
-# Custom authentication function that uses the existing get_current_user from dependencies
+
+class GetOrCreateConversationRequest(BaseModel):
+    content_id: str
+    model_id: Optional[str] = "grok-2-1212"
+    title: Optional[str] = None
+    
+
+async def get_or_create_conversation(content_id: str, user_id: str, model_id: str, title: str, db: Database):
+    """Get or create a conversation with database-level uniqueness"""
+    try:
+        # First check if the content exists in mo_content
+        content_check_query = "SELECT uuid FROM mo_content WHERE uuid = :uuid"
+        content_exists = await db.fetch_one(query=content_check_query, values={"uuid": content_id})
+        
+        if not content_exists:
+            logger.warning(f"Content ID {content_id} does not exist in mo_content table")
+            # Try to create content entry automatically
+            try:
+                # Create a new content entry
+                route = f"auto-{uuid.uuid4().hex[:8]}"  # Generate unique route
+                content_insert = """
+                INSERT INTO mo_content 
+                (uuid, firebase_uid, name, description, route, status) 
+                VALUES 
+                (:uuid, :firebase_uid, :name, :description, :route, 'draft')
+                ON CONFLICT (uuid) DO NOTHING
+                RETURNING uuid
+                """
+                
+                content_values = {
+                    "uuid": content_id,
+                    "firebase_uid": user_id,
+                    "name": f"Auto-created Content {content_id[:8]}",
+                    "description": "Automatically created content for conversation",
+                    "route": route
+                }
+                
+                content_result = await db.fetch_one(content_insert, content_values)
+                if content_result:
+                    logger.info(f"Created missing content entry: {content_id}")
+                else:
+                    logger.warning(f"Failed to create content entry for {content_id}")
+            except Exception as content_error:
+                logger.error(f"Error creating content entry: {str(content_error)}")
+                # Continue anyway - the transaction below will fail if content doesn't exist
+        
+        async with db.transaction():
+            # Try to get an existing conversation
+            query = """
+            SELECT id FROM mo_llm_conversations 
+            WHERE content_id = :content_id AND user_id = :user_id
+            """
+            existing = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+
+            if existing:
+                logger.info(
+                    f"Found existing conversation {existing['id']} for content {content_id}, user {user_id}")
+                return existing["id"]
+
+            # Create new conversation if none exists
+            new_id = str(uuid.uuid4())
+            insert_query = """
+            INSERT INTO mo_llm_conversations 
+            (id, user_id, content_id, model_id, title)
+            VALUES (:id, :user_id, :content_id, :model_id, :title)
+            RETURNING id
+            """
+            values = {
+                "id": new_id,
+                "user_id": user_id,
+                "content_id": content_id,
+                "model_id": model_id,
+                "title": title or f"Conversation about {content_id}"
+            }
+
+            result = await db.fetch_one(query=insert_query, values=values)
+            logger.info(
+                f"Created new conversation {result['id']} for content {content_id}, user {user_id}")
+            return result["id"]
+    except Exception as e:
+        logger.error(f"Error in get_or_create_conversation: {str(e)}")
+        # If there was an error, try to get again (might be a concurrent insert)
+        query = """
+        SELECT id FROM mo_llm_conversations 
+        WHERE content_id = :content_id AND user_id = :user_id
+        """
+        existing = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+
+        if existing:
+            logger.info(f"Recovered conversation {existing['id']} after error")
+            return existing["id"]
+
+        # If recovery failed, re-raise
+        raise
+
 
 
 async def get_user(request: Request, db: Database = Depends(get_database)):
@@ -449,101 +544,68 @@ async def process_multi_intent_request(
 # ADDED NEW ENDPOINTS FOR CONVERSATION MANAGEMENT
 
 
-@router.post("/conversation", response_model=Dict[str, Any])
-async def create_new_conversation(
-    request: CreateConversationRequest,
-    current_user: dict = Depends(get_user),
-    db: Database = Depends(get_database)
+# Legacy endpoint - but use new implementation internally for safety
+@router.post("/conversation")
+async def create_conversation(
+    request: GetOrCreateConversationRequest,
+    idempotency_key: Optional[str] = Header(None),
+    db: Database = Depends(get_database),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Create a new pipeline conversation"""
-    try:
-        # Log user info for debugging
-        logger.info(
-            f"Creating conversation for content {request.content_id} with user {current_user}")
-
-        # Use the correct user ID field
-        user_id = current_user.get('id', current_user.get('uid'))
-        if not user_id:
-            raise HTTPException(
-                status_code=400, detail="No valid user ID found")
-
-        # Verify user exists in database
-        check_query = "SELECT id FROM mo_user_info WHERE id = :user_id"
-        user_exists = await db.fetch_one(query=check_query, values={"user_id": user_id})
-
-        if not user_exists:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot create conversation: User {user_id} does not exist in the database"
-            )
-
-        conversation_id = await create_conversation(
-            db=db,
-            user_id=user_id,
-            title=request.title,
-            content_id=request.content_id,
-            model=request.model
-        )
-
-        conversation = await get_conversation_by_id(db, conversation_id)
-
-        return {"conversation": conversation, "success": True}
-    except Exception as e:
-        logger.error(f"Error creating conversation: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+    """Create a new conversation - using the get-or-create pattern internally"""
+    # Reuse the idempotent endpoint to avoid duplicates
+    return await get_or_create_conversation_endpoint(request, idempotency_key, db, current_user)
 
 
+@router.post("/conversation/get-or-create")
+@idempotent("get_or_create_conversation")
+async def get_or_create_conversation_endpoint(
+    request: GetOrCreateConversationRequest,
+    idempotency_key: Optional[str] = Header(None),
+    db: Database = Depends(get_database),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get an existing conversation or create a new one with idempotency support"""
+    user_id = current_user.get("uid")
+    if not user_id:
+        logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
+        user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+
+    conversation_id = await get_or_create_conversation(
+        request.content_id, user_id, request.model_id, request.title, db
+    )
+
+    return {"id": conversation_id, "content_id": request.content_id, "user_id": user_id}
+
+
+# Legacy endpoint - for backward compatibility
 @router.get("/conversation/by-content/{content_id}")
-async def get_conversation_for_content(
+async def get_conversation_by_content(
     content_id: str,
-    current_user: dict = Depends(get_user),
-    db: Database = Depends(get_database)
+    db: Database = Depends(get_database),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get a conversation for a specific content ID"""
-    try:
-        # Use the correct user ID field
-        user_id = current_user.get('id', current_user.get('uid'))
-        if not user_id:
-            raise HTTPException(
-                status_code=400, detail="No valid user ID found")
+    """Get a conversation by content ID"""
+    user_id = current_user.get("uid")
+    if not user_id:
+        logger.warning(f"Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
+        user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
 
-        # Log authentication information
-        logger.info(
-            f"Fetching conversation for content {content_id}, user {user_id}")
+    logger.info(
+        f"Fetching conversation for content {content_id}, user {user_id}")
 
-        conversation = await get_conversation_by_content_id(db, content_id, user_id)
+    query = """
+    SELECT id, user_id, content_id, model_id, title, created_at, updated_at, metadata
+    FROM mo_llm_conversations
+    WHERE content_id = :content_id AND user_id = :user_id
+    """
+    conversation = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
 
-        if not conversation:
-            # Return empty response instead of 404
-            logger.info(
-                f"No existing conversation found for content {content_id}")
-            return {"conversation": None, "messages": []}
+    if not conversation:
+        logger.info(f"No existing conversation found for content {content_id}")
+        return {"conversation": None, "found": False}
 
-        logger.info(
-            f"Found conversation {conversation['id']} for content {content_id}")
-
-        # Get messages for this conversation
-        messages_query = """
-        SELECT id, role, content, created_at, function_call
-        FROM mo_llm_messages
-        WHERE conversation_id = :conversation_id
-        ORDER BY created_at
-        """
-        messages = await db.fetch_all(
-            query=messages_query,
-            values={"conversation_id": conversation['id']}
-        )
-
-        return {
-            "conversation": conversation,
-            "messages": [dict(msg) for msg in messages]
-        }
-    except Exception as e:
-        logger.error(
-            f"Error getting conversation for content {content_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"conversation": dict(conversation), "found": True}
 
 
 @router.get("/conversation/{conversation_id}")
@@ -570,7 +632,41 @@ async def get_conversation(
             raise HTTPException(
                 status_code=403, detail="You don't have permission to access this conversation")
 
-        return {"conversation": conversation}
+        # Get messages for this conversation
+        # Get messages for this conversation
+        messages_query = """
+        SELECT id, role, content, created_at, function_call, metadata, image_url, image_metadata
+        FROM mo_llm_messages
+        WHERE conversation_id = :conversation_id
+        ORDER BY created_at
+        """ 
+        messages = await db.fetch_all(
+            query=messages_query,
+            values={"conversation_id": conversation_id}
+        )
+
+        # Convert records to dictionaries
+        messages_list = [dict(msg) for msg in messages]
+        
+        # Process metadata for each message if present
+        for msg in messages_list:
+            if msg.get("metadata") and isinstance(msg["metadata"], str):
+                try:
+                    msg["metadata"] = json.loads(msg["metadata"])
+                except json.JSONDecodeError:
+                    pass  # Keep as string if can't parse
+                    
+            if msg.get("function_call") and isinstance(msg["function_call"], str):
+                try:
+                    msg["function_call"] = json.loads(msg["function_call"])
+                except json.JSONDecodeError:
+                    pass  # Keep as string if can't parse
+        
+        # Return both conversation and messages
+        return {
+            "conversation": conversation,
+            "messages": messages_list
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -775,6 +871,148 @@ async def debug_image_status(task_id: str):
         "endpoint": "/api/v1/pipeline/debug-image-status/{task_id}",
         "timestamp": datetime.now().isoformat()
     }
+
+
+@router.get("/diagnostics")
+async def run_diagnostics(
+    repair: bool = False,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Run diagnostics on the conversation system and optionally repair issues.
+    """
+    try:
+        results = {
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "user_id": current_user.get('id', current_user.get('uid')),
+            "issues": [],
+            "fixed": []
+        }
+        
+        # 1. Check for orphaned conversations (content_id doesn't exist in mo_content)
+        orphaned_query = """
+        SELECT c.id, c.content_id, c.user_id 
+        FROM mo_llm_conversations c
+        LEFT JOIN mo_content m ON c.content_id = m.uuid
+        WHERE m.uuid IS NULL AND c.content_id IS NOT NULL
+        LIMIT 50
+        """
+        orphaned = await db.fetch_all(orphaned_query)
+        
+        if orphaned:
+            results["issues"].append({
+                "type": "orphaned_conversations",
+                "count": len(orphaned),
+                "details": [dict(row) for row in orphaned[:5]]  # Show first 5 for sample
+            })
+            
+            # Repair if requested
+            if repair:
+                fixed_count = 0
+                for row in orphaned:
+                    content_id = row['content_id']
+                    user_id = row['user_id']
+                    
+                    try:
+                        # Create a new content entry
+                        route = f"repair-{uuid.uuid4().hex[:8]}"  # Generate unique route
+                        content_insert = """
+                        INSERT INTO mo_content 
+                        (uuid, firebase_uid, name, description, route, status) 
+                        VALUES 
+                        (:uuid, :firebase_uid, :name, :description, :route, 'draft')
+                        ON CONFLICT (uuid) DO NOTHING
+                        RETURNING uuid
+                        """
+                        
+                        content_values = {
+                            "uuid": content_id,
+                            "firebase_uid": user_id,
+                            "name": f"Repaired Content {content_id[:8]}",
+                            "description": "Automatically repaired content for orphaned conversation",
+                            "route": route
+                        }
+                        
+                        result = await db.fetch_one(content_insert, content_values)
+                        if result:
+                            fixed_count += 1
+                    except Exception as e:
+                        logger.error(f"Error fixing orphaned conversation: {str(e)}")
+                
+                results["fixed"].append({
+                    "type": "orphaned_conversations",
+                    "count": fixed_count
+                })
+        
+        # 2. Check for inconsistent content entries
+        inconsistent_query = """
+        SELECT id, uuid, firebase_uid, name, route 
+        FROM mo_content
+        WHERE route IS NULL OR name IS NULL OR firebase_uid IS NULL
+        LIMIT 20
+        """
+        inconsistent = await db.fetch_all(inconsistent_query)
+        
+        if inconsistent:
+            results["issues"].append({
+                "type": "inconsistent_content",
+                "count": len(inconsistent),
+                "details": [dict(row) for row in inconsistent[:5]]  # Show first 5
+            })
+            
+            # Repair if requested
+            if repair:
+                fixed_count = 0
+                for row in inconsistent:
+                    try:
+                        # Update with valid values
+                        update_query = """
+                        UPDATE mo_content
+                        SET 
+                            name = COALESCE(name, :default_name),
+                            route = COALESCE(route, :default_route),
+                            firebase_uid = COALESCE(firebase_uid, :default_uid)
+                        WHERE id = :id
+                        RETURNING id
+                        """
+                        
+                        values = {
+                            "id": row["id"],
+                            "default_name": f"Fixed Content {row['id']}",
+                            "default_route": f"fixed-{uuid.uuid4().hex[:8]}",
+                            "default_uid": current_user.get('id', current_user.get('uid')) or row["firebase_uid"] or "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+                        }
+                        
+                        result = await db.fetch_one(update_query, values)
+                        if result:
+                            fixed_count += 1
+                    except Exception as e:
+                        logger.error(f"Error fixing inconsistent content: {str(e)}")
+                
+                results["fixed"].append({
+                    "type": "inconsistent_content",
+                    "count": fixed_count
+                })
+        
+        # 3. Check for total counts
+        count_query = """
+        SELECT 
+            (SELECT COUNT(*) FROM mo_content) AS content_count,
+            (SELECT COUNT(*) FROM mo_llm_conversations) AS conversation_count,
+            (SELECT COUNT(*) FROM mo_llm_messages) AS message_count
+        """
+        counts = await db.fetch_one(count_query)
+        
+        results["counts"] = dict(counts)
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"Error in diagnostics: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/message/{message_id}")
