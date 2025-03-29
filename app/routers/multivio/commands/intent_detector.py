@@ -194,10 +194,10 @@ def detect_intents(message: str) -> Dict[str, Any]:
         general_knowledge_confidence = 1.0
     
     # Add general knowledge with adjusted confidence
-    intents["general_knowledge"] = {
-        "confidence": general_knowledge_confidence,
-        "query": message
-    }
+    # intents["general_knowledge"] = {
+    #     "confidence": general_knowledge_confidence,
+    #     "query": message
+    # }
     
     return intents
 
