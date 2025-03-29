@@ -21,13 +21,38 @@ async def broadcast_to_conversation(conversation_id: str, message: Dict[str, Any
     """Broadcast a message to all WebSocket clients for a specific conversation"""
     if conversation_id in conversation_connections:
         disconnected = []
+        success_count = 0
+        
+        logger.info(f"Broadcasting to conversation {conversation_id}: {message['type']}")
+        
+        # Log message details based on type
+        if message['type'] == 'message_update' and 'updates' in message:
+            has_image = 'imageUrl' in message['updates']
+            image_status = message['updates'].get('status', 'unknown')
+            logger.info(f"Message update for {message.get('messageId', 'unknown')}: hasImage={has_image}, status={image_status}")
+            
+            # For image updates, log more details
+            if has_image:
+                image_url = message['updates']['imageUrl']
+                truncated_url = image_url[:40] + '...' if len(image_url) > 40 else image_url
+                logger.info(f"Image update: url={truncated_url}")
+        
         for connection in conversation_connections[conversation_id]:
             try:
-                await connection.send_text(json.dumps(message))
-                logger.info(f"Sent update to conversation {conversation_id}: {message['type']}")
+                # Send the message as stringified JSON
+                message_text = json.dumps(message)
+                await connection.send_text(message_text)
+                success_count += 1
+                
+                # Log success but only for types we're interested in
+                if message['type'] != 'ping' and message['type'] != 'pong':
+                    logger.info(f"Successfully sent {message['type']} to a client for conversation {conversation_id}")
             except Exception as e:
                 logger.error(f"Error sending websocket message: {str(e)}")
                 disconnected.append(connection)
+        
+        # Log summary of broadcast operation
+        logger.info(f"Broadcast summary for {conversation_id}: {success_count} success, {len(disconnected)} failed")
         
         # Clean up any disconnected clients
         for conn in disconnected:
@@ -36,6 +61,8 @@ async def broadcast_to_conversation(conversation_id: str, message: Dict[str, Any
         
         if not conversation_connections[conversation_id]:
             del conversation_connections[conversation_id]
+    else:
+        logger.warning(f"No active connections for conversation {conversation_id}")
 
 @router.websocket("/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):

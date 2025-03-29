@@ -14,6 +14,7 @@ import uuid
 import base64
 import tempfile
 import boto3
+import asyncio
 
 # Import the official Together Python package
 try:
@@ -298,33 +299,8 @@ async def generate_image_task(
                 
                 logger.info(f"Updating conversation {conversation_id}, message {message_id} with image URL: {image_url}")
                 
-                # Send WebSocket notification about the new image
-                try:
-                    await broadcast_to_conversation(
-                        conversation_id,
-                        {
-                            "type": "message_update",
-                            "messageId": message_id,
-                            "updates": {
-                                "imageUrl": image_url,
-                                "status": "completed",
-                                "metadata": {
-                                    "is_image": True,
-                                    "image_task_id": task_id,
-                                    "image_id": first_image.get("id"),
-                                    "imageGenerationStatus": "completed",
-                                    "prompt": prompt
-                                }
-                            }
-                        }
-                    )
-                    logger.info(f"Sent WebSocket notification for image in conversation {conversation_id}")
-                except Exception as ws_error:
-                    logger.error(f"WebSocket notification error: {str(ws_error)}")
-                    # Continue even if WebSocket notification fails
-                
+                # IMPORTANT: Update the database FIRST before sending WebSocket notification
                 # Create a message that references the image
-                # Use markdown image syntax: ![alt text](url)
                 message_content = f"![Generated image for: {prompt}]({image_url})"
                 
                 # Create metadata with image information
@@ -366,6 +342,9 @@ async def generate_image_task(
                     }
                 )
                 
+                # Flag to track if update succeeded
+                update_succeeded = False
+                
                 if not existing_msg:
                     logger.warning(f"Message {message_id} not found in conversation {conversation_id}. Creating new message.")
                     # If message doesn't exist, create it
@@ -399,6 +378,7 @@ async def generate_image_task(
                     """
                     
                     await db.execute(query=insert_query, values=insert_values)
+                    update_succeeded = True
                 else:
                     # Update the existing message with appropriate fields
                     update_fields = ["content"]
@@ -435,6 +415,57 @@ async def generate_image_task(
                     """
                     
                     await db.execute(query=update_query, values=update_values)
+                    update_succeeded = True
+                    
+                # Verify database change was applied before sending WebSocket notification
+                if update_succeeded:
+                    # Verify the update by checking the current state
+                    verify_query = """
+                    SELECT content, image_url 
+                    FROM mo_llm_messages 
+                    WHERE id = :message_id AND conversation_id = :conversation_id
+                    """
+                    
+                    # Add a small delay to ensure database consistency
+                    await asyncio.sleep(0.2)
+                    
+                    verification = await db.fetch_one(
+                        query=verify_query,
+                        values={
+                            "message_id": message_id,
+                            "conversation_id": conversation_id
+                        }
+                    )
+                    
+                    if verification:
+                        verification_dict = dict(verification)
+                        logger.info(f"Database verification: content={verification_dict.get('content')[:30]}..., image_url={verification_dict.get('image_url')}")
+                    
+                    # Now send WebSocket notification AFTER database is verified to be updated
+                    try:
+                        await broadcast_to_conversation(
+                            conversation_id,
+                            {
+                                "type": "message_update",
+                                "messageId": message_id,
+                                "updates": {
+                                    "imageUrl": image_url,
+                                    "status": "completed",
+                                    "metadata": {
+                                        "is_image": True,
+                                        "image_task_id": task_id,
+                                        "image_id": first_image.get("id"),
+                                        "imageGenerationStatus": "completed",
+                                        "prompt": prompt,
+                                        "image_url": image_url  # Add image_url in metadata too
+                                    }
+                                }
+                            }
+                        )
+                        logger.info(f"Sent WebSocket notification for image in conversation {conversation_id}")
+                    except Exception as ws_error:
+                        logger.error(f"WebSocket notification error: {str(ws_error)}")
+                        # Continue even if WebSocket notification fails
                 
                 logger.info(f"Successfully updated conversation message with image URL and metadata")
             except Exception as e:
@@ -609,7 +640,7 @@ async def generate_image(
                             "id": message_id,
                             "conversation_id": conversation_id,
                             "role": "assistant",
-                            "content": f"Generating image for: {request.prompt}...",
+                            "content": f"Generating image of {request.prompt}...",
                             "created_at": now,
                             "metadata": json.dumps(metadata)
                         }
@@ -626,7 +657,7 @@ async def generate_image(
                     await db.execute(
                         query=update_query,
                         values={
-                            "content": f"Generating image for: {request.prompt}...",
+                            "content": f"Generating image of {request.prompt}...",
                             "metadata": json.dumps(metadata),
                             "message_id": message_id,
                             "conversation_id": conversation_id
@@ -641,7 +672,7 @@ async def generate_image(
                             "type": "message_update",
                             "messageId": message_id,
                             "updates": {
-                                "content": f"Generating image for: {request.prompt}...",
+                                "content": f"Generating image of {request.prompt}...",
                                 "status": "pending",
                                 "metadata": metadata
                             }
