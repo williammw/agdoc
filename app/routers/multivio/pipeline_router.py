@@ -19,13 +19,16 @@ import re
 from firebase_admin import auth as firebase_auth
 
 from .commands.base import Pipeline, CommandFactory
-from .commands.intent_detector import detect_intents
+from .commands.intent_detector import detect_intents, MultilingualIntentDetector
 # Import commands to register them with the factory
 from .commands.web_search_command import WebSearchCommand
 from .commands.image_generation_command import ImageGenerationCommand
 from .commands.social_media_command import SocialMediaCommand
 from .commands.puppeteer_command import PuppeteerCommand
 from .commands.general_knowledge_command import GeneralKnowledgeCommand
+from .commands.conversation_command import ConversationCommand
+from .commands.calculation_command import CalculationCommand
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -368,6 +371,8 @@ async def format_pipeline_response(context: Dict[str, Any]) -> Dict[str, Any]:
             elif result.get("type") == "puppeteer" and result.get("url"):
                 content_sections.append(
                     f"## Website Content from {result.get('url')}\n\nI've visited the website and extracted information.")
+            elif result.get("type") == "calculation" and result.get("content"):
+                content_sections.append(result.get("content"))
 
         response["content"] = "\n\n".join(
             content_sections) or "I processed your request but couldn't generate a meaningful response."
@@ -400,6 +405,8 @@ async def process_streaming_response(context: Dict[str, Any]):
         # Add current command info
         if "current_command" in context:
             result_message["current_command"] = context["current_command"]
+        
+        
 
         # Send each result with clear completion marker
         yield f"data: {json.dumps(result_message)}\n\n"
@@ -517,6 +524,10 @@ async def process_multi_intent_request(
     if "puppeteer" in significant_intents:
         pipeline.add_command(CommandFactory.create("puppeteer"))
 
+    # Calculation command for math operations
+    if "calculation" in significant_intents:
+        pipeline.add_command(CommandFactory.create("calculation"))
+
     # Image generation next (if present)
     if "image_generation" in significant_intents:
         pipeline.add_command(CommandFactory.create("image_generation"))
@@ -524,16 +535,23 @@ async def process_multi_intent_request(
     # Social media content generation next
     if "social_media" in significant_intents:
         pipeline.add_command(CommandFactory.create("social_media"))
-
-    # Calculate total confidence of specialized commands
-    specialized_intents = [intent_type for intent_type in significant_intents.keys() 
-                          if intent_type != "general_knowledge"]
-    specialized_confidences = [significant_intents[intent_type]["confidence"] for intent_type in specialized_intents]
-    
-    # Only add general knowledge if confidence is above threshold
-    # This now relies on the smarter confidence calculation in detect_intents
-    if significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
+        
+    # Add conversation command for simple chats/greetings
+    if "conversation" in significant_intents:
+        pipeline.add_command(CommandFactory.create("conversation"))
+        # ALWAYS add general knowledge command when conversation intent is detected
+        # since conversation command doesn't generate text itself
         pipeline.add_command(CommandFactory.create("general_knowledge"))
+    else:
+        # Calculate total confidence of specialized commands
+        specialized_intents = [intent_type for intent_type in significant_intents.keys() 
+                              if intent_type != "general_knowledge"]
+        specialized_confidences = [significant_intents[intent_type]["confidence"] for intent_type in specialized_intents]
+        
+        # Only add general knowledge if confidence is above threshold
+        # This now relies on the smarter confidence calculation in detect_intents
+        if significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
+            pipeline.add_command(CommandFactory.create("general_knowledge"))
 
     # Execute the pipeline
     result_context = await pipeline.execute(context)
