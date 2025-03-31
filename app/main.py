@@ -23,6 +23,8 @@ from app.routers.multivio.websearch_router import router as websearch_router
 from app.routers.multivio.puppeteer_router import router as puppeteer_router
 from app.routers.multivio.pipeline_router import router as pipeline_router
 from app.routers.multivio.patreon_router import router as patreon_router
+from app.routers.multivio.intent_feedback_router import router as intent_feedback_router
+from app.routers.multivio.feedback_router import router as feedback_router
 
 from threadpoolctl import threadpool_limits
 from dotenv import load_dotenv
@@ -142,6 +144,8 @@ router_list = [
     (puppeteer_router, "/api/v1/puppeteer", ["puppeteer"]),
     (pipeline_router, "/api/v1/pipeline", ["pipeline"]),
     (patreon_router, "/api/v1/patreon", ["patreon"]),
+    (intent_feedback_router, "/api/v1/intent-feedback", ["intent_feedback"]),
+    (feedback_router, "/api/v1/feedback", ["feedback"]),
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
