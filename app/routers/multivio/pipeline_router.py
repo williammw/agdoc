@@ -20,11 +20,11 @@ from firebase_admin import auth as firebase_auth
 
 from .commands.base import Pipeline, CommandFactory
 from .commands.intent_detector import detect_intents, MultilingualIntentDetector
-# Import commands to register them with the factory
-from .commands.web_search_command import WebSearchCommand
+# Import commands to register them with the factory - hiding web search and puppeteer
+# from .commands.web_search_command import WebSearchCommand
+# from .commands.puppeteer_command import PuppeteerCommand
 from .commands.image_generation_command import ImageGenerationCommand
 from .commands.social_media_command import SocialMediaCommand
-from .commands.puppeteer_command import PuppeteerCommand
 from .commands.general_knowledge_command import GeneralKnowledgeCommand
 from .commands.conversation_command import ConversationCommand
 from .commands.calculation_command import CalculationCommand
@@ -358,19 +358,13 @@ async def format_pipeline_response(context: Dict[str, Any]) -> Dict[str, Any]:
         # Combine results from different commands
         content_sections = []
         for result in context.get("results", []):
-            if result.get("type") == "web_search" and result.get("content"):
-                content_sections.append(
-                    "## Web Search Results\n\nI searched the web and found relevant information for your query.")
-            elif result.get("type") == "image_generation" and result.get("prompt"):
+            if result.get("type") == "image_generation" and result.get("prompt"):
                 content_sections.append(
                     f"## Image Generation\n\nI've generated an image based on: '{result.get('prompt')}'")
             elif result.get("type") == "social_media" and result.get("content"):
                 platforms = result.get("platforms", [])
                 content_sections.append(
                     f"## Social Media Content for {', '.join(platforms)}\n\n{result.get('content')}")
-            elif result.get("type") == "puppeteer" and result.get("url"):
-                content_sections.append(
-                    f"## Website Content from {result.get('url')}\n\nI've visited the website and extracted information.")
             elif result.get("type") == "calculation" and result.get("content"):
                 content_sections.append(result.get("content"))
 
@@ -463,6 +457,13 @@ async def process_multi_intent_request(
     
     # Filter out low-confidence intents for logging
     significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
+    
+    # Filter out web_search and puppeteer intents
+    if "web_search" in significant_intents:
+        del significant_intents["web_search"]
+    if "puppeteer" in significant_intents:
+        del significant_intents["puppeteer"]
+    
     logger.info(f"Detected intents: {list(significant_intents.keys())}")
 
     # Create or get conversation
@@ -516,13 +517,7 @@ async def process_multi_intent_request(
     # Create pipeline based on intents
     pipeline = Pipeline(name="MultiIntentPipeline")
 
-    # Add commands based on detected intents in appropriate order
-    # Web search and puppeteer first as they provide context for other commands
-    if "web_search" in significant_intents or "local_search" in significant_intents:
-        pipeline.add_command(CommandFactory.create("web_search"))
-
-    if "puppeteer" in significant_intents:
-        pipeline.add_command(CommandFactory.create("puppeteer"))
+    # REMOVED web search and puppeteer commands
 
     # Calculation command for math operations
     if "calculation" in significant_intents:
@@ -548,9 +543,19 @@ async def process_multi_intent_request(
                               if intent_type != "general_knowledge"]
         specialized_confidences = [significant_intents[intent_type]["confidence"] for intent_type in specialized_intents]
         
-        # Only add general knowledge if confidence is above threshold
+        # Check for potentially sensitive image generation content before adding general_knowledge
+        skip_general_knowledge = False
+        if "image_generation" in significant_intents:
+            sensitive_terms = ["nude", "naked", "sexual", "porn", "explicit", "adult", "xxx"]
+            prompt = significant_intents["image_generation"].get("prompt", "").lower()
+            
+            if any(term in prompt for term in sensitive_terms):
+                logger.info(f"Detected potentially sensitive image request in pipeline, skipping general_knowledge command")
+                skip_general_knowledge = True
+        
+        # Only add general knowledge if confidence is above threshold and not dealing with sensitive content
         # This now relies on the smarter confidence calculation in detect_intents
-        if significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
+        if not skip_general_knowledge and significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
             pipeline.add_command(CommandFactory.create("general_knowledge"))
 
     # Execute the pipeline
@@ -906,6 +911,13 @@ async def list_available_commands():
     List all registered commands in the system.
     """
     commands = CommandFactory.get_available_commands()
+    
+    # Filter out web_search and puppeteer commands
+    if "web_search" in commands:
+        commands.remove("web_search")
+    if "puppeteer" in commands:
+        commands.remove("puppeteer")
+        
     return {"commands": commands}
 
 
@@ -940,6 +952,10 @@ async def api_info(
             "endpoints": {
                 "conversation_by_content": "/api/v1/pipeline/conversation/by-content/{content_id}",
                 "conversation_by_id": "/api/v1/pipeline/conversation/{conversation_id}"
+            },
+            "features": {
+                "web_search": False,  # Indicate these features are disabled
+                "puppeteer": False
             }
         }
     except Exception as e:
