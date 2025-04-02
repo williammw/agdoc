@@ -212,46 +212,72 @@ async def delete_content(
     try:
         # First check if content exists and belongs to user
         check_query = """
-        SELECT id FROM mo_content 
+        SELECT uuid FROM mo_content 
         WHERE CAST(id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
         """
-        exists = await db.fetch_one(
+        content_result = await db.fetch_one(
             query=check_query,
             values={"content_id": content_id, "firebase_uid": current_user["uid"]}
         )
         
-        if not exists:
+        if not content_result:
             raise HTTPException(status_code=404, detail="Content not found")
-
-        # Delete associated versions first (due to foreign key constraint)
-        delete_versions_query = """
-        DELETE FROM mo_content_version 
-        WHERE CAST(content_id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
-        """
-        await db.execute(
-            query=delete_versions_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
-        )
-
-        # Delete associated social posts
-        delete_posts_query = """
-        DELETE FROM mo_social_post 
-        WHERE CAST(content_id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
-        """
-        await db.execute(
-            query=delete_posts_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
-        )
-
-        # Finally delete the content
-        delete_query = """
-        DELETE FROM mo_content 
-        WHERE CAST(id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
-        """
-        await db.execute(
-            query=delete_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
-        )
+        
+        content_uuid = content_result["uuid"]
+        
+        # Begin transaction for consistent deletion
+        transaction = await db.transaction()
+        try:
+            # Step 1: Delete LLM messages associated with conversations linked to this content
+            delete_messages_query = """
+            DELETE FROM mo_llm_messages 
+            WHERE conversation_id IN (
+                SELECT v.id FROM mo_llm_conversations v
+                WHERE v.content_id = :content_uuid
+            )
+            """
+            await db.execute(
+                query=delete_messages_query,
+                values={"content_uuid": content_uuid}
+            )
+            
+            # Step 2: Delete LLM conversations associated with this content
+            delete_conversations_query = """
+            DELETE FROM mo_llm_conversations
+            WHERE content_id = :content_uuid
+            """
+            await db.execute(
+                query=delete_conversations_query,
+                values={"content_uuid": content_uuid}
+            )
+            
+            # Step 3: Delete associated versions (due to foreign key constraint)
+            delete_versions_query = """
+            DELETE FROM mo_content_version 
+            WHERE CAST(content_id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
+            """
+            await db.execute(
+                query=delete_versions_query,
+                values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            )
+            
+            # Step 4: Finally delete the content
+            delete_query = """
+            DELETE FROM mo_content 
+            WHERE CAST(id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
+            """
+            await db.execute(
+                query=delete_query,
+                values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            )
+            
+            # Commit the transaction
+            await transaction.commit()
+            
+        except Exception as e:
+            # Rollback in case of error
+            await transaction.rollback()
+            raise e
 
         return {"message": "Content deleted successfully"}
 

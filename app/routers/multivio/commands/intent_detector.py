@@ -306,12 +306,16 @@ def detect_intents(message: str) -> Dict[str, Any]:
                         logger.info(f"Detected potentially sensitive image request, suppressing general_knowledge intent")
                         return intents
                 
-                # Add general_knowledge intent for any non-trivial message that's not sensitive image content
+                # Add general_knowledge intent for non-trivial messages, but not for high-confidence image requests
                 if len(message.strip()) > 20 and "general_knowledge" not in intents:
-                    intents["general_knowledge"] = {
-                        "confidence": 0.8,
-                        "query": message
-                    }
+                    # Check if image_generation intent is detected with high confidence
+                    if "image_generation" in intents and intents["image_generation"]["confidence"] > 0.6:
+                        logger.info(f"Detected high-confidence image generation, suppressing general_knowledge intent")
+                    else:
+                        intents["general_knowledge"] = {
+                            "confidence": 0.8,
+                            "query": message
+                        }
                     
                 return intents
             except Exception as e:
@@ -419,8 +423,12 @@ def detect_intents_regex(message: str) -> Dict[str, Any]:
         # Check if specialized intents cover the message comprehensively
         has_high_confidence = any(intents[intent]["confidence"] > 0.7 for intent in specialized_intents)
         has_comprehensive_coverage = "social_media" in intents
+        has_image_generation = "image_generation" in intents and intents["image_generation"]["confidence"] > 0.6
         
-        if has_high_confidence and has_comprehensive_coverage:
+        if has_image_generation:
+            # Very low confidence when high-confidence image generation exists
+            general_knowledge_confidence = 0.1
+        elif has_high_confidence and has_comprehensive_coverage:
             # Low confidence when specialized intents cover the message well
             general_knowledge_confidence = 0.2
         elif has_high_confidence or has_comprehensive_coverage:
@@ -442,12 +450,18 @@ def detect_intents_regex(message: str) -> Dict[str, Any]:
             general_knowledge_confidence = 0.0  # Zero confidence for sensitive content
             logger.info(f"Detected potentially sensitive image request, setting general_knowledge confidence to 0")
     
+    # Check if image_generation exists with high confidence
+    has_high_confidence_image = "image_generation" in intents and intents["image_generation"]["confidence"] > 0.6
+    
     # Add general knowledge with adjusted confidence if no other intents were detected
-    if not intents or general_knowledge_confidence > 0.5:
+    # or if there's no high-confidence image generation intent
+    if (not intents or general_knowledge_confidence > 0.5) and not has_high_confidence_image:
         intents["general_knowledge"] = {
             "confidence": general_knowledge_confidence,
             "query": message
         }
+    elif has_high_confidence_image:
+        logger.info(f"Detected high-confidence image generation in regex detection, suppressing general_knowledge intent")
     
     return intents
 
