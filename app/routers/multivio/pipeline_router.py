@@ -517,6 +517,11 @@ async def process_multi_intent_request(
     # Create pipeline based on intents
     pipeline = Pipeline(name="MultiIntentPipeline")
 
+    # REMOVED web search and puppeteer commands    
+
+    # Initialize skip_general_knowledge flag
+    skip_general_knowledge = False
+
     # REMOVED web search and puppeteer commands
 
     # Calculation command for math operations
@@ -526,11 +531,19 @@ async def process_multi_intent_request(
     # Image generation next (if present)
     if "image_generation" in significant_intents:
         pipeline.add_command(CommandFactory.create("image_generation"))
+        # Skip general knowledge for image generation requests
+        skip_general_knowledge = True
+        logger.info(
+            f"Skipping general_knowledge because image_generation intent was detected")
 
     # Social media content generation next
     if "social_media" in significant_intents:
         pipeline.add_command(CommandFactory.create("social_media"))
-        
+        # Skip general knowledge for social media requests
+        skip_general_knowledge = True
+        logger.info(
+            f"Skipping general_knowledge because social_media intent was detected")
+
     # Add conversation command for simple chats/greetings
     if "conversation" in significant_intents:
         pipeline.add_command(CommandFactory.create("conversation"))
@@ -538,23 +551,7 @@ async def process_multi_intent_request(
         # since conversation command doesn't generate text itself
         pipeline.add_command(CommandFactory.create("general_knowledge"))
     else:
-        # Calculate total confidence of specialized commands
-        specialized_intents = [intent_type for intent_type in significant_intents.keys() 
-                              if intent_type != "general_knowledge"]
-        specialized_confidences = [significant_intents[intent_type]["confidence"] for intent_type in specialized_intents]
-        
-        # Check for potentially sensitive image generation content before adding general_knowledge
-        skip_general_knowledge = False
-        if "image_generation" in significant_intents:
-            sensitive_terms = ["nude", "naked", "sexual", "porn", "explicit", "adult", "xxx"]
-            prompt = significant_intents["image_generation"].get("prompt", "").lower()
-            
-            if any(term in prompt for term in sensitive_terms):
-                logger.info(f"Detected potentially sensitive image request in pipeline, skipping general_knowledge command")
-                skip_general_knowledge = True
-        
-        # Only add general knowledge if confidence is above threshold and not dealing with sensitive content
-        # This now relies on the smarter confidence calculation in detect_intents
+        # Only add general knowledge if we haven't decided to skip it
         if not skip_general_knowledge and significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
             pipeline.add_command(CommandFactory.create("general_knowledge"))
 
@@ -610,33 +607,78 @@ async def get_conversation_by_content(
     db: Database = Depends(get_database),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get a conversation by content ID (simple version)"""
+    """Get a conversation by content ID with all associated messages"""
     try:
         logger.info(f"Content ID endpoint called for: {content_id}")
         
         # Get user ID
         user_id = current_user.get("uid")
-        if not user_id:
-            logger.warning(f"Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
-            user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
         
-        logger.info(f"Getting conversation for content {content_id}, user {user_id}")
+        logger.info(f"Getting conversation and messages for content {content_id}, user {user_id}")
 
-        # Simple approach - use original query
+        # Updated query to fetch conversations and messages in one request
         query = """
-        SELECT id, user_id, content_id, model_id, title, created_at, updated_at, metadata
-        FROM mo_llm_conversations
-        WHERE content_id = :content_id AND user_id = :user_id
-        ORDER BY created_at DESC
-        LIMIT 1
+        SELECT c.id as conversation_id, c.user_id, c.content_id, c.model_id, c.title, 
+               c.created_at as conversation_created_at, c.updated_at, c.metadata as conversation_metadata,
+               m.id as message_id, m.role, m.content as message_content, 
+               m.created_at as message_created_at, m.function_call, 
+               m.metadata as message_metadata, m.image_url, m.image_metadata
+        FROM mo_llm_conversations c
+        LEFT JOIN mo_llm_messages m ON c.id = m.conversation_id
+        WHERE c.content_id = :content_id AND c.user_id = :user_id
+        ORDER BY c.created_at DESC, m.created_at ASC
         """
-        conversation = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+        results = await db.fetch_all(query=query, values={"content_id": content_id, "user_id": user_id})
 
-        if not conversation:
+        if not results:
             logger.info(f"No existing conversation found for content {content_id}")
-            return {"conversation": None, "found": False}
+            return {"conversation": None, "messages": [], "found": False}
 
-        return {"conversation": dict(conversation), "found": True}
+        # Extract conversation details from the first row
+        first_row = dict(results[0]) if results else {}
+        conversation = {
+            "id": first_row.get("conversation_id"),
+            "user_id": first_row.get("user_id"),
+            "content_id": first_row.get("content_id"),
+            "model_id": first_row.get("model_id"),
+            "title": first_row.get("title"),
+            "created_at": first_row.get("conversation_created_at"),
+            "updated_at": first_row.get("updated_at"),
+            "metadata": first_row.get("conversation_metadata")
+        } if first_row else None
+
+        # Extract all messages
+        messages = []
+        for row in results:
+            if row["message_id"]:
+                message = {
+                    "id": row["message_id"],
+                    "role": row["role"],
+                    "content": row["message_content"],
+                    "created_at": row["message_created_at"],
+                    "function_call": row["function_call"],
+                    "metadata": row["message_metadata"],
+                    "image_url": row["image_url"],
+                    "image_metadata": row["image_metadata"]
+                }
+                
+                # Process metadata and function_call if they're JSON strings
+                for field in ["metadata", "function_call"]:
+                    if message.get(field) and isinstance(message[field], str):
+                        try:
+                            message[field] = json.loads(message[field])
+                        except json.JSONDecodeError:
+                            pass  # Keep as string if can't parse
+                            
+                messages.append(message)
+
+        logger.info(f"Found conversation with {len(messages)} messages for content {content_id}")
+        return {
+            "conversation": conversation,
+            "messages": messages,
+            "found": True,
+            "cached": False  # Indicate this is a fresh response
+        }
     except Exception as e:
         logger.error(f"Error in get_conversation_by_content: {str(e)}")
         logger.error(traceback.format_exc())
