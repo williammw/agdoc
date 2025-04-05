@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router, session_router, session_router
 # Add this import
 # Import individual router modules from multivio directory
 from app.routers.multivio.grok_router import router as grok_router
@@ -99,11 +99,17 @@ app.add_middleware(
     allow_headers=["*", "Authorization", "Content-Type"],
     expose_headers=["*"]
 )
-# Add SessionMiddleware
-app.add_middleware(SessionMiddleware, secret_key=os.getenv(
-    'SESSION_SECRET_KEY', 'your_session_secret_key'))
 
-# Router list
+# Updated SessionMiddleware with better settings
+app.add_middleware(
+    SessionMiddleware, 
+    secret_key=os.getenv('SESSION_SECRET_KEY', 'your_session_secret_key'),
+    max_age=3600,  # 1 hour session timeout
+    same_site="lax",  # Better security
+    https_only=True  # Force secure cookies in production
+)
+
+# Router list (updated to include the session router)
 router_list = [
     (umami_router.router, "/api/v1/umami", ["umami"]),
     (agi_router.router, "/api/v1/agi", ["agi"]),
@@ -146,6 +152,7 @@ router_list = [
     (patreon_router, "/api/v1/patreon", ["patreon"]),
     (intent_feedback_router, "/api/v1/intent-feedback", ["intent_feedback"]),
     (feedback_router, "/api/v1/feedback", ["feedback"]),
+    (session_router.router, "/api/v1/session", ["session"]),  # Add the session router
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
