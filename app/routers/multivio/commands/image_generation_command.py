@@ -6,7 +6,7 @@ from typing import Dict, Any
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,169 @@ class ImageGenerationCommand(Command):
             return context
         
         try:
-            # Create a task ID
+            # ENHANCEMENT: Check for recently generated images with similar prompt from the same user
+            recent_time = datetime.now(timezone.utc) - timedelta(hours=24)  # Look back 24 hours
+            similar_images_query = """
+            SELECT t.id, t.result
+            FROM mo_ai_tasks t
+            WHERE t.type = 'image_generation'
+              AND t.created_by = :user_id
+              AND t.status = 'completed'
+              AND t.created_at > :recent_time
+              AND t.result IS NOT NULL
+              AND t.parameters::text ILIKE :prompt_pattern
+            ORDER BY t.created_at DESC
+            LIMIT 1
+            """
+            
+            # Use SQL pattern matching to find similar prompts
+            prompt_pattern = f"%{prompt}%"
+            
+            similar_image = await db.fetch_one(
+                query=similar_images_query,
+                values={
+                    "user_id": current_user["uid"],
+                    "recent_time": recent_time,
+                    "prompt_pattern": prompt_pattern
+                }
+            )
+            
+            # Check if we found a similar image we can reuse
+            if similar_image and similar_image["result"]:
+                import json
+                try:
+                    # Parse the result as JSON
+                    result_data = json.loads(similar_image["result"])
+                    if "images" in result_data and len(result_data["images"]) > 0:
+                        similar_image_data = result_data["images"][0]
+                        image_url = similar_image_data.get("url")
+                        image_id = similar_image_data.get("id")
+                        
+                        if image_url and image_id:
+                            logger.info(f"Found similar previously generated image: {image_id}")
+                            
+                            # Create task ID - we'll still create an entry for tracking
+                            task_id = str(uuid.uuid4())
+                            now = datetime.now(timezone.utc)
+                            
+                            # Store the task as already completed
+                            query = """
+                            INSERT INTO mo_ai_tasks (
+                                id, type, parameters, status, created_by, created_at, updated_at, completed_at, result
+                            ) VALUES (
+                                :id, :type, :parameters, :status, :created_by, :created_at, :updated_at, :completed_at, :result
+                            )
+                            """
+                            
+                            values = {
+                                "id": task_id,
+                                "type": "image_generation",
+                                "parameters": json.dumps({
+                                    "prompt": prompt,
+                                    "model": "flux",
+                                    "num_images": 1,
+                                    "disable_safety_checker": True,
+                                    "reusing_similar_image": True
+                                }),
+                                "status": "completed",
+                                "created_by": current_user["uid"],
+                                "created_at": now,
+                                "updated_at": now,
+                                "completed_at": now,
+                                "result": json.dumps({
+                                    "images": [similar_image_data],
+                                    "reused": True,
+                                    "original_task_id": similar_image["id"]
+                                })
+                            }
+                            
+                            await db.execute(query=query, values=values)
+                            
+                            # Add to context that we're reusing an image
+                            context["image_generation"] = {
+                                "task_id": task_id,
+                                "prompt": prompt,
+                                "status": "completed",
+                                "image_url": image_url,
+                                "image_id": image_id,
+                                "reused": True
+                            }
+                            
+                            # Add to results collection with image URL already available
+                            context["results"].append({
+                                "type": "image_generation",
+                                "task_id": task_id,
+                                "prompt": prompt,
+                                "status": "completed",
+                                "image_url": image_url,
+                                "image_id": image_id,
+                                "reused": True
+                            })
+                            
+                            # Record the message in conversation if conversation_id is provided
+                            if conversation_id:
+                                try:
+                                    # Add assistant message directly with the image
+                                    message_id = str(uuid.uuid4())
+                                    
+                                    # Check if the table has an image_url column
+                                    check_image_url_query = """
+                                    SELECT column_name FROM information_schema.columns 
+                                    WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                                    """
+                                    has_image_url = await db.fetch_one(check_image_url_query)
+                                    
+                                    # Determine columns and values based on schema
+                                    insert_fields = [
+                                        "id", "conversation_id", "role", "content", "created_at", "metadata"
+                                    ]
+                                    
+                                    insert_values = {
+                                        "id": message_id,
+                                        "conversation_id": conversation_id,
+                                        "role": "assistant",
+                                        "content": f"Generated image of {prompt}",
+                                        "created_at": now,
+                                        "metadata": json.dumps({
+                                            "is_image": True,
+                                            "image_task_id": task_id,
+                                            "image_id": image_id,
+                                            "prompt": prompt,
+                                            "image_url": image_url,
+                                            "status": "completed",
+                                            "reused": True
+                                        })
+                                    }
+                                    
+                                    # Add image_url if the column exists
+                                    if has_image_url:
+                                        insert_fields.append("image_url")
+                                        insert_values["image_url"] = image_url
+                                        
+                                    # Build dynamic query
+                                    fields_str = ", ".join(insert_fields)
+                                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
+                                    
+                                    insert_query = f"""
+                                    INSERT INTO mo_llm_messages (
+                                        {fields_str}
+                                    ) VALUES (
+                                        {placeholders_str}
+                                    )
+                                    """
+                                    
+                                    await db.execute(query=insert_query, values=insert_values)
+                                except Exception as e:
+                                    logger.error(f"Error recording messages for reused image: {str(e)}")
+                                    # Continue even if message recording fails
+                            
+                            # Return context - we don't need to generate a new image
+                            return context
+                except Exception as e:
+                    logger.error(f"Error processing similar image: {str(e)}")
+                    # Continue with normal flow if we can't reuse
+            
+            # Create a task ID for new image generation
             task_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
             
@@ -189,7 +351,8 @@ class ImageGenerationCommand(Command):
             context["image_generation"] = {
                 "task_id": task_id,
                 "prompt": prompt,
-                "status": "processing"
+                "status": "processing",
+                "poll_endpoint": f"/api/v1/pipeline/image-status/{task_id}"
             }
             
             # Add to results collection
@@ -197,7 +360,8 @@ class ImageGenerationCommand(Command):
                 "type": "image_generation",
                 "task_id": task_id,
                 "prompt": prompt,
-                "status": "processing"
+                "status": "processing",
+                "poll_endpoint": f"/api/v1/pipeline/image-status/{task_id}"
             })
             
             return context

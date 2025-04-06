@@ -93,6 +93,7 @@ class GetOrCreateConversationRequest(BaseModel):
 
 async def get_or_create_conversation(content_id: str, user_id: str, model_id: str, title: str, db: Database):
     """Get or create a conversation with database-level uniqueness"""
+    logger.info(f"get_or_create_conversation starting: content_id={content_id}, user_id={user_id}, model_id={model_id}, title={title}")
     try:
         # First check if the content exists in mo_content
         content_check_query = "SELECT uuid FROM mo_content WHERE uuid = :uuid"
@@ -376,7 +377,8 @@ async def format_pipeline_response(context: Dict[str, Any]) -> Dict[str, Any]:
 
 async def process_streaming_response(context: Dict[str, Any]):
     """
-    Process the pipeline response for streaming.
+    Process the pipeline response for streaming with a consistent format.
+    All intent types (image_generation, social_media, etc.) will follow the same pattern.
     """
     # First yield detected intents
     intents_message = {
@@ -384,52 +386,105 @@ async def process_streaming_response(context: Dict[str, Any]):
     }
     yield f"data: {json.dumps(intents_message)}\n\n"
 
-    # Process each result individually with proper type signaling
+    # Track which results have been processed
+    processed_results = []
+
+    # Process each result individually with consistent structure
     for result in context.get("results", []):
+        result_type = result.get("type", "unknown")
+        
         # Skip general_knowledge as it will be part of the content stream
-        if result.get("type") == "general_knowledge":
+        if result_type == "general_knowledge":
             continue
-
-        # Create a properly formatted result message with result_type field
+            
+        # Create a standardized result message
         result_message = {
-            "result_type": result.get("type"),
-            "result": result
+            "type": result_type,
+            "result_type": result_type,  # For backward compatibility
+            "result": result,            # For backward compatibility
+            "data": result
         }
-
-        # Add current command info
+        
+        # Special handling for image generation to indicate polling is needed
+        if result_type == "image_generation":
+            # Check if we already have an image URL (from reused image)
+            if "image_url" in result and result["image_url"]:
+                result_message["status"] = "completed"
+                # Make sure the image URL is prominently available
+                result_message["image_url"] = result["image_url"]
+                result_message["data"]["image_url"] = result["image_url"]
+                result_message["result"]["image_url"] = result["image_url"]
+                # Include image_id if available
+                if "image_id" in result:
+                    result_message["image_id"] = result["image_id"]
+                    result_message["data"]["image_id"] = result["image_id"]
+                    result_message["result"]["image_id"] = result["image_id"]
+                # Include reused flag if this is a reused image
+                if result.get("reused"):
+                    result_message["reused"] = True
+                    result_message["data"]["reused"] = True
+                    result_message["result"]["reused"] = True
+            else:
+                # No image URL yet, set needs_polling
+                result_message["status"] = "needs_polling"
+                result_message["poll_endpoint"] = result.get("poll_endpoint") or f"/api/v1/pipeline/image-status/{result.get('task_id')}"
+                # Include additional info about prompt
+                if "prompt" in result:
+                    result_message["prompt"] = result["prompt"]  
+        else:
+            result_message["status"] = "complete"
+        
+        # Add current command info for backward compatibility
         if "current_command" in context:
             result_message["current_command"] = context["current_command"]
         
-        
-
-        # Send each result with clear completion marker
+        # Send result information
         yield f"data: {json.dumps(result_message)}\n\n"
-        # Add a small delay to ensure frontend processes each message
         await asyncio.sleep(0.05)
         
-        # Send a completion signal for this specific result
-        yield f"data: {json.dumps({'result_complete': result.get('type')})}\n\n"
+        # Send a completion signal for this specific result (backward compatibility)
+        yield f"data: {json.dumps({'result_complete': result_type})}\n\n"
         await asyncio.sleep(0.05)
-
-    # Finally stream the content if available
+        
+        # Add to processed results
+        processed_results.append(result_type)
+    
+    # Stream the general knowledge content if available
     if "general_knowledge_content" in context:
         content = context["general_knowledge_content"]
         # Stream in chunks
         chunk_size = 100
         
-        # Signal start of content
+        # Signal start of content (backward compatibility)
         yield f"data: {json.dumps({'content_start': True})}\n\n"
+        
+        # Signal start of content (new format)
+        yield f"data: {json.dumps({'type': 'content_start', 'data': {'content_type': 'text'}})}\n\n"
+        await asyncio.sleep(0.02)
         
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i+chunk_size]
-            yield f"data: {json.dumps({'content': chunk})}\n\n"
+            # Both old and new format for compatibility
+            yield f"data: {json.dumps({'content': chunk, 'type': 'content', 'data': {'text': chunk}})}\n\n"
             # Small delay for natural streaming effect
             await asyncio.sleep(0.02)
+        
+        # Signal end of content
+        yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
+        await asyncio.sleep(0.02)
+        
+        # Add general_knowledge to processed results
+        processed_results.append("general_knowledge")
     
     # Send a final summary message with all completed results
     summary = {
-        "summary": {
-            "completed_results": [r.get("type") for r in context.get("results", []) if r.get("type") != "general_knowledge"],
+        "type": "summary",
+        "summary": {  # For backward compatibility
+            "completed_results": processed_results,
+            "all_complete": True
+        },
+        "data": {
+            "completed_results": processed_results,
             "all_complete": True
         }
     }
@@ -445,6 +500,18 @@ async def process_multi_intent_request(
     current_user: dict,
     db: Database
 ) -> Dict[str, Any]:
+    logger.info(f"process_multi_intent_request starting: content_id={request.content_id}, conversation_id={request.conversation_id}")
+    
+    # If we have a content_id, try to fetch content info
+    if request.content_id:
+        try:
+            content_query = "SELECT id, name, description FROM mo_content WHERE uuid = :content_id"
+            content = await db.fetch_one(content_query, {"content_id": request.content_id})
+            if content:
+                logger.info(f"Found content for request: ID={content['id']}, Name='{content['name']}'")
+        except Exception as e:
+            logger.error(f"Error fetching content info: {str(e)}")
+            # Continue processing even if this fails
     """
     Process a multi-intent request using the pipeline pattern.
     """
@@ -504,6 +571,7 @@ async def process_multi_intent_request(
     context = {
         "message": request.message,
         "conversation_id": conversation_id,
+        "content_id": request.content_id,  # Explicitly include content_id 
         "user_id": current_user.get('id', current_user.get('uid')),
         "db": db,
         "background_tasks": background_tasks,
@@ -511,8 +579,12 @@ async def process_multi_intent_request(
         "intents": significant_intents,
         "model": request.model,
         "temperature": request.temperature,
-        "max_tokens": request.max_tokens
+        "max_tokens": request.max_tokens,
+        "results": []  # Ensure results list is always initialized
     }
+    
+    # Log the content_id we're using
+    logger.info(f"Processing message with content_id: {request.content_id}")
 
     # Create pipeline based on intents
     pipeline = Pipeline(name="MultiIntentPipeline")
@@ -587,9 +659,10 @@ async def get_or_create_conversation_endpoint(
 ):
     """Get an existing conversation or create a new one with idempotency support"""
     user_id = current_user.get("uid")
-    if not user_id:
-        logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
-        user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+    # if not user_id:
+    #     logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
+    #     user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+    logger.info(f"get_or_create_conversation_endpoint starting: content_id={request.content_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
 
     conversation_id = await get_or_create_conversation(
         request.content_id, user_id, request.model_id, request.title, db
@@ -860,10 +933,19 @@ async def stream_multi_intent_chat(
     current_user: dict = Depends(get_user),
     db: Database = Depends(get_database)
 ):
+    logger.info(f"Received stream request with content_id: {request.content_id}, conversation_id: {request.conversation_id}")
     """
     Stream a multi-intent chat response.
     """
     try:
+        # Skip processing if there's no message (likely a new conversation initialization)
+        if not request.message or request.message.strip() == "":
+            logger.info(f"Skipping stream_multi_intent_chat for empty message")
+            return JSONResponse(
+                status_code=200,
+                content={"message": "No message to process", "skipped": True}
+            )
+            
         # Process the request
         result_context = await process_multi_intent_request(request, background_tasks, current_user, db)
         

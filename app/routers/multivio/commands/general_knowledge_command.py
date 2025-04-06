@@ -70,6 +70,34 @@ class GeneralKnowledgeCommand(Command):
             # Build the final system prompt combining results from other commands
             system_prompt = DEFAULT_SYSTEM_PROMPT
             
+            # Add content information if available
+            content_id = context.get("content_id")
+            db = context.get("db")
+            if content_id and db:
+                try:
+                    # Query to get content name by content_id
+                    query = "SELECT name, description FROM mo_content WHERE uuid = :content_id"
+                    content_info = await db.fetch_one(query=query, values={"content_id": content_id})
+                    
+                    if content_info:
+                        content_name = content_info["name"]
+                        content_description = content_info["description"] or ""
+                        
+                        # Add content context to the system prompt
+                        content_prompt = f"""
+## CONTENT CONTEXT
+The user is working on content titled: "{content_name}"
+{f'Description: {content_description}' if content_description else ''}
+
+Keep this content topic in mind when responding to their question.
+"""
+                        system_prompt += "\n\n" + content_prompt
+                        logger.info(f"Added content context to prompt: Content name '{content_name}'")
+                    else:
+                        logger.warning(f"Content with ID {content_id} not found in database")
+                except Exception as e:
+                    logger.error(f"Error fetching content info: {str(e)}")
+            
             # Add all system prompts from other commands
             if "system_prompts" in context and context["system_prompts"]:
                 for prompt_data in context["system_prompts"]:

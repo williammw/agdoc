@@ -129,8 +129,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             del connections[user_id]
 
 @router.websocket("/conversation/{conversation_id}")
-async def conversation_websocket(websocket: WebSocket, conversation_id: str, request: Request):
-    client_host = request.client.host if request.client else "unknown"
+async def conversation_websocket(websocket: WebSocket, conversation_id: str):
+    client_host = websocket.scope.get('client')[0] if websocket.scope.get('client') else "unknown"
     connection_id = f"{client_host}_{int(time.time())}"
     
     await websocket.accept()
