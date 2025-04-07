@@ -9,7 +9,7 @@ from app.models.content_model import ContentCreate, ContentUpdate, ContentRespon
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@router.post("/content", response_model=ContentResponse)
+@router.post("/chat", response_model=ContentResponse)
 async def create_content(
     content: ContentCreate,
     current_user: Dict = Depends(get_current_user),
@@ -53,7 +53,7 @@ async def create_content(
         logger.error(f"Error in create_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/content/{content_id}", response_model=ContentResponse)
+@router.get("/chat/{content_id}", response_model=ContentResponse)
 async def get_content(
     content_id: int,
     current_user: Dict = Depends(get_current_user),
@@ -79,7 +79,7 @@ async def get_content(
         logger.error(f"Error in get_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/content", response_model=List[ContentResponse])
+@router.get("/chat", response_model=List[ContentResponse])
 async def list_content(
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database),
@@ -108,7 +108,7 @@ async def list_content(
         logger.error(f"Error in list_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.put("/content/{content_id}", response_model=ContentResponse)
+@router.put("/chat/{content_id}", response_model=ContentResponse)
 async def update_content(
     content_id: int,
     content: ContentUpdate,
@@ -155,7 +155,7 @@ async def update_content(
     except Exception as e:
         logger.error(f"Error in update_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-@router.patch("/content/{content_id}", response_model=ContentResponse)
+@router.patch("/chat/{content_id}", response_model=ContentResponse)
 async def patch_content(
     content_id: int,
     content: ContentUpdate,
@@ -203,7 +203,7 @@ async def patch_content(
         logger.error(f"Error in patch_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.delete("/content/{content_id}")
+@router.delete("/chat/{content_id}")
 async def delete_content(
     content_id: str,
     current_user: Dict = Depends(get_current_user),
@@ -285,7 +285,7 @@ async def delete_content(
         logger.error(f"Error in delete_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/content/{content_id}/version")
+@router.post("/chat/{content_id}/version")
 async def create_content_version(
     content_id: int,
     version_data: ContentVersion,

@@ -1,5 +1,5 @@
 from .lifespan import app_lifespan
-from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, chat_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router, session_router, session_router
+from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router, session_router, session_router
 # Add this import
 # Import individual router modules from multivio directory
 from app.routers.multivio.grok_router import router as grok_router
@@ -7,7 +7,7 @@ from app.routers.multivio.linkedin_router import router as linkedin_router
 from app.routers.multivio.media_router import router as media_router
 from app.routers.multivio.twitter_router import router as twitter_router
 from app.routers.multivio.userinfo_router import router as userinfo_router
-from app.routers.multivio.content_router import router as content_router
+from app.routers.multivio.chat_router import router as chat_router
 from app.routers.multivio.facebook_router import router as facebook_router
 from app.routers.multivio.instagram_router import router as instagram_router
 from app.routers.multivio.threads_router import router as threads_router
@@ -118,7 +118,7 @@ router_list = [
     (agents_router.router, "/api/v1/agents", ["agents"]),
     (auth_router.router, "/api/v1/auth", ["auth"]),
     (auth2_router.router, "/api/v2/auth", ["auth"]),
-    (chat_router.router, "/api/v1", ["chats"]),
+    (chat_router, "/api/v1/chat", ["chat"]),
     (cv_router.router, "/api/v1/cv", ["cv"]),
     # (rag_router.router, "/api/v1/rag", ["rag"]),
     (live_stream_router.router, "/api/v1/live-stream", ["live-stream"]),
@@ -134,7 +134,6 @@ router_list = [
     (youtube_router, "/api/v1/youtube", ["youtube"]),
     # Add the new user info router
     (userinfo_router, "/api/v1/multivio/user-info", ["userinfo"]),
-    (content_router, "/api/v1/content", ["content"]),
     (facebook_router, "/api/v1/facebook", ["facebook"]),
     (instagram_router, "/api/v1/instagram", ["instagram"]),
     (recycle_router, "/api/v1/recycle", ["recycle"]),
@@ -156,9 +155,6 @@ router_list = [
 ]
 for router, prefix, tags in router_list:
     app.include_router(router, prefix=prefix, tags=tags)
-
-from app.routers.multivio.content_router import router as content_router
-app.include_router(content_router, prefix="/api", tags=["content"])
 
 # Global exception handler
 @app.exception_handler(Exception)
