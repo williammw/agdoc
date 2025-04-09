@@ -83,26 +83,61 @@ async def get_content(
 async def list_content(
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database),
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    limit: int = 40,
+    offset: int = 0
 ):
     try:
+        # Base query for counting total records
+        count_query = """
+        SELECT COUNT(*) as total FROM mo_content 
+        WHERE firebase_uid = :firebase_uid 
+        """
+        
+        count_values = {"firebase_uid": current_user["uid"]}
+        
+        if status:
+            count_query += " AND status = :status"
+            count_values["status"] = status
+
+        # Get total count
+        total_result = await db.fetch_one(query=count_query, values=count_values)
+        total_count = total_result["total"] if total_result else 0
+        
+        # Main query with pagination
         if status:
             query = """
             SELECT * FROM mo_content 
             WHERE firebase_uid = :firebase_uid AND status = :status
             ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
             """
-            values = {"firebase_uid": current_user["uid"], "status": status}
+            values = {
+                "firebase_uid": current_user["uid"], 
+                "status": status, 
+                "limit": limit, 
+                "offset": offset
+            }
         else:
             query = """
             SELECT * FROM mo_content 
             WHERE firebase_uid = :firebase_uid
             ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
             """
-            values = {"firebase_uid": current_user["uid"]}
+            values = {
+                "firebase_uid": current_user["uid"],
+                "limit": limit,
+                "offset": offset
+            }
         
         results = await db.fetch_all(query=query, values=values)
-        return [dict(row) for row in results]
+        
+        # Add pagination metadata to response headers (not part of the JSON response)
+        response_data = [dict(row) for row in results]
+        
+        # Return paginated results with metadata
+        return response_data
 
     except Exception as e:
         logger.error(f"Error in list_content: {str(e)}")
