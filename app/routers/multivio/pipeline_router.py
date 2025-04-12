@@ -48,10 +48,11 @@ class MultiIntentChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     content_id: Optional[str] = None
     message: str
-    model: Optional[str] = "grok-2-1212"
+    model: Optional[str] = "grok-3-mini-beta"
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 1000
     stream: bool = True
+    reasoning_effort: Optional[str] = "high"
 
 
 class CommandResult(BaseModel):
@@ -580,6 +581,7 @@ async def process_multi_intent_request(
         "model": request.model,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
+        "reasoning_effort": request.reasoning_effort,
         "results": []  # Ensure results list is always initialized
     }
     

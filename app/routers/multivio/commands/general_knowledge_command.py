@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import uuid
 import httpx
 import os
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,12 @@ logger = logging.getLogger(__name__)
 GROK_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
 GROK_API_BASE_URL = os.getenv("GROK_API_BASE_URL", "https://api.x.ai/v1")
 
+# Default model to use
+DEFAULT_MODEL = "grok-3-mini-beta"
+
 # Default system prompt for general knowledge
 DEFAULT_SYSTEM_PROMPT = """
-# SYSTEM PROMPT - Multivio General Assistant
+# SYSTEM PROMPT - Multivio General Assistant V1.1.0
 
 You are a helpful, knowledgeable assistant for Multivio users. You can help with a wide range of topics including programming, research, writing, data analysis, and general knowledge questions.
 
@@ -103,80 +107,85 @@ Keep this content topic in mind when responding to their question.
                 for prompt_data in context["system_prompts"]:
                     system_prompt += f"\n\n{prompt_data['content']}"
             
-            # Prepare the request
-            request_data = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ],
-                "model": "grok-2-1212",
+            # Initialize OpenAI client
+            client = OpenAI(
+                api_key=GROK_API_KEY,
+                base_url=GROK_API_BASE_URL
+            )
+            
+            # Prepare messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ]
+            
+            # Prepare parameters for the API call
+            params = {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 2048
             }
             
-            # Call the API
-            headers = {
-                "x-api-key": GROK_API_KEY,
-                "Content-Type": "application/json"
-            }
+            # Add reasoning_effort for grok-3 models
+            if DEFAULT_MODEL.startswith("grok-3"):
+                params["reasoning_effort"] = "high"
+                logger.info(f"Using reasoning_effort=high for {DEFAULT_MODEL}")
             
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{GROK_API_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=request_data,
-                    timeout=60.0
-                )
+            # Call the API
+            logger.info(f"Calling {DEFAULT_MODEL} API for general knowledge")
+            completion = client.chat.completions.create(**params)
+            
+            # Get the content from the response
+            content = completion.choices[0].message.content
+            
+            # For grok-3 models, log the reasoning content if available
+            if DEFAULT_MODEL.startswith("grok-3") and hasattr(completion.choices[0].message, 'reasoning_content'):
+                reasoning = completion.choices[0].message.reasoning_content
+                logger.info(f"Reasoning content received ({len(reasoning)} chars)")
+                # Store reasoning in context for debugging
+                context["reasoning_content"] = reasoning
+            
+            # Add to context
+            context["general_knowledge_content"] = content
+            
+            # Add to results collection
+            context["results"].append({
+                "type": "general_knowledge",
+                "content": content
+            })
+            
+            # Store in database if conversation_id is provided
+            conversation_id = context.get("conversation_id")
+            db = context.get("db")
+            if conversation_id and db:
+                message_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc)
                 
-                if response.status_code != 200:
-                    error_data = response.json() if response.content else {"error": "Unknown error"}
-                    error_message = error_data.get("error", {}).get("message", "API call failed")
-                    logger.error(f"Grok API error: {error_message}")
-                    raise Exception(f"Failed to generate response: {error_message}")
-                
-                result = response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                # Add to context
-                context["general_knowledge_content"] = content
-                
-                # Add to results collection
-                context["results"].append({
+                metadata = {
                     "type": "general_knowledge",
-                    "content": content
-                })
+                    "multi_intent": len(context.get("results", [])) > 1
+                }
                 
-                # Store in database if conversation_id is provided
-                conversation_id = context.get("conversation_id")
-                db = context.get("db")
-                if conversation_id and db:
-                    message_id = str(uuid.uuid4())
-                    now = datetime.now(timezone.utc)
-                    
-                    metadata = {
-                        "type": "general_knowledge",
-                        "multi_intent": len(context.get("results", [])) > 1
-                    }
-                    
-                    await db.execute(
-                        """
-                        INSERT INTO mo_llm_messages (
-                            id, conversation_id, role, content, created_at, metadata
-                        ) VALUES (
-                            :id, :conversation_id, :role, :content, :created_at, :metadata
-                        )
-                        """,
-                        {
-                            "id": message_id,
-                            "conversation_id": conversation_id,
-                            "role": "assistant",
-                            "content": content,
-                            "created_at": now,
-                            "metadata": json.dumps(metadata)
-                        }
+                await db.execute(
+                    """
+                    INSERT INTO mo_llm_messages (
+                        id, conversation_id, role, content, created_at, metadata
+                    ) VALUES (
+                        :id, :conversation_id, :role, :content, :created_at, :metadata
                     )
-                
-                return context
+                    """,
+                    {
+                        "id": message_id,
+                        "conversation_id": conversation_id,
+                        "role": "assistant",
+                        "content": content,
+                        "created_at": now,
+                        "metadata": json.dumps(metadata)
+                    }
+                )
+            
+            return context
                 
         except Exception as e:
             logger.error(f"Error in GeneralKnowledgeCommand: {str(e)}")

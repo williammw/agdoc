@@ -7,8 +7,17 @@ from typing import Dict, Any
 import logging
 import re
 import math
+import os
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+# Load environment variables
+GROK_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
+GROK_API_BASE_URL = os.getenv("GROK_API_BASE_URL", "https://api.x.ai/v1")
+
+# Default model to use
+DEFAULT_MODEL = "grok-3-mini-beta"
 
 @CommandFactory.register("calculation")
 class CalculationCommand(Command):
@@ -149,8 +158,71 @@ class CalculationCommand(Command):
         # Parse the expression from the message
         expression = self._parse_expression(message)
         
-        # Try to evaluate the expression
+        # Try to evaluate the expression with our simple evaluator
         result = self._evaluate_expression(expression)
+        
+        # For complex calculations, fall back to Grok if our evaluator failed
+        if result is None and GROK_API_KEY:
+            try:
+                # Use Grok-3 for complex calculations
+                client = OpenAI(
+                    api_key=GROK_API_KEY,
+                    base_url=GROK_API_BASE_URL
+                )
+                
+                # Create system prompt for calculation
+                system_prompt = """
+                You are a mathematical calculation assistant. Your only task is to:
+                1. Identify the mathematical calculation being requested
+                2. Compute the result
+                3. Reply with ONLY the result as a number, nothing else
+                
+                Don't explain steps or provide any other text. Just return the numerical result.
+                """
+                
+                # Prepare messages
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Calculate: {expression}"}
+                ]
+                
+                # Prepare parameters for the API call
+                params = {
+                    "model": DEFAULT_MODEL,
+                    "messages": messages,
+                    "temperature": 0.0,  # Use deterministic output for calculations
+                    "max_tokens": 50,     # Results should be short
+                    "reasoning_effort": "high"  # Use high reasoning for calculations
+                }
+                
+                # Call the API
+                logger.info(f"Using {DEFAULT_MODEL} API for complex calculation: {expression}")
+                completion = client.chat.completions.create(**params)
+                
+                # Get the content from the response
+                grok_result = completion.choices[0].message.content.strip()
+                
+                # Try to convert the result to a number
+                try:
+                    # Check if the result is a numeric value
+                    if re.match(r'^-?\d+(\.\d+)?$', grok_result):
+                        result = float(grok_result)
+                        # Convert to integer if it's a whole number
+                        if result == int(result):
+                            result = int(result)
+                        logger.info(f"Successfully calculated {expression} = {result} using Grok API")
+                    else:
+                        # If not numeric, use the text as fallback
+                        result_text = grok_result
+                        # Set result to None to use our text-based fallback
+                        result = None
+                except:
+                    logger.error(f"Error converting Grok result to number: {grok_result}")
+                    # We'll fall back to the text-based response below
+                    result = None
+            except Exception as e:
+                logger.error(f"Error using Grok API for calculation: {str(e)}")
+                # Fall back to our default error message
         
         # Format the result
         if result is not None:

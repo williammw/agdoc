@@ -2,7 +2,7 @@ from .lifespan import app_lifespan
 from app.routers import auth2_router, posts_router, recognize_router, search_router, umami_router, agi_router, dev_router, cdn_router, agents_router, auth_router, cv_router, live_stream_router, users_router, comment_router, videos_router, ws_router, openai_router, session_router, session_router
 # Add this import
 # Import individual router modules from multivio directory
-from app.routers.multivio.grok_router import router as grok_router
+# from app.routers.multivio.grok_router import router as grok_router
 from app.routers.multivio.linkedin_router import router as linkedin_router
 from app.routers.multivio.media_router import router as media_router
 from app.routers.multivio.twitter_router import router as twitter_router
@@ -15,11 +15,11 @@ from app.routers.multivio.youtube_router import router as youtube_router
 from app.routers.multivio.folders_router import router as folders_router
 from app.routers.multivio.recycle_router import router as recycle_router
 from app.routers.multivio.together_router import router as together_router
-from app.routers.multivio.smart_router import router as smart_router
-from app.routers.multivio.general_router import router as general_router
+# from app.routers.multivio.smart_router import router as smart_router
+# from app.routers.multivio.general_router import router as general_router
 from app.routers.multivio.brave_search_router import router as brave_search_router
 from app.routers.multivio.direct_search_router import router as direct_search_router
-from app.routers.multivio.websearch_router import router as websearch_router
+# from app.routers.multivio.websearch_router import router as websearch_router
 from app.routers.multivio.puppeteer_router import router as puppeteer_router
 from app.routers.multivio.pipeline_router import router as pipeline_router
 from app.routers.multivio.patreon_router import router as patreon_router
@@ -126,7 +126,7 @@ router_list = [
     (posts_router.router, "/api/v1/posts", ["posts"]),
     (comment_router.router, "/api/v1/comments", ["comments"]),
     (videos_router.router, "/api/v1/videos", ["videos"]),
-    (grok_router, "/api/v1/grok", ["grok"]),
+    # (grok_router, "/api/v1/grok", ["grok"]),
     (openai_router.router, "/api/v1/openai", ["openai"]),
     (ws_router.router, "/api/v1/ws", ["websocket"]),
     (twitter_router, "/api/v1/twitter", ["twitter"]),
@@ -141,11 +141,11 @@ router_list = [
     (media_router, "/api/v1/media", ["media"]),
     (threads_router, "/api/v1/threads", ["threads"]),
     (together_router, "/api/v1/together", ["together"]),
-    (smart_router, "/api/v1/smart", ["smart"]),
-    (general_router, "/api/v1/general", ["general"]),
+    # (smart_router, "/api/v1/smart", ["smart"]),
+    # (general_router, "/api/v1/general", ["general"]),
     (brave_search_router, "/api/v1/brave-search", ["brave_search"]),
     (direct_search_router, "/api/v1/direct-search", ["direct_search"]),
-    (websearch_router, "/api/v1/websearch", ["websearch"]),
+    # (websearch_router, "/api/v1/websearch", ["websearch"]),
     (puppeteer_router, "/api/v1/puppeteer", ["puppeteer"]),
     (pipeline_router, "/api/v1/pipeline", ["pipeline"]),
     (patreon_router, "/api/v1/patreon", ["patreon"]),

@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 import httpx
 import os
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,12 @@ logger = logging.getLogger(__name__)
 GROK_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
 GROK_API_BASE_URL = os.getenv("GROK_API_BASE_URL", "https://api.x.ai/v1")
 
+# Default model to use
+DEFAULT_MODEL = "grok-3-mini-beta"
+
 # Default system prompt for social media content
 SOCIAL_MEDIA_SYSTEM_PROMPT = """
-# SYSTEM PROMPT - Multivio Social Media Assistant
+# SYSTEM PROMPT - Multivio Social Media Assistant V1.1.0
 
 You are a tier-1 enterprise social media strategist for Multivio, the industry-leading cross-platform content management system. You help users create and optimize content across Facebook, Twitter, Instagram, LinkedIn and other platforms through our unified API.
 
@@ -142,84 +146,89 @@ class SocialMediaCommand(Command):
         
         # Create a new conversation message if needed
         try:
-            # Prepare request data
-            request_data = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ],
-                "model": "grok-2-1212",
+            # Initialize OpenAI client
+            client = OpenAI(
+                api_key=GROK_API_KEY,
+                base_url=GROK_API_BASE_URL
+            )
+            
+            # Prepare messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ]
+            
+            # Prepare parameters for the API call
+            params = {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 2048
             }
             
-            # Call Grok API to generate content
-            headers = {
-                "x-api-key": GROK_API_KEY,
-                "Content-Type": "application/json"
+            # Add reasoning_effort for grok-3 models
+            if DEFAULT_MODEL.startswith("grok-3"):
+                params["reasoning_effort"] = "high"
+                logger.info(f"Using reasoning_effort=high for {DEFAULT_MODEL}")
+            
+            # Call the API
+            logger.info(f"Calling {DEFAULT_MODEL} API for social media content generation")
+            completion = client.chat.completions.create(**params)
+            
+            # Get the content from the response
+            content = completion.choices[0].message.content
+            
+            # For grok-3 models, log the reasoning content if available
+            if DEFAULT_MODEL.startswith("grok-3") and hasattr(completion.choices[0].message, 'reasoning_content'):
+                reasoning = completion.choices[0].message.reasoning_content
+                logger.info(f"Reasoning content received ({len(reasoning)} chars)")
+                # Store reasoning in context for debugging
+                context["reasoning_content"] = reasoning
+            
+            # Add to context
+            context["social_media_content"] = {
+                "platforms": platforms,
+                "content": content
             }
             
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{GROK_API_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=request_data,
-                    timeout=60.0
-                )
+            # Add to results collection
+            context["results"].append({
+                "type": "social_media",
+                "platforms": platforms,
+                "content": content
+            })
+            
+            # Store in database if conversation_id is provided
+            conversation_id = context.get("conversation_id")
+            db = context.get("db")
+            if conversation_id and db:
+                message_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc)
                 
-                if response.status_code != 200:
-                    error_data = response.json() if response.content else {"error": "Unknown error"}
-                    error_message = error_data.get("error", {}).get("message", "API call failed")
-                    logger.error(f"Grok API error: {error_message}")
-                    raise Exception(f"Failed to generate social media content: {error_message}")
-                
-                result = response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                # Add to context
-                context["social_media_content"] = {
-                    "platforms": platforms,
-                    "content": content
+                metadata = {
+                    "type": "social_media",
+                    "platforms": platforms
                 }
                 
-                # Add to results collection
-                context["results"].append({
-                    "type": "social_media",
-                    "platforms": platforms,
-                    "content": content
-                })
-                
-                # Store in database if conversation_id is provided
-                conversation_id = context.get("conversation_id")
-                db = context.get("db")
-                if conversation_id and db:
-                    message_id = str(uuid.uuid4())
-                    now = datetime.now(timezone.utc)
-                    
-                    metadata = {
-                        "type": "social_media",
-                        "platforms": platforms
-                    }
-                    
-                    await db.execute(
-                        """
-                        INSERT INTO mo_llm_messages (
-                            id, conversation_id, role, content, created_at, metadata
-                        ) VALUES (
-                            :id, :conversation_id, :role, :content, :created_at, :metadata
-                        )
-                        """,
-                        {
-                            "id": message_id,
-                            "conversation_id": conversation_id,
-                            "role": "assistant",
-                            "content": content,
-                            "created_at": now,
-                            "metadata": json.dumps(metadata)
-                        }
+                await db.execute(
+                    """
+                    INSERT INTO mo_llm_messages (
+                        id, conversation_id, role, content, created_at, metadata
+                    ) VALUES (
+                        :id, :conversation_id, :role, :content, :created_at, :metadata
                     )
-                
-                return context
+                    """,
+                    {
+                        "id": message_id,
+                        "conversation_id": conversation_id,
+                        "role": "assistant",
+                        "content": content,
+                        "created_at": now,
+                        "metadata": json.dumps(metadata)
+                    }
+                )
+            
+            return context
                 
         except Exception as e:
             logger.error(f"Error in SocialMediaCommand: {str(e)}")

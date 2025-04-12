@@ -88,6 +88,7 @@ ipython==8.26.0
 itsdangerous==2.2.0
 jedi==0.19.1
 Jinja2==3.1.4
+jiter==0.9.0
 jmespath==1.0.1
 jupyter_client==8.6.2
 jupyter_core==5.7.2
@@ -111,7 +112,7 @@ nest-asyncio==1.6.0
 networkx==3.4.2
 numpy==1.26.4
 oauthlib==3.2.2
-openai==1.37.1
+openai==1.72.0
 opencv-python==4.10.0.84
 opt-einsum==3.3.0
 optree==0.12.1

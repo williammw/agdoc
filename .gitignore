@@ -136,3 +136,5 @@ app/ML/data
 app/services/fine_tuned_model
 client_secret_659920774949-l2m33ktn8sh4b6sbm3bspq9sk4t1vtg6.apps.googleusercontent.com.json
 app/routers/multivio/pipeline_router.md
+app/routers/multivio/image.json
+app/routers/multivio/newconversation.json
