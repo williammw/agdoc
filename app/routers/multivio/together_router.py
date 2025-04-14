@@ -158,6 +158,67 @@ async def generate_image_task(
     try:
         logger.info(f"Starting image generation task {task_id}")
         
+        # Update to 10% progress stage
+        try:
+            # Create a unique path for this stage
+            timestamp_folder = datetime.now(timezone.utc).strftime('%Y/%m/%d')
+            stage_path = f"generations/{task_id}/10_percent.png"
+            
+            # Update stage record
+            stage_query = """
+            INSERT INTO mo_image_stages
+            (task_id, stage_number, completion_percentage, image_path, image_url)
+            VALUES (:task_id, 2, 10, :image_path, NULL)
+            ON CONFLICT (task_id, stage_number) 
+            DO UPDATE SET completion_percentage = 10, image_path = :image_path
+            """
+            await db.execute(
+                query=stage_query,
+                values={
+                    "task_id": task_id,
+                    "image_path": stage_path
+                }
+            )
+            
+            # Update main task status
+            update_query = """
+            UPDATE mo_ai_tasks 
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE id = :task_id
+            """
+            await db.execute(query=update_query, values={"task_id": task_id})
+        except Exception as e:
+            logger.error(f"Error updating 10% stage: {str(e)}")
+        
+        # Simulate initial processing time (in production this would be actual processing time)
+        await asyncio.sleep(1)
+        
+        # Update to 50% progress stage
+        try:
+            # Create a unique path for this stage
+            stage_path = f"generations/{task_id}/50_percent.png"
+            
+            # Update stage record
+            stage_query = """
+            INSERT INTO mo_image_stages
+            (task_id, stage_number, completion_percentage, image_path, image_url)
+            VALUES (:task_id, 3, 50, :image_path, NULL)
+            ON CONFLICT (task_id, stage_number) 
+            DO UPDATE SET completion_percentage = 50, image_path = :image_path
+            """
+            await db.execute(
+                query=stage_query,
+                values={
+                    "task_id": task_id,
+                    "image_path": stage_path
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error updating 50% stage: {str(e)}")
+        
+        # Simulate more processing time
+        await asyncio.sleep(2)
+        
         # Call together.ai API
         result = await call_together_api("images/generations", api_data)
         
@@ -255,7 +316,7 @@ async def generate_image_task(
                         "processing_status": "completed",
                         "metadata": json.dumps(metadata),
                         "created_at": now,
-                        "original_name": name  # Set original_name to the same as name
+                        "original_name": name
                     }
                 )
                 
@@ -266,6 +327,28 @@ async def generate_image_task(
                     "model": api_data["model"],
                     "created_at": now.isoformat()
                 })
+                
+                # Update the 100% progress stage
+                try:
+                    final_stage_query = """
+                    INSERT INTO mo_image_stages
+                    (task_id, stage_number, completion_percentage, image_path, image_url)
+                    VALUES (:task_id, 4, 100, :image_path, :image_url)
+                    ON CONFLICT (task_id, stage_number) 
+                    DO UPDATE SET completion_percentage = 100, 
+                                 image_path = :image_path,
+                                 image_url = :image_url
+                    """
+                    await db.execute(
+                        query=final_stage_query,
+                        values={
+                            "task_id": task_id,
+                            "image_path": r2_key,
+                            "image_url": image_url
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating final stage: {str(e)}")
         
         # Update task status
         task_query = """
@@ -416,56 +499,8 @@ async def generate_image_task(
                     
                     await db.execute(query=update_query, values=update_values)
                     update_succeeded = True
-                    
-                # Verify database change was applied before sending WebSocket notification
-                if update_succeeded:
-                    # Verify the update by checking the current state
-                    verify_query = """
-                    SELECT content, image_url 
-                    FROM mo_llm_messages 
-                    WHERE id = :message_id AND conversation_id = :conversation_id
-                    """
-                    
-                    # Add a small delay to ensure database consistency
-                    await asyncio.sleep(0.2)
-                    
-                    verification = await db.fetch_one(
-                        query=verify_query,
-                        values={
-                            "message_id": message_id,
-                            "conversation_id": conversation_id
-                        }
-                    )
-                    
-                    if verification:
-                        verification_dict = dict(verification)
-                        logger.info(f"Database verification: content={verification_dict.get('content')[:30]}..., image_url={verification_dict.get('image_url')}")
-                    
-                    # Now send WebSocket notification AFTER database is verified to be updated
-                    try:
-                        await broadcast_to_conversation(
-                            conversation_id,
-                            {
-                                "type": "message_update",
-                                "messageId": message_id,
-                                "updates": {
-                                    "imageUrl": image_url,
-                                    "status": "completed",
-                                    "metadata": {
-                                        "is_image": True,
-                                        "image_task_id": task_id,
-                                        "image_id": first_image.get("id"),
-                                        "imageGenerationStatus": "completed",
-                                        "prompt": prompt,
-                                        "image_url": image_url  # Add image_url in metadata too
-                                    }
-                                }
-                            }
-                        )
-                        logger.info(f"Sent WebSocket notification for image in conversation {conversation_id}")
-                    except Exception as ws_error:
-                        logger.error(f"WebSocket notification error: {str(ws_error)}")
-                        # Continue even if WebSocket notification fails
+                
+                # The WebSocket notification code is removed as we're now using REST polling
                 
                 logger.info(f"Successfully updated conversation message with image URL and metadata")
             except Exception as e:
@@ -495,6 +530,22 @@ async def generate_image_task(
                     "user_id": user_id
                 }
             )
+            
+            # Add a failed stage entry
+            try:
+                failed_stage_query = """
+                INSERT INTO mo_image_stages
+                (task_id, stage_number, completion_percentage, image_path, image_url)
+                VALUES (:task_id, 99, 0, '', NULL)
+                ON CONFLICT (task_id, stage_number) DO NOTHING
+                """
+                await db.execute(
+                    query=failed_stage_query,
+                    values={"task_id": task_id}
+                )
+            except Exception as stage_error:
+                logger.error(f"Error adding failed stage: {str(stage_error)}")
+            
         except Exception as db_error:
             logger.error(f"Failed to update task status: {str(db_error)}")
 

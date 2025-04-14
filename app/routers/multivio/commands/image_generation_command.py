@@ -1,5 +1,6 @@
 """
 Image generation command implementation for the pipeline pattern.
+Updated to use REST-based approach instead of WebSockets.
 """
 from .base import Command, CommandFactory
 from typing import Dict, Any
@@ -7,6 +8,8 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
+import httpx
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +106,6 @@ class ImageGenerationCommand(Command):
             
             # Check if we found a similar image we can reuse
             if similar_image and similar_image["result"]:
-                import json
                 try:
                     # Parse the result as JSON
                     result_data = json.loads(similar_image["result"])
@@ -115,46 +117,9 @@ class ImageGenerationCommand(Command):
                         if image_url and image_id:
                             logger.info(f"Found similar previously generated image: {image_id}")
                             
-                            # Create task ID - we'll still create an entry for tracking
-                            task_id = str(uuid.uuid4())
-                            now = datetime.now(timezone.utc)
-                            
-                            # Store the task as already completed
-                            query = """
-                            INSERT INTO mo_ai_tasks (
-                                id, type, parameters, status, created_by, created_at, updated_at, completed_at, result
-                            ) VALUES (
-                                :id, :type, :parameters, :status, :created_by, :created_at, :updated_at, :completed_at, :result
-                            )
-                            """
-                            
-                            values = {
-                                "id": task_id,
-                                "type": "image_generation",
-                                "parameters": json.dumps({
-                                    "prompt": prompt,
-                                    "model": "flux",
-                                    "num_images": 1,
-                                    "disable_safety_checker": True,
-                                    "reusing_similar_image": True
-                                }),
-                                "status": "completed",
-                                "created_by": current_user["uid"],
-                                "created_at": now,
-                                "updated_at": now,
-                                "completed_at": now,
-                                "result": json.dumps({
-                                    "images": [similar_image_data],
-                                    "reused": True,
-                                    "original_task_id": similar_image["id"]
-                                })
-                            }
-                            
-                            await db.execute(query=query, values=values)
-                            
                             # Add to context that we're reusing an image
                             context["image_generation"] = {
-                                "task_id": task_id,
+                                "task_id": similar_image["id"],
                                 "prompt": prompt,
                                 "status": "completed",
                                 "image_url": image_url,
@@ -165,70 +130,14 @@ class ImageGenerationCommand(Command):
                             # Add to results collection with image URL already available
                             context["results"].append({
                                 "type": "image_generation",
-                                "task_id": task_id,
+                                "task_id": similar_image["id"],
                                 "prompt": prompt,
                                 "status": "completed",
                                 "image_url": image_url,
                                 "image_id": image_id,
-                                "reused": True
+                                "reused": True,
+                                "poll_endpoint": None  # No polling needed for reused image
                             })
-                            
-                            # Record the message in conversation if conversation_id is provided
-                            if conversation_id:
-                                try:
-                                    # Add assistant message directly with the image
-                                    message_id = str(uuid.uuid4())
-                                    
-                                    # Check if the table has an image_url column
-                                    check_image_url_query = """
-                                    SELECT column_name FROM information_schema.columns 
-                                    WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
-                                    """
-                                    has_image_url = await db.fetch_one(check_image_url_query)
-                                    
-                                    # Determine columns and values based on schema
-                                    insert_fields = [
-                                        "id", "conversation_id", "role", "content", "created_at", "metadata"
-                                    ]
-                                    
-                                    insert_values = {
-                                        "id": message_id,
-                                        "conversation_id": conversation_id,
-                                        "role": "assistant",
-                                        "content": f"Generated image of {prompt}",
-                                        "created_at": now,
-                                        "metadata": json.dumps({
-                                            "is_image": True,
-                                            "image_task_id": task_id,
-                                            "image_id": image_id,
-                                            "prompt": prompt,
-                                            "image_url": image_url,
-                                            "status": "completed",
-                                            "reused": True
-                                        })
-                                    }
-                                    
-                                    # Add image_url if the column exists
-                                    if has_image_url:
-                                        insert_fields.append("image_url")
-                                        insert_values["image_url"] = image_url
-                                        
-                                    # Build dynamic query
-                                    fields_str = ", ".join(insert_fields)
-                                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
-                                    
-                                    insert_query = f"""
-                                    INSERT INTO mo_llm_messages (
-                                        {fields_str}
-                                    ) VALUES (
-                                        {placeholders_str}
-                                    )
-                                    """
-                                    
-                                    await db.execute(query=insert_query, values=insert_values)
-                                except Exception as e:
-                                    logger.error(f"Error recording messages for reused image: {str(e)}")
-                                    # Continue even if message recording fails
                             
                             # Return context - we don't need to generate a new image
                             return context
@@ -260,12 +169,12 @@ class ImageGenerationCommand(Command):
             values = {
                 "id": task_id,
                 "type": "image_generation",
-                "parameters": "{" +
-                    f'"prompt": "{prompt}", ' +
-                    f'"model": "flux", ' +
-                    f'"num_images": 1, ' +
-                    f'"disable_safety_checker": true' +
-                "}",
+                "parameters": json.dumps({
+                    "prompt": prompt,
+                    "model": "flux",
+                    "num_images": 1,
+                    "disable_safety_checker": True
+                }),
                 "status": "processing",
                 "created_by": current_user["uid"],
                 "created_at": now,
@@ -273,64 +182,6 @@ class ImageGenerationCommand(Command):
             }
             
             await db.execute(query=query, values=values)
-            
-            # Store message ID for later reference
-            message_id = None
-            
-            # Record the message in conversation if conversation_id is provided
-            if conversation_id:
-                try:
-                    # Add assistant message (placeholder)
-                    message_id = str(uuid.uuid4())
-                    
-                    # Check if the table has an image_url column
-                    check_image_url_query = """
-                    SELECT column_name FROM information_schema.columns 
-                    WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
-                    """
-                    has_image_url = await db.fetch_one(check_image_url_query)
-                    
-                    # Determine columns and values based on schema
-                    insert_fields = [
-                        "id", "conversation_id", "role", "content", "created_at", "metadata"
-                    ]
-                    
-                    insert_values = {
-                        "id": message_id,
-                        "conversation_id": conversation_id,
-                        "role": "assistant",
-                        "content": f"Generating image of {prompt}...",
-                        "created_at": now,
-                        "metadata": "{" +
-                            f'"is_image": true, ' +
-                            f'"image_task_id": "{task_id}", ' +
-                            f'"prompt": "{prompt}", ' +
-                            f'"status": "generating"' +
-                        "}"
-                    }
-                    
-                    # Add image_url placeholder if the column exists
-                    if has_image_url:
-                        insert_fields.append("image_url")
-                        # Will be updated when image is ready
-                        insert_values["image_url"] = "pending" 
-                        
-                    # Build dynamic query
-                    fields_str = ", ".join(insert_fields)
-                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
-                    
-                    insert_query = f"""
-                    INSERT INTO mo_llm_messages (
-                        {fields_str}
-                    ) VALUES (
-                        {placeholders_str}
-                    )
-                    """
-                    
-                    await db.execute(query=insert_query, values=insert_values)
-                except Exception as e:
-                    logger.error(f"Error recording messages in stream chat: {str(e)}")
-                    # Continue even if message recording fails
             
             # Import the image generation task to avoid circular imports
             from app.routers.multivio.together_router import generate_image_task
@@ -344,7 +195,7 @@ class ImageGenerationCommand(Command):
                 None,  # No folder_id for chat-based images
                 db,
                 conversation_id,
-                message_id
+                None  # No message_id
             )
             
             # Add to context
@@ -352,7 +203,7 @@ class ImageGenerationCommand(Command):
                 "task_id": task_id,
                 "prompt": prompt,
                 "status": "processing",
-                "poll_endpoint": f"/api/v1/pipeline/image-status/{task_id}"
+                "poll_endpoint": f"/api/v1/pipeline/image/{task_id}"  # Use the compatible endpoint
             }
             
             # Add to results collection
@@ -361,7 +212,7 @@ class ImageGenerationCommand(Command):
                 "task_id": task_id,
                 "prompt": prompt,
                 "status": "processing",
-                "poll_endpoint": f"/api/v1/pipeline/image-status/{task_id}"
+                "poll_endpoint": f"/api/v1/pipeline/image/{task_id}"  # Use the compatible endpoint
             })
             
             return context

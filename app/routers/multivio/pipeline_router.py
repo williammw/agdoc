@@ -13,6 +13,7 @@ import json
 import os
 import logging
 import asyncio
+import httpx
 from datetime import datetime, timezone
 import traceback
 import re
@@ -380,6 +381,7 @@ async def process_streaming_response(context: Dict[str, Any]):
     """
     Process the pipeline response for streaming with a consistent format.
     All intent types (image_generation, social_media, etc.) will follow the same pattern.
+    Updated to support REST-based polling for image generation.
     """
     # First yield detected intents
     intents_message = {
@@ -428,7 +430,7 @@ async def process_streaming_response(context: Dict[str, Any]):
             else:
                 # No image URL yet, set needs_polling
                 result_message["status"] = "needs_polling"
-                result_message["poll_endpoint"] = result.get("poll_endpoint") or f"/api/v1/pipeline/image-status/{result.get('task_id')}"
+                result_message["poll_endpoint"] = result.get("poll_endpoint") or f"/api/v1/media/image-status/{result.get('task_id')}"
                 # Include additional info about prompt
                 if "prompt" in result:
                     result_message["prompt"] = result["prompt"]  
@@ -482,11 +484,15 @@ async def process_streaming_response(context: Dict[str, Any]):
         "type": "summary",
         "summary": {  # For backward compatibility
             "completed_results": processed_results,
-            "all_complete": True
+            "all_complete": True,
+            "polling_required": any(result.get("type") == "image_generation" and 
+                                  not result.get("image_url") for result in context.get("results", []))
         },
         "data": {
             "completed_results": processed_results,
-            "all_complete": True
+            "all_complete": True,
+            "polling_required": any(result.get("type") == "image_generation" and 
+                                  not result.get("image_url") for result in context.get("results", []))
         }
     }
     yield f"data: {json.dumps(summary)}\n\n"
@@ -938,6 +944,7 @@ async def stream_multi_intent_chat(
     logger.info(f"Received stream request with content_id: {request.content_id}, conversation_id: {request.conversation_id}")
     """
     Stream a multi-intent chat response.
+    Updated to support REST-based image generation.
     """
     try:
         # Skip processing if there's no message (likely a new conversation initialization)
@@ -961,6 +968,13 @@ async def stream_multi_intent_chat(
         if "general_knowledge_content" in result_context:
             response_content = result_context["general_knowledge_content"]
         
+        # Check if there's an image generation result
+        image_generation_result = None
+        for result in result_context.get("results", []):
+            if result.get("type") == "image_generation":
+                image_generation_result = result
+                break
+                
         # Create metadata with all results for later retrieval
         metadata = {
             "multi_intent": True,
@@ -970,6 +984,20 @@ async def stream_multi_intent_chat(
             "message_id": message_id
         }
         
+        # Add image information to metadata if available
+        if image_generation_result:
+            if "image_url" in image_generation_result and image_generation_result["image_url"]:
+                # Image already available
+                metadata["has_image"] = True
+                metadata["image_url"] = image_generation_result["image_url"]
+                metadata["image_status"] = "completed"
+            else:
+                # Image being generated, needs polling
+                metadata["has_image"] = True
+                metadata["image_status"] = "processing"
+                metadata["image_task_id"] = image_generation_result.get("task_id")
+                metadata["image_poll_endpoint"] = image_generation_result.get("poll_endpoint")
+                
         # Check if this message already exists to prevent duplicates
         check_query = """
         SELECT id FROM mo_llm_messages
@@ -1233,7 +1261,6 @@ async def run_diagnostics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/message/{message_id}")
 @router.get("/image-status/{task_id}")
 async def get_image_status(
     task_id: str,
@@ -1242,8 +1269,63 @@ async def get_image_status(
 ):
     """
     Get the status of an image generation task.
+    Updated to use REST-based approach.
     """
     logger.info(f"Received request for image status, task_id: {task_id}")
+    try:
+        # Determine the media API URL (same server)
+        # Use relative URL since we're on the same server
+        api_url = f"/api/v1/media/image-status/{task_id}"
+        
+        # Get token from current_user for authentication
+        token = current_user.get("token", "")
+        
+        # Make HTTP request to our REST endpoint
+        async with httpx.AsyncClient() as client:
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                
+                # Forward the request to our media endpoint
+                response = await client.get(
+                    api_url, 
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    # Success - return the media endpoint response
+                    return response.json()
+                else:
+                    # Request failed
+                    return {
+                        "status": "failed",
+                        "error": f"Status check failed: {response.text}"
+                    }
+            except Exception as request_error:
+                logger.error(f"Error making API request: {str(request_error)}")
+                return {
+                    "status": "error",
+                    "error": f"API request error: {str(request_error)}"
+                }
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting image status: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/image/{task_id}")
+async def get_image(
+    task_id: str,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Get the status of an image generation task.
+    Compatibility endpoint for existing client code.
+    """
+    logger.info(f"Received request for image, task_id: {task_id}")
     try:
         # Query the task table for the task
         query = """
@@ -1253,68 +1335,64 @@ async def get_image_status(
         FROM mo_ai_tasks 
         WHERE id = :task_id
         """
-        
-        logger.info(f"Executing DB query for task_id: {task_id}")
+
         task = await db.fetch_one(
             query=query,
             values={
                 "task_id": task_id
             }
         )
-        
+
         if not task:
-            logger.warning(f"Task not found: {task_id}")
-            raise HTTPException(status_code=404, detail="Image generation task not found")
-        
+            raise HTTPException(status_code=404, detail="Image task not found")
+
         task_dict = dict(task)
-        logger.info(f"Found task with status: {task_dict['status']}")
-        
+
         if task_dict["status"] == "completed" and task_dict["result"]:
             # Parse the result JSON
             result_data = json.loads(task_dict["result"])
-            
+
             # Get the first image from the result
-            image = result_data.get("images", [])[0] if result_data.get("images") else None
-            
+            image = result_data.get("images", [])[
+                0] if result_data.get("images") else None
+
             if image:
-                logger.info(f"Returning completed image: {image['id']}")
+                # FIX: Return url field that matches what the frontend expects
                 return {
                     "status": "completed",
+                    # CHANGED: image_url -> url for frontend compatibility
+                    "url": image["url"],
+                    # Keep this for backward compatibility
                     "image_url": image["url"],
                     "image_id": image["id"],
                     "prompt": image["prompt"],
                     "model": image["model"],
-                    "created_at": task_dict["created_at"].isoformat() if task_dict["created_at"] else None,
-                    "completed_at": task_dict["completed_at"].isoformat() if task_dict["completed_at"] else None
                 }
             else:
                 # Result exists but no images found
-                logger.warning(f"Task {task_id} completed but no images found")
                 return {
                     "status": "failed",
                     "error": "No images found in completed result"
                 }
-                
+
         elif task_dict["status"] == "failed":
-            logger.warning(f"Task {task_id} failed: {task_dict.get('error', 'Unknown error')}")
             return {
                 "status": "failed",
                 "error": task_dict.get("error", "Unknown error occurred during image generation")
             }
         else:
-            # Still processing
-            logger.info(f"Task {task_id} is still processing")
+            # Still processing - return progress information
             return {
                 "status": "processing",
                 "message": "Image generation is still in progress"
             }
-            
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting image status: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error getting image: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 async def get_message_by_id(
     message_id: str,

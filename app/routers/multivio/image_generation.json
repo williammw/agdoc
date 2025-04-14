@@ -1,0 +1,60 @@
+{
+    "action": "next",
+    "messages": [
+        {
+            "id": "38fefae2-865f-4a5c-abd5-0d8ea033d36e",
+            "author": {
+                "role": "user"
+            },
+            "create_time": 1744584810.32,
+            "content": {
+                "content_type": "text",
+                "parts": [
+                    "Create image Ghibli style of sexy woman"
+                ]
+            },
+            "metadata": {
+                "selected_github_repos": [],
+                "system_hints": [
+                    "picture_v2"
+                ],
+                "serialization_metadata": {
+                    "custom_symbol_offsets": [
+                        {
+                            "symbol": "systemHint",
+                            "startIndex": 0,
+                            "endIndex": 13
+                        }
+                    ]
+                },
+                "dictation": false
+            }
+        }
+    ],
+    "conversation_id": "67fc2bfe-7224-8011-9926-8ec1af1ccbc2",
+    "parent_message_id": "37350c27-e4bf-4879-91f4-b3097ba979aa",
+    "model": "gpt-4o",
+    "timezone_offset_min": -60,
+    "timezone": "Europe/London",
+    "conversation_mode": {
+        "kind": "primary_assistant"
+    },
+    "enable_message_followups": true,
+    "system_hints": [
+        "picture_v2"
+    ],
+    "supports_buffering": true,
+    "supported_encodings": [
+        "v1"
+    ],
+    "client_contextual_info": {
+        "is_dark_mode": true,
+        "time_since_loaded": 5243,
+        "page_height": 1318,
+        "page_width": 1001,
+        "pixel_ratio": 1,
+        "screen_height": 1440,
+        "screen_width": 2560
+    },
+    "paragen_cot_summary_display_override": "allow"
+}

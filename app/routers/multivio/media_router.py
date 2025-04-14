@@ -1,8 +1,7 @@
-
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from typing import List, Optional, Dict
-from pydantic import BaseModel
-from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, BackgroundTasks
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from datetime import datetime, timezone, timedelta, date
 import logging
 from app.dependencies import get_current_user, get_database
 from databases import Database
@@ -10,6 +9,7 @@ import boto3
 import os
 import uuid
 import json
+import asyncio
 logger = logging.getLogger(__name__)
 
 # Configure R2 client
@@ -70,6 +70,22 @@ class PresignedUrlRequest(BaseModel):
     filename: str
     content_type: str
     folder_id: Optional[str] = None
+
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    negative_prompt: Optional[str] = None
+    size: str = "1024x1024"
+    model: str = "flux"
+    num_images: int = Field(1, ge=1, le=4)
+    folder_id: Optional[str] = None
+    disable_safety_checker: bool = True
+
+
+class ImageGenerationResponse(BaseModel):
+    task_id: str
+    status: str = "processing"
+    public_url: Optional[str] = None
 
 
 def configure_r2_cors():
@@ -576,3 +592,328 @@ async def delete_file(
     except Exception as e:
         logger.error(f"Delete error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def check_and_update_quota(db: Database, user_id: str) -> bool:
+    """Check if user has remaining quota and update usage."""
+    # Check if user has a quota record
+    query = """
+    SELECT * FROM mo_image_quotas WHERE user_id = :user_id
+    """
+    quota = await db.fetch_one(query=query, values={"user_id": user_id})
+    
+    today = date.today()
+    
+    # If no quota record exists, create one
+    if not quota:
+        insert_query = """
+        INSERT INTO mo_image_quotas 
+        (user_id, daily_limit, daily_used, monthly_limit, monthly_used, last_reset_date)
+        VALUES (:user_id, 10, 0, 100, 0, :today)
+        RETURNING *
+        """
+        quota = await db.fetch_one(
+            query=insert_query, 
+            values={"user_id": user_id, "today": today}
+        )
+    
+    # Convert to dict for easier access
+    quota = dict(quota)
+    
+    # Check if we need to reset daily counter
+    if quota["last_reset_date"] < today:
+        update_query = """
+        UPDATE mo_image_quotas
+        SET daily_used = 0, last_reset_date = :today
+        WHERE user_id = :user_id
+        RETURNING *
+        """
+        quota = await db.fetch_one(
+            query=update_query,
+            values={"user_id": user_id, "today": today}
+        )
+        quota = dict(quota)
+    
+    # Check if we need to reset monthly counter (first day of month)
+    if today.day == 1 and quota["last_reset_date"].month != today.month:
+        update_query = """
+        UPDATE mo_image_quotas
+        SET monthly_used = 0
+        WHERE user_id = :user_id
+        RETURNING *
+        """
+        quota = await db.fetch_one(
+            query=update_query,
+            values={"user_id": user_id}
+        )
+        quota = dict(quota)
+    
+    # Check if user has exceeded quotas
+    if quota["daily_used"] >= quota["daily_limit"]:
+        return False
+    
+    if quota["monthly_used"] >= quota["monthly_limit"]:
+        return False
+    
+    # Update usage counters
+    update_query = """
+    UPDATE mo_image_quotas
+    SET daily_used = daily_used + 1, monthly_used = monthly_used + 1
+    WHERE user_id = :user_id
+    """
+    await db.execute(query=update_query, values={"user_id": user_id})
+    
+    return True
+
+@router.post("/generate-image", response_model=ImageGenerationResponse)
+async def generate_image(
+    request: ImageGenerationRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Initiate image generation process with REST approach."""
+    try:
+        # Check user quota
+        user_id = current_user["uid"]
+        has_quota = await check_and_update_quota(db, user_id)
+        
+        if not has_quota:
+            raise HTTPException(
+                status_code=429,
+                detail="You have reached your daily or monthly image generation limit"
+            )
+        
+        # Create a task ID
+        task_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        
+        # Prepare API data for together.ai
+        api_data = {
+            "prompt": request.prompt,
+            "model": request.model,
+            "n": request.num_images,
+            "disable_safety_checker": request.disable_safety_checker
+        }
+        
+        # Add optional parameters
+        if request.negative_prompt:
+            api_data["negative_prompt"] = request.negative_prompt
+        
+        if request.size:
+            width, height = map(int, request.size.split("x"))
+            api_data["width"] = width
+            api_data["height"] = height
+        
+        # Store the task in the database
+        query = """
+        INSERT INTO mo_ai_tasks (
+            id, type, parameters, status, created_by, created_at, updated_at
+        ) VALUES (
+            :id, :type, :parameters, :status, :created_by, :created_at, :updated_at
+        )
+        """
+        
+        values = {
+            "id": task_id,
+            "type": "image_generation",
+            "parameters": json.dumps({
+                "prompt": request.prompt,
+                "negative_prompt": request.negative_prompt,
+                "size": request.size,
+                "model": request.model,
+                "num_images": request.num_images,
+                "folder_id": request.folder_id,
+                "disable_safety_checker": request.disable_safety_checker
+            }),
+            "status": "processing",
+            "created_by": user_id,
+            "created_at": now,
+            "updated_at": now
+        }
+        
+        await db.execute(query=query, values=values)
+        
+        # Create initial stage record at 0%
+        stage_query = """
+        INSERT INTO mo_image_stages
+        (task_id, stage_number, completion_percentage, image_path, image_url)
+        VALUES (:task_id, 1, 0, '', NULL)
+        """
+        await db.execute(
+            query=stage_query,
+            values={
+                "task_id": task_id
+            }
+        )
+        
+        # Import the image generation task to avoid circular imports
+        from app.routers.multivio.together_router import generate_image_task
+        
+        # Start background task
+        background_tasks.add_task(
+            generate_image_task,
+            task_id,
+            api_data,
+            user_id,
+            request.folder_id,
+            db
+        )
+        
+        return ImageGenerationResponse(
+            task_id=task_id,
+            status="processing"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error initiating image generation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/image-status/{task_id}")
+async def get_image_status(
+    task_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Get the status of an image generation task."""
+    try:
+        # Query the task table for the task
+        query = """
+        SELECT id, type, parameters, status, result, error, 
+               created_at AT TIME ZONE 'UTC' as created_at,
+               completed_at AT TIME ZONE 'UTC' as completed_at
+        FROM mo_ai_tasks 
+        WHERE id = :task_id
+        """
+        
+        task = await db.fetch_one(
+            query=query,
+            values={
+                "task_id": task_id
+            }
+        )
+        
+        if not task:
+            raise HTTPException(status_code=404, detail="Image generation task not found")
+        
+        task_dict = dict(task)
+        
+        # Get the latest stage information
+        stages_query = """
+        SELECT * FROM mo_image_stages
+        WHERE task_id = :task_id
+        ORDER BY completion_percentage DESC
+        LIMIT 1
+        """
+        
+        stage = await db.fetch_one(
+            query=stages_query,
+            values={"task_id": task_id}
+        )
+        
+        stage_dict = dict(stage) if stage else {}
+        
+        if task_dict["status"] == "completed" and task_dict["result"]:
+            # Parse the result JSON
+            result_data = json.loads(task_dict["result"])
+            
+            # Get the first image from the result
+            image = result_data.get("images", [])[0] if result_data.get("images") else None
+            
+            if image:
+                return {
+                    "status": "completed",
+                    "image_url": image["url"],
+                    "image_id": image["id"],
+                    "prompt": image["prompt"],
+                    "model": image["model"],
+                    "created_at": task_dict["created_at"].isoformat() if task_dict["created_at"] else None,
+                    "completed_at": task_dict["completed_at"].isoformat() if task_dict["completed_at"] else None
+                }
+            else:
+                # Result exists but no images found
+                return {
+                    "status": "failed",
+                    "error": "No images found in completed result"
+                }
+                
+        elif task_dict["status"] == "failed":
+            return {
+                "status": "failed",
+                "error": task_dict.get("error", "Unknown error occurred during image generation")
+            }
+        else:
+            # Still processing - return stage information
+            return {
+                "status": "processing",
+                "completion": stage_dict.get("completion_percentage", 0),
+                "image_url": stage_dict.get("image_url", None),
+                "message": "Image generation is still in progress"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting image status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/images/history")
+async def get_image_history(
+    limit: int = 10,
+    offset: int = 0,
+    user = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Get user's image generation history."""
+    user_id = user.get("uid")
+    
+    query = """
+    SELECT t.id, t.parameters, t.status, t.created_at, t.result
+    FROM mo_ai_tasks t
+    WHERE t.type = 'image_generation' AND t.created_by = :user_id
+    ORDER BY t.created_at DESC
+    LIMIT :limit OFFSET :offset
+    """
+    
+    history_items = await db.fetch_all(
+        query=query,
+        values={"user_id": user_id, "limit": limit, "offset": offset}
+    )
+    
+    count_query = """
+    SELECT COUNT(*) as total
+    FROM mo_ai_tasks
+    WHERE type = 'image_generation' AND created_by = :user_id
+    """
+    count = await db.fetch_val(query=count_query, values={"user_id": user_id}, column="total")
+    
+    # Process history items
+    processed_items = []
+    for item in history_items:
+        item_dict = dict(item)
+        
+        # Parse the parameters
+        try:
+            if isinstance(item_dict["parameters"], str):
+                item_dict["parameters"] = json.loads(item_dict["parameters"])
+        except:
+            pass
+            
+        # Parse the result if completed
+        if item_dict["status"] == "completed" and item_dict.get("result"):
+            try:
+                if isinstance(item_dict["result"], str):
+                    result_data = json.loads(item_dict["result"])
+                    # Extract just the first image for the overview
+                    if "images" in result_data and len(result_data["images"]) > 0:
+                        item_dict["image"] = result_data["images"][0]
+            except:
+                pass
+                
+        processed_items.append(item_dict)
+    
+    return {
+        "images": processed_items,
+        "total": count,
+        "limit": limit,
+        "offset": offset
+    }
