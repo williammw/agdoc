@@ -56,6 +56,35 @@ class MultiIntentChatRequest(BaseModel):
     reasoning_effort: Optional[str] = "high"
 
 
+# Add enhanced request model
+class StreamChatRequest(BaseModel):
+    conversation_id: Optional[str] = None
+    content_id: Optional[str] = None
+    content_name: Optional[str] = None
+    message: str
+    message_type: str = "text"  # "text", "image", "social", "reasoning"
+    stream: bool = True
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "conversation_id": "optional-for-existing-chats",
+                "content_id": "optional-content-id",
+                "content_name": "New Chat Title",
+                "message": "Hello, how can you help me today?",
+                "message_type": "text",
+                "options": {
+                    "perform_web_search": False,
+                    "image_model": None,
+                    "social_platforms": None,
+                    "reasoning_model": None,
+                    "unfiltered": False
+                }
+            }
+        }
+
+
 class CommandResult(BaseModel):
     type: str
     content: Optional[str] = None
@@ -182,6 +211,124 @@ async def get_or_create_conversation(content_id: str, user_id: str, model_id: st
         # If recovery failed, re-raise
         raise
 
+
+# Add helper functions
+async def create_new_content(db: Database, user_id: str, content_name: str) -> str:
+    """Create new content and return its ID, checks first if similar content exists"""
+    # First check if the user already has content with a similar name
+    similarity_query = """
+    SELECT uuid FROM mo_content 
+    WHERE firebase_uid = :user_id AND name = :content_name
+    LIMIT 1
+    """
+    
+    existing = await db.fetch_one(
+        query=similarity_query,
+        values={
+            "user_id": user_id,
+            "content_name": content_name
+        }
+    )
+    
+    if existing:
+        logger.info(f"Found existing content with same name: {existing['uuid']}")
+        return str(existing["uuid"])
+    
+    # Create new content if none exists
+    content_id = str(uuid.uuid4())
+    route = f"auto-{uuid.uuid4().hex[:8]}"  # Generate unique route
+    
+    query = """
+    INSERT INTO mo_content 
+    (uuid, firebase_uid, name, description, route, status) 
+    VALUES 
+    (:uuid, :firebase_uid, :name, :description, :route, 'draft')
+    RETURNING uuid
+    """
+    
+    values = {
+        "uuid": content_id,
+        "firebase_uid": user_id,
+        "name": content_name or "New Chat",
+        "description": "Conversation content",
+        "route": route
+    }
+    
+    try:
+        result = await db.fetch_one(query=query, values=values)
+        return str(result["uuid"])
+    except Exception as e:
+        # If insertion fails, try to find the content again (race condition)
+        logger.warning(f"Error creating content, checking if it exists: {str(e)}")
+        existing = await db.fetch_one(
+            query=similarity_query,
+            values={
+                "user_id": user_id,
+                "content_name": content_name
+            }
+        )
+        
+        if existing:
+            return str(existing["uuid"])
+        else:
+            # If still not found, try to create with a slightly modified name
+            modified_name = f"{content_name} {datetime.now().strftime('%H:%M:%S')}"
+            content_id = str(uuid.uuid4())
+            
+            values["uuid"] = content_id
+            values["name"] = modified_name
+            values["route"] = f"auto-{uuid.uuid4().hex[:8]}"
+            
+            result = await db.fetch_one(query=query, values=values)
+            return str(result["uuid"])
+
+async def create_new_conversation(db: Database, user_id: str, content_id: Optional[str] = None, model_id: str = "grok-3-mini-beta", title: Optional[str] = None) -> str:
+    """Create new conversation and return its ID, or return existing ID if one exists"""
+    
+    # First check if a conversation already exists for this user and content
+    if content_id:
+        check_query = """
+        SELECT id FROM mo_llm_conversations
+        WHERE user_id = :user_id AND content_id = :content_id
+        ORDER BY created_at DESC LIMIT 1
+        """
+        
+        existing = await db.fetch_one(
+            query=check_query,
+            values={
+                "user_id": user_id,
+                "content_id": content_id
+            }
+        )
+        
+        if existing:
+            logger.info(f"Reusing existing conversation {existing['id']} for content {content_id} and user {user_id}")
+            return str(existing["id"])
+    
+    # If no existing conversation or no content_id, create a new one
+    conversation_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    
+    query = """
+    INSERT INTO mo_llm_conversations (
+        id, user_id, title, model_id, created_at, updated_at, content_id
+    ) VALUES (
+        :id, :user_id, :title, :model, :created_at, :updated_at, :content_id
+    ) RETURNING id
+    """
+
+    values = {
+        "id": conversation_id,
+        "user_id": user_id,
+        "title": title or "New Conversation",
+        "model": model_id,
+        "created_at": now,
+        "updated_at": now,
+        "content_id": content_id
+    }
+
+    result = await db.fetch_one(query=query, values=values)
+    return str(result["id"])
 
 
 async def get_user(request: Request, db: Database = Depends(get_database)):
@@ -383,11 +530,27 @@ async def process_streaming_response(context: Dict[str, Any]):
     All intent types (image_generation, social_media, etc.) will follow the same pattern.
     Updated to support REST-based polling for image generation.
     """
-    # First yield detected intents
+    # First yield initialization information if we have new IDs
+    if context.get("conversation_id") or context.get("content_id"):
+        init_message = {
+            "type": "initialization",
+            "data": {
+                "conversation_id": context.get("conversation_id"),
+                "content_id": context.get("content_id")
+            }
+        }
+        yield f"data: {json.dumps(init_message)}\n\n"
+        await asyncio.sleep(0.05)
+
+    # Yield detected intents
     intents_message = {
-        "detected_intents": list(context.get("intents", {}).keys())
+        "type": "intents",
+        "data": {
+            "intents": list(context.get("intents", {}).keys())
+        }
     }
     yield f"data: {json.dumps(intents_message)}\n\n"
+    await asyncio.sleep(0.05)
 
     # Track which results have been processed
     processed_results = []
@@ -476,6 +639,20 @@ async def process_streaming_response(context: Dict[str, Any]):
         yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
         await asyncio.sleep(0.02)
         
+        # Check if we have reasoning content to send
+        if "reasoning_content" in context and context["reasoning_content"]:
+            reasoning_content = context["reasoning_content"]
+            
+            # Send reasoning content in a special message
+            reasoning_msg = {
+                "type": "reasoning_content",
+                "data": {
+                    "reasoning": reasoning_content
+                }
+            }
+            yield f"data: {json.dumps(reasoning_msg)}\n\n"
+            await asyncio.sleep(0.02)
+        
         # Add general_knowledge to processed results
         processed_results.append("general_knowledge")
     
@@ -499,6 +676,140 @@ async def process_streaming_response(context: Dict[str, Any]):
 
     # End the stream
     yield "data: [DONE]\n\n"
+
+
+async def process_message_with_pipeline(config: Dict[str, Any]):
+    """Process message through pipeline and yield formatted chunks"""
+    # Extract request parameters
+    message_type = config.get("message_type", "text")
+    options = config.get("options", {})
+    conversation_id = config.get("conversation_id")
+    db = config.get("db")
+    
+    # Configure message processing based on message type and options
+    if message_type == "image":
+        # For image generation requests
+        config["intents"] = {"image_generation": {"confidence": 1.0}}
+    elif message_type == "social":
+        # For social media content requests
+        config["intents"] = {"social_media": {"confidence": 1.0}}
+        if options.get("social_platforms"):
+            config["social_platforms"] = options["social_platforms"]
+    elif message_type == "reasoning":
+        # For reasoning-focused requests
+        config["reasoning_effort"] = "high"
+        if options.get("reasoning_model"):
+            config["model"] = options["reasoning_model"]
+    
+    # Always detect intents for text messages
+    if message_type == "text":
+        intents = detect_intents(config["message"])
+        # Filter out low-confidence intents
+        significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
+        config["intents"] = significant_intents
+    
+    # Handle web search option
+    if options.get("perform_web_search"):
+        # This would integrate with your web search command
+        pass
+        
+    # Create pipeline based on intents and message type
+    pipeline = Pipeline(name="MultiIntentPipeline")
+    
+    # Add commands based on message type and intents
+    intents_dict = config.get("intents", {})
+    
+    # For calculation
+    if "calculation" in intents_dict:
+        pipeline.add_command(CommandFactory.create("calculation"))
+    
+    # For image generation
+    if message_type == "image" or "image_generation" in intents_dict:
+        image_command = CommandFactory.create("image_generation")
+        if options.get("image_model"):
+            # Set model in command config
+            image_command.set_option("model", options["image_model"])
+        pipeline.add_command(image_command)
+        
+    # For social media
+    if message_type == "social" or "social_media" in intents_dict:
+        social_command = CommandFactory.create("social_media")
+        if options.get("social_platforms"):
+            # Set platforms in command config
+            social_command.set_option("platforms", options["social_platforms"])
+        pipeline.add_command(social_command)
+        
+    # For conversation/general knowledge
+    if message_type in ["text", "reasoning"] or "conversation" in intents_dict:
+        if "conversation" in intents_dict:
+            pipeline.add_command(CommandFactory.create("conversation"))
+        
+        # Add general knowledge command for text responses
+        if message_type != "image" and message_type != "social":
+            pipeline.add_command(CommandFactory.create("general_knowledge"))
+    
+    # Execute the pipeline
+    result_context = await pipeline.execute(config)
+    
+    # Stream the response
+    try:
+        async for chunk in process_streaming_response(result_context):
+            yield chunk
+            
+        # After streaming is complete, update the message in the database with the complete content
+        if conversation_id and db and "general_knowledge_content" in result_context:
+            # Find the most recent assistant message for this conversation
+            query = """
+            SELECT id, metadata FROM mo_llm_messages 
+            WHERE conversation_id = :conversation_id AND role = 'assistant'
+            ORDER BY created_at DESC LIMIT 1
+            """
+            
+            recent_message = await db.fetch_one(query=query, values={"conversation_id": conversation_id})
+            
+            if recent_message:
+                message_id = recent_message["id"]
+                metadata = {}
+                
+                # Parse existing metadata if available
+                if recent_message["metadata"]:
+                    try:
+                        metadata = json.loads(recent_message["metadata"])
+                    except:
+                        pass
+                
+                # Update with reasoning content if available
+                if "reasoning_content" in result_context:
+                    metadata["reasoning_content"] = result_context["reasoning_content"]
+                    logger.info(f"Updating message {message_id} with reasoning content")
+                
+                # Include other important information
+                if "intents" in result_context:
+                    metadata["detected_intents"] = list(result_context["intents"].keys())
+                
+                # Update the message with content and metadata
+                update_query = """
+                UPDATE mo_llm_messages
+                SET content = :content, metadata = :metadata
+                WHERE id = :message_id
+                """
+                
+                await db.execute(
+                    query=update_query,
+                    values={
+                        "message_id": message_id,
+                        "content": result_context.get("general_knowledge_content", ""),
+                        "metadata": json.dumps(metadata)
+                    }
+                )
+                logger.info(f"Updated message {message_id} with complete content and metadata")
+            else:
+                logger.warning(f"No recent assistant message found for conversation {conversation_id}")
+    except Exception as e:
+        logger.error(f"Error in process_message_with_pipeline streaming: {str(e)}")
+        # Still yield the error so the client knows something went wrong
+        yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def process_multi_intent_request(
@@ -657,26 +968,26 @@ async def create_conversation(
     return await get_or_create_conversation_endpoint(request, idempotency_key, db, current_user)
 
 
-@router.post("/conversation/get-or-create")
-@idempotent("get_or_create_conversation")
-async def get_or_create_conversation_endpoint(
-    request: GetOrCreateConversationRequest,
-    idempotency_key: Optional[str] = Header(None),
-    db: Database = Depends(get_database),
-    current_user: dict = Depends(get_current_user)
-):
-    """Get an existing conversation or create a new one with idempotency support"""
-    user_id = current_user.get("uid")
-    # if not user_id:
-    #     logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
-    #     user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
-    logger.info(f"get_or_create_conversation_endpoint starting: content_id={request.content_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
+# @router.post("/conversation/get-or-create")
+# @idempotent("get_or_create_conversation")
+# async def get_or_create_conversation_endpoint(
+#     request: GetOrCreateConversationRequest,
+#     idempotency_key: Optional[str] = Header(None),
+#     db: Database = Depends(get_database),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     """Get an existing conversation or create a new one with idempotency support"""
+#     user_id = current_user.get("uid")
+#     # if not user_id:
+#     #     logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
+#     #     user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
+#     logger.info(f"get_or_create_conversation_endpoint starting: content_id={request.content_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
 
-    conversation_id = await get_or_create_conversation(
-        request.content_id, user_id, request.model_id, request.title, db
-    )
+#     conversation_id = await get_or_create_conversation(
+#         request.content_id, user_id, request.model_id, request.title, db
+#     )
 
-    return {"id": conversation_id, "content_id": request.content_id, "user_id": user_id}
+#     return {"id": conversation_id, "content_id": request.content_id, "user_id": user_id}
 
 
 # Endpoint removed - consolidated into get_conversation_by_content
@@ -887,6 +1198,11 @@ async def multi_intent_chat(
             "message_id": message_id
         }
         
+        # Add reasoning content to metadata if available
+        if "reasoning_content" in result_context:
+            metadata["reasoning_content"] = result_context["reasoning_content"]
+            logger.info(f"Including reasoning content in message metadata")
+        
         # Check if this message already exists to prevent duplicates
         check_query = """
         SELECT id FROM mo_llm_messages
@@ -936,12 +1252,263 @@ async def multi_intent_chat(
 
 @router.post("/chat/stream")
 async def stream_multi_intent_chat(
+    request: StreamChatRequest,  # Using the new enhanced request model
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Stream a chat response with enhanced options and payload support.
+    Handles content/conversation creation and message processing in a unified API.
+    """
+    try:
+        user_id = current_user.get('id', current_user.get('uid'))
+        logger.info(f"Received stream request: type={request.message_type}, content_id={request.content_id}, conversation_id={request.conversation_id}")
+        
+        # Skip processing if there's no message
+        if not request.message or request.message.strip() == "":
+            logger.info(f"Skipping empty message")
+            return JSONResponse(
+                status_code=200,
+                content={"message": "No message to process", "skipped": True}
+            )
+
+        # Check if we need to create new content or conversation
+        content_id = request.content_id
+        conversation_id = request.conversation_id
+        
+        # If we have a content_id but no conversation_id, create a new conversation in the existing content
+        if content_id and not conversation_id:
+            logger.info(f"Creating new conversation thread in existing content {content_id}")
+            try:
+                conversation_id = await create_new_conversation(
+                    db=db,
+                    user_id=user_id,
+                    content_id=content_id,
+                    title=request.content_name or "New Thread"
+                )
+                logger.info(f"Created new conversation {conversation_id} for existing content {content_id}")
+            except Exception as e:
+                # If creation fails, try to find existing conversation
+                logger.error(f"Error creating conversation: {str(e)}")
+                
+                # Try to get existing conversation for this content
+                query = """
+                SELECT id FROM mo_llm_conversations
+                WHERE content_id = :content_id AND user_id = :user_id
+                ORDER BY created_at DESC LIMIT 1
+                """
+                
+                existing = await db.fetch_one(
+                    query=query,
+                    values={
+                        "content_id": content_id,
+                        "user_id": user_id
+                    }
+                )
+                
+                if existing:
+                    conversation_id = existing["id"]
+                    logger.info(f"Using existing conversation {conversation_id} for content {content_id}")
+                else:
+                    # If still no conversation found, raise error
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to create or find conversation for content {content_id}"
+                    )
+        # If we have neither content_id nor conversation_id, create both (completely new chat)
+        elif not content_id and not conversation_id:
+            logger.info("Creating new content and conversation for completely new chat")
+            try:
+                # Create new content first
+                content_id = await create_new_content(
+                    db=db, 
+                    user_id=user_id, 
+                    content_name=request.content_name or "New Chat"
+                )
+                
+                # Create new conversation for the content
+                conversation_id = await create_new_conversation(
+                    db=db,
+                    user_id=user_id,
+                    content_id=content_id,
+                    title=request.content_name or "New Chat"
+                )
+                
+                logger.info(f"Created new content {content_id} and conversation {conversation_id}")
+            except Exception as e:
+                logger.error(f"Error creating content and conversation: {str(e)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to create new chat: {str(e)}"
+                )
+        # If we have neither or missing content_id, return error
+        elif not content_id and conversation_id:
+            # Look up the content_id from the conversation
+            conversation = await get_conversation_by_id(db, conversation_id)
+            if conversation and conversation.get("content_id"):
+                content_id = conversation["content_id"]
+                logger.info(f"Retrieved content_id {content_id} from conversation {conversation_id}")
+            else:
+                logger.error("Conversation has no content_id and none was provided")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Conversation has no content_id and none was provided"}
+                )
+        
+        # Store user message in database
+        user_message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        
+        # Create metadata with message type and options
+        user_metadata = {
+            "message_type": request.message_type,
+            "options": request.options,
+            "multi_intent": True
+        }
+        
+        # Store the user message
+        await db.execute(
+            """
+            INSERT INTO mo_llm_messages (
+                id, conversation_id, role, content, created_at, metadata
+            ) VALUES (
+                :id, :conversation_id, :role, :content, :created_at, :metadata
+            )
+            """,
+            {
+                "id": user_message_id,
+                "conversation_id": conversation_id,
+                "role": "user",
+                "content": request.message,
+                "created_at": now,
+                "metadata": json.dumps(user_metadata)
+            }
+        )
+        
+        # Create the processing configuration
+        config = {
+            "message": request.message,
+            "message_type": request.message_type,
+            "options": request.options or {},
+            "conversation_id": conversation_id,
+            "content_id": content_id,
+            "user_id": user_id,
+            "db": db,
+            "background_tasks": background_tasks,
+            "current_user": current_user,
+            "results": []
+        }
+        
+        # Create assistant message placeholder
+        assistant_message_id = str(uuid.uuid4())
+        
+        # Create metadata with reasoning model indicator if applicable
+        metadata = {
+            "message_type": request.message_type,
+            "streaming": True,
+            "options": request.options
+        }
+        
+        # Add reasoning model info if specified
+        if request.message_type == "reasoning" or (request.options and request.options.get("reasoning_model")):
+            metadata["reasoning_enabled"] = True
+            metadata["reasoning_model"] = request.options.get("reasoning_model") if request.options else None
+            logger.info(f"Created message with reasoning_enabled=True")
+        
+        # We'll update this with content later
+        await db.execute(
+            """
+            INSERT INTO mo_llm_messages (
+                id, conversation_id, role, content, created_at, metadata
+            ) VALUES (
+                :id, :conversation_id, :role, :content, :created_at, :metadata
+            )
+            """,
+            {
+                "id": assistant_message_id,
+                "conversation_id": conversation_id,
+                "role": "assistant",
+                "content": "",  # Empty initially, will be updated when streaming finishes
+                "created_at": now,
+                "metadata": json.dumps(metadata)
+            }
+        )
+        
+        # Return streaming response
+        return StreamingResponse(
+            process_message_with_pipeline(config),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in stream_multi_intent_chat: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Attempt to recover in case this was a race condition
+        if "duplicate key value" in str(e) and "unique_user_content" in str(e):
+            # This is likely a race condition where another request created the same conversation
+            try:
+                # Extract the content_id from the error message
+                error_msg = str(e)
+                match = re.search(r"Key \(user_id, content_id\)=\((.*?), (.*?)\)", error_msg)
+                
+                if match and len(match.groups()) == 2:
+                    user_id_from_error = match.group(1)
+                    content_id_from_error = match.group(2)
+                    
+                    logger.info(f"Attempting to recover from race condition for content {content_id_from_error}")
+                    
+                    # Find the existing conversation
+                    query = """
+                    SELECT id FROM mo_llm_conversations
+                    WHERE user_id = :user_id AND content_id = :content_id
+                    ORDER BY created_at DESC LIMIT 1
+                    """
+                    
+                    existing = await db.fetch_one(
+                        query=query,
+                        values={
+                            "user_id": user_id_from_error,
+                            "content_id": content_id_from_error
+                        }
+                    )
+                    
+                    if existing:
+                        # Return a more user-friendly message
+                        return JSONResponse(
+                            status_code=409,  # Conflict
+                            content={
+                                "message": "This conversation already exists",
+                                "conversation_id": existing["id"],
+                                "content_id": content_id_from_error,
+                                "error_type": "duplicate_conversation"
+                            }
+                        )
+            except Exception as recovery_error:
+                logger.error(f"Error in recovery attempt: {str(recovery_error)}")
+        
+        # If we couldn't recover, return a general error
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "error_type": "general_error"}
+        )
+
+
+# Legacy streaming endpoint - supports old format requests
+@router.post("/chat/stream-legacy")
+async def stream_multi_intent_chat_legacy(
     request: MultiIntentChatRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_user),
     db: Database = Depends(get_database)
 ):
-    logger.info(f"Received stream request with content_id: {request.content_id}, conversation_id: {request.conversation_id}")
+    logger.info(f"Received legacy stream request with content_id: {request.content_id}, conversation_id: {request.conversation_id}")
     """
     Stream a multi-intent chat response.
     Updated to support REST-based image generation.
@@ -1451,3 +2018,243 @@ async def get_message_by_id(
         logger.error(f"Error getting message: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Add this endpoint to pipeline_router.py
+
+@router.delete("/conversation/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Delete a conversation by ID and its associated messages"""
+    try:
+        # First, check if the conversation exists and belongs to the user
+        conversation = await get_conversation_by_id(db, conversation_id)
+
+        if not conversation:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found")
+
+        # Verify ownership
+        user_id = current_user.get("uid", current_user.get("id"))
+        if conversation["user_id"] != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to delete this conversation"
+            )
+        logger.info(f"Deleting conversation: {conversation_id}")
+
+        # Transaction to delete messages and conversation
+        async with db.transaction():
+            # STEP 1: First delete all function calls associated with messages
+            delete_function_calls_query = """
+            DELETE FROM mo_llm_function_calls
+            WHERE message_id IN (
+                SELECT id FROM mo_llm_messages 
+                WHERE conversation_id = :conversation_id
+            )
+            """
+            await db.execute(
+                query=delete_function_calls_query,
+                values={"conversation_id": conversation_id}
+            )
+
+            # STEP 2: Then delete all messages
+            delete_messages_query = """
+            DELETE FROM mo_llm_messages
+            WHERE conversation_id = :conversation_id
+            """
+            await db.execute(
+                query=delete_messages_query,
+                values={"conversation_id": conversation_id}
+            )
+
+            # STEP 3: Finally delete the conversation
+            delete_conversation_query = """
+            DELETE FROM mo_llm_conversations
+            WHERE id = :conversation_id
+            """
+            await db.execute(
+                query=delete_conversation_query,
+                values={"conversation_id": conversation_id}
+            )
+
+            # Optional: Handle content as before
+            content_id = conversation.get("content_id")
+            # ... rest of your content handling code ...
+            logger.info(f"Deleted conversation: {conversation_id}")
+            logger.info(f"Content ID: {content_id}")
+            # update mo_content status to 'deleted' - use uuid column, not id
+            if content_id:
+                update_content_status_query = """
+                UPDATE mo_content
+                SET status = 'deleted'
+                WHERE uuid = :content_id
+                """
+                await db.execute(
+                    query=update_content_status_query,
+                    values={"content_id": content_id}
+                )
+
+        return {
+            "success": True,
+            "message": "Conversation deleted successfully",
+            "conversation_id": conversation_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete conversation: {str(e)}")
+
+# Define a new model for the init request
+
+
+class InitConversationRequest(BaseModel):
+    content_id: str
+    title: Optional[str] = None
+    model_id: Optional[str] = "grok-3-mini-beta"
+
+
+@router.post("/conversation/init")
+async def init_conversation(
+    request: InitConversationRequest,
+    idempotency_key: Optional[str] = Header(None),
+    db: Database = Depends(get_database),
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new thread by creating a new content that references the original"""
+    user_id = current_user.get("uid")
+    original_content_id = request.content_id
+
+    logger.info(
+        f"init_conversation: Creating new thread for original content_id={original_content_id}, user_id={user_id}")
+
+    try:
+        # Get original content details for reference
+        orig_content_query = """
+        SELECT uuid, name, description, route, status FROM mo_content 
+        WHERE uuid = :uuid
+        """
+        orig_content = await db.fetch_one(query=orig_content_query, values={"uuid": original_content_id})
+
+        if not orig_content:
+            raise HTTPException(
+                status_code=404, detail="Original content not found")
+
+        # Generate a UUID for the new content
+        new_content_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+
+        # Get thread count to create a unique name - FIXED QUERY
+        # Instead of trying to use complex JSON operations, let's use a simpler approach
+        # Look for content items where the metadata contains the parent_content_id
+        # Using the JSONB containment operator @>
+        count_query = """
+        SELECT COUNT(*) as count FROM mo_content 
+        WHERE firebase_uid = :user_id AND 
+              (metadata IS NOT NULL AND 
+               metadata::jsonb->>'parent_content_id' = :original_content_id)
+        """
+        count_result = await db.fetch_one(
+            query=count_query,
+            values={
+                "user_id": user_id,
+                "original_content_id": original_content_id
+            }
+        )
+        thread_number = (
+            count_result["count"] + 2) if count_result and count_result["count"] is not None else 2
+
+        # Create metadata with reference to original content
+        metadata = json.dumps({
+            "parent_content_id": original_content_id,
+            "is_thread": True,
+            "thread_number": thread_number,
+            "original_name": orig_content["name"]
+        })
+
+        # Create a new route
+        route = f"thread-{thread_number}-{uuid.uuid4().hex[:8]}"
+
+        # Create a new content entry
+        content_insert = """
+        INSERT INTO mo_content 
+        (uuid, firebase_uid, name, description, route, status, metadata) 
+        VALUES 
+        (:uuid, :user_id, :name, :description, :route, :status, :metadata)
+        RETURNING uuid, name
+        """
+
+        new_title = request.title or f"Thread {thread_number}"
+        thread_name = f"{new_title} - {orig_content['name']}"
+
+        content_values = {
+            "uuid": new_content_id,
+            "user_id": user_id,
+            "name": thread_name,
+            "description": f"Thread {thread_number} of {orig_content['name']}",
+            "route": route,
+            "status": orig_content["status"],
+            "metadata": metadata
+        }
+
+        new_content = await db.fetch_one(query=content_insert, values=content_values)
+        if not new_content:
+            raise HTTPException(
+                status_code=500, detail="Failed to create new content for thread")
+
+        logger.info(
+            f"Created new content {new_content_id} for thread {thread_number} of {original_content_id}")
+
+        # Now create a conversation for the new content
+        conversation_id = str(uuid.uuid4())
+
+        conversation_insert = """
+        INSERT INTO mo_llm_conversations 
+        (id, user_id, content_id, model_id, title, created_at, updated_at) 
+        VALUES 
+        (:id, :user_id, :content_id, :model_id, :title, :created_at, :updated_at)
+        RETURNING id
+        """
+
+        conversation_values = {
+            "id": conversation_id,
+            "user_id": user_id,
+            "content_id": new_content_id,
+            "model_id": request.model_id,
+            "title": new_title or f"Thread {thread_number}",
+            "created_at": now,
+            "updated_at": now
+        }
+
+        conversation = await db.fetch_one(query=conversation_insert, values=conversation_values)
+        if not conversation:
+            raise HTTPException(
+                status_code=500, detail="Failed to create conversation for new thread")
+
+        logger.info(
+            f"Created new conversation {conversation_id} for content {new_content_id}")
+
+        # Return both the new content and conversation IDs
+        return {
+            "id": conversation_id,
+            "content_id": new_content_id,
+            "content_name": thread_name,
+            "thread_number": thread_number,
+            "original_content_id": original_content_id,
+            "success": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in init_conversation: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create new thread: {str(e)}")

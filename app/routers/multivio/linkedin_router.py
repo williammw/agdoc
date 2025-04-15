@@ -24,7 +24,7 @@ from enum import Enum
 import base64
 import hashlib
 
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 load_dotenv()

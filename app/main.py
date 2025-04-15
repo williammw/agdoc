@@ -38,9 +38,46 @@ import subprocess
 import os
 import traceback
 import logging
+import colorlog
 # os.environ["KMP_INIT_AT_FORK"] = "FALSE"
 
 
+# Set up colored logging
+def setup_colored_logging():
+    """Configure colored logging for terminal output"""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)  # Set default level
+    
+    # Remove existing handlers
+    if root_logger.handlers:
+        for handler in root_logger.handlers:
+            root_logger.removeHandler(handler)
+    
+    # Create console handler with color formatter
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Create color formatter
+    formatter = colorlog.ColoredFormatter(
+        "%(log_color)s%(levelname)-8s%(reset)s %(cyan)s[%(name)s]%(reset)s %(white)s%(message)s",
+        log_colors={
+            'DEBUG': 'blue',
+            'INFO': 'green',
+            'WARNING': 'yellow',
+            'ERROR': 'red',
+            'CRITICAL': 'red,bg_white',
+        },
+        secondary_log_colors={},
+        style='%'
+    )
+    
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    return root_logger
+
+# Initialize colored logging
+logger = setup_colored_logging()
+logger.info("Colored logging is now enabled")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -68,7 +105,6 @@ if missing_keys:
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=app_lifespan, debug=True)
-logger = logging.getLogger(__name__)
 
 
 

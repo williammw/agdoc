@@ -89,12 +89,12 @@ class GeneralKnowledgeCommand(Command):
                         
                         # Add content context to the system prompt
                         content_prompt = f"""
-## CONTENT CONTEXT
-The user is working on content titled: "{content_name}"
-{f'Description: {content_description}' if content_description else ''}
+                            ## CONTENT CONTEXT
+                            The user is working on content titled: "{content_name}"
+                            {f'Description: {content_description}' if content_description else ''}
 
-Keep this content topic in mind when responding to their question.
-"""
+                            Keep this content topic in mind when responding to their question.
+                            """
                         system_prompt += "\n\n" + content_prompt
                         logger.info(f"Added content context to prompt: Content name '{content_name}'")
                     else:
@@ -143,6 +143,7 @@ Keep this content topic in mind when responding to their question.
             if DEFAULT_MODEL.startswith("grok-3") and hasattr(completion.choices[0].message, 'reasoning_content'):
                 reasoning = completion.choices[0].message.reasoning_content
                 logger.info(f"Reasoning content received ({len(reasoning)} chars)")
+                # logger.info(f"Reasoning content: {reasoning}")
                 # Store reasoning in context for debugging
                 context["reasoning_content"] = reasoning
             
@@ -162,10 +163,15 @@ Keep this content topic in mind when responding to their question.
                 message_id = str(uuid.uuid4())
                 now = datetime.now(timezone.utc)
                 
+                # Create metadata with reasoning content if available
                 metadata = {
                     "type": "general_knowledge",
                     "multi_intent": len(context.get("results", [])) > 1
                 }
+                
+                # Include reasoning content in metadata if available
+                if "reasoning_content" in context:
+                    metadata["reasoning_content"] = context["reasoning_content"]
                 
                 await db.execute(
                     """

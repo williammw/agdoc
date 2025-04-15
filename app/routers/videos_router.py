@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import json
 router = APIRouter()
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 s3_client = boto3.client('s3',

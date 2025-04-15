@@ -121,7 +121,7 @@ async def list_content(
         else:
             query = """
             SELECT * FROM mo_content 
-            WHERE firebase_uid = :firebase_uid
+            WHERE firebase_uid = :firebase_uid AND status = 'draft'
             ORDER BY created_at DESC
             LIMIT :limit OFFSET :offset
             """
