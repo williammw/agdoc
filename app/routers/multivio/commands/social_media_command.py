@@ -28,10 +28,13 @@ SOCIAL_MEDIA_SYSTEM_PROMPT = """
 You are a tier-1 enterprise social media strategist for Multivio, the industry-leading cross-platform content management system. You help users create and optimize content across Facebook, Twitter, Instagram, LinkedIn and other platforms through our unified API.
 
 ## PLATFORM SPECIFICS
-- **Twitter**: 280 character limit, supports single/multiple images, videos up to 2:20
 - **Facebook**: Longer text, supports photos, videos, carousels, and link previews
 - **Instagram**: Visual-focused, supports images, videos, carousels, and Stories
 - **LinkedIn**: Professional content, supports longer text, images, documents, and videos
+- **TikTok**: 1000 character limit, supports images, videos, and link previews
+- **YouTube**: 1000 character limit, supports images, videos, and link previews
+- **X**: 280 280 character limit, supports single/multiple images, videos up to 2:20
+- **Threads**: 2200 character limit, supports single/multiple images, videos up to 2:20
 
 ## CONTENT CREATION WORKFLOW
 1. Understand the user's content objectives and target audience
@@ -163,7 +166,8 @@ class SocialMediaCommand(Command):
                 "model": DEFAULT_MODEL,
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 2048
+                "max_tokens": 2048,
+                "stream": True  # Enable streaming for chunked responses
             }
             
             # Add reasoning_effort for grok-3 models
@@ -171,19 +175,55 @@ class SocialMediaCommand(Command):
                 params["reasoning_effort"] = "high"
                 logger.info(f"Using reasoning_effort=high for {DEFAULT_MODEL}")
             
-            # Call the API
-            logger.info(f"Calling {DEFAULT_MODEL} API for social media content generation")
-            completion = client.chat.completions.create(**params)
+            # Call the API with streaming enabled
+            logger.info(f"Calling {DEFAULT_MODEL} API for social media content generation with streaming")
+            stream = client.chat.completions.create(**params)
             
-            # Get the content from the response
-            content = completion.choices[0].message.content
+            # Process the streaming response
+            content = ""
+            reasoning = ""
             
-            # For grok-3 models, log the reasoning content if available
-            if DEFAULT_MODEL.startswith("grok-3") and hasattr(completion.choices[0].message, 'reasoning_content'):
-                reasoning = completion.choices[0].message.reasoning_content
+            for chunk in stream:
+                # Append content delta if it exists
+                if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content is not None:
+                    content += chunk.choices[0].delta.content
+                # Check for reasoning content in delta if available
+                if hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content is not None:
+                    reasoning += chunk.choices[0].delta.reasoning_content
+            
+            # Store reasoning content if we collected any
+            if reasoning:
                 logger.info(f"Reasoning content received ({len(reasoning)} chars)")
-                # Store reasoning in context for debugging
                 context["reasoning_content"] = reasoning
+            else:
+                # If no streaming reasoning content, try to extract it from the final completion
+                # This fallback helps ensure compatibility with both streaming and non-streaming modes
+                try:
+                    # Make a non-streaming request to get reasoning content
+                    nonstream_params = {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "max_tokens": 2048,
+                        "stream": False  # Explicitly disable streaming
+                    }
+                    
+                    # Add reasoning_effort for grok-3 models
+                    if DEFAULT_MODEL.startswith("grok-3"):
+                        nonstream_params["reasoning_effort"] = "high"
+                    
+                    # Make a separate non-streaming call just to get reasoning content
+                    logger.info(f"No reasoning from stream, making separate call to get reasoning content")
+                    completion = client.chat.completions.create(**nonstream_params)
+                    
+                    # Try to extract reasoning content
+                    if hasattr(completion.choices[0].message, 'reasoning_content'):
+                        reasoning = completion.choices[0].message.reasoning_content
+                        logger.info(f"Extracted reasoning content from non-streaming call ({len(reasoning)} chars)")
+                        context["reasoning_content"] = reasoning
+                except Exception as fallback_error:
+                    logger.error(f"Error in fallback reasoning content extraction: {str(fallback_error)}")
+                    # Continue without reasoning content
             
             # Add to context
             context["social_media_content"] = {

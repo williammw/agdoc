@@ -21,6 +21,7 @@ from firebase_admin import auth as firebase_auth
 
 from .commands.base import Pipeline, CommandFactory
 from .commands.intent_detector import detect_intents, MultilingualIntentDetector
+from .commands.intent_detector_v2 import predict_intents
 # Import commands to register them with the factory - hiding web search and puppeteer
 # from .commands.web_search_command import WebSearchCommand
 # from .commands.puppeteer_command import PuppeteerCommand
@@ -528,17 +529,24 @@ async def process_streaming_response(context: Dict[str, Any]):
     """
     Process the pipeline response for streaming with a consistent format.
     All intent types (image_generation, social_media, etc.) will follow the same pattern.
-    Updated to support REST-based polling for image generation.
+    Updated to support REST-based polling for image generation and true real-time streaming.
     """
+    logger.info(
+        f"__stream__shit Starting streaming response processing for context: {context.get('conversation_id')}")
+
     # First yield initialization information if we have new IDs
     if context.get("conversation_id") or context.get("content_id"):
         init_message = {
             "type": "initialization",
             "data": {
                 "conversation_id": context.get("conversation_id"),
-                "content_id": context.get("content_id")
+                "content_id": context.get("content_id"),
+                # Add this line to include message_id
+                "message_id": context.get("message_id")
             }
         }
+        logger.info(
+            f"__stream__shit Sending initialization message: {init_message}")
         yield f"data: {json.dumps(init_message)}\n\n"
         await asyncio.sleep(0.05)
 
@@ -549,6 +557,8 @@ async def process_streaming_response(context: Dict[str, Any]):
             "intents": list(context.get("intents", {}).keys())
         }
     }
+    logger.info(
+        f"__stream__shit Sending intents: {intents_message['data']['intents']}")
     yield f"data: {json.dumps(intents_message)}\n\n"
     await asyncio.sleep(0.05)
 
@@ -558,11 +568,11 @@ async def process_streaming_response(context: Dict[str, Any]):
     # Process each result individually with consistent structure
     for result in context.get("results", []):
         result_type = result.get("type", "unknown")
-        
+
         # Skip general_knowledge as it will be part of the content stream
         if result_type == "general_knowledge":
             continue
-            
+
         # Create a standardized result message
         result_message = {
             "type": result_type,
@@ -570,7 +580,7 @@ async def process_streaming_response(context: Dict[str, Any]):
             "result": result,            # For backward compatibility
             "data": result
         }
-        
+
         # Special handling for image generation to indicate polling is needed
         if result_type == "image_generation":
             # Check if we already have an image URL (from reused image)
@@ -593,56 +603,165 @@ async def process_streaming_response(context: Dict[str, Any]):
             else:
                 # No image URL yet, set needs_polling
                 result_message["status"] = "needs_polling"
-                result_message["poll_endpoint"] = result.get("poll_endpoint") or f"/api/v1/media/image-status/{result.get('task_id')}"
+                result_message["poll_endpoint"] = result.get(
+                    "poll_endpoint") or f"/api/v1/media/image-status/{result.get('task_id')}"
                 # Include additional info about prompt
                 if "prompt" in result:
-                    result_message["prompt"] = result["prompt"]  
+                    result_message["prompt"] = result["prompt"]
         else:
             result_message["status"] = "complete"
-        
+
         # Add current command info for backward compatibility
         if "current_command" in context:
             result_message["current_command"] = context["current_command"]
-        
+
         # Send result information
         yield f"data: {json.dumps(result_message)}\n\n"
         await asyncio.sleep(0.05)
-        
+
         # Send a completion signal for this specific result (backward compatibility)
         yield f"data: {json.dumps({'result_complete': result_type})}\n\n"
         await asyncio.sleep(0.05)
-        
+
         # Add to processed results
         processed_results.append(result_type)
-    
-    # Stream the general knowledge content if available
-    if "general_knowledge_content" in context:
+
+    # Check if we have a streaming generator from general_knowledge_command
+    if "_streaming_generator" in context and context["_streaming_generator"]:
+        # Initialize variables
+        content_chunks = []
+        reasoning_chunks = []
+        content_complete = False
+        all_chunks = []
+        chunk_count = 0
+        
+        try:
+            # First pass: collect all chunks
+            async for chunk in context["_streaming_generator"]:
+                all_chunks.append(chunk)
+                chunk_count += 1
+                chunk_type = chunk.get("type", "content")
+                
+                if chunk_type == "reasoning":
+                    reasoning_chunks.append(chunk.get("content", ""))
+                elif chunk_type == "content":
+                    content_chunks.append(chunk.get("content", ""))
+                elif chunk_type == "completion":
+                    content_complete = True
+                    logger.info(
+                        f"__stream__shit Received completion signal: content_length={chunk.get('content_length', 0)}, reasoning_length={chunk.get('reasoning_length', 0)}")
+                elif chunk_type == "error":
+                    logger.error(
+                        f"__stream__shit Error in streaming generator: {chunk.get('error', 'Unknown error')}")
+                    yield f"data: {json.dumps({'error': chunk.get('error', 'Unknown error'), 'type': 'error'})}\n\n"
+            
+            # If we get here with no explicit completion, we're still complete
+            content_complete = True
+            
+            # Send reasoning chunks first if available
+            if reasoning_chunks:
+                combined_reasoning = "".join(reasoning_chunks)
+                
+                # Signal start of reasoning
+                logger.info(f"__stream__shit Starting reasoning content streaming")
+                yield f"data: {json.dumps({'type': 'reasoning_start', 'data': {'content_type': 'reasoning'}})}\n\n"
+                await asyncio.sleep(0.02)
+                
+                # Send reasoning content in a special message
+                reasoning_msg = {
+                    "type": "reasoning_content",
+                    "data": {
+                        "reasoning": combined_reasoning
+                    }
+                }
+                logger.info(
+                    f"__stream__shit Sending reasoning content to client ({len(combined_reasoning)} chars) - sample: '{combined_reasoning[:50]}...'")
+                yield f"data: {json.dumps(reasoning_msg)}\n\n"
+                await asyncio.sleep(0.05)
+                
+                # Signal end of reasoning
+                yield f"data: {json.dumps({'type': 'reasoning_end', 'data': {'content_type': 'reasoning'}})}\n\n"
+                await asyncio.sleep(0.02)
+                
+                # Additional reasoning availability signal for backward compatibility
+                reasoning_available_msg = {
+                    "type": "reasoning_available",
+                    "data": {
+                        "timestamp": datetime.now().isoformat(),
+                        "content_length": len(combined_reasoning)
+                    }
+                }
+                logger.info(
+                    f"__stream__shit Sending reasoning_available signal as backup")
+                yield f"data: {json.dumps(reasoning_available_msg)}\n\n"
+                await asyncio.sleep(0.05)
+            
+            # Now stream content
+            if content_chunks:
+                # Signal start of content (backward compatibility)
+                logger.info(f"__stream__shit Starting to stream content from generator")
+                yield f"data: {json.dumps({'content_start': True})}\n\n"
+                
+                # Signal start of content (new format)
+                yield f"data: {json.dumps({'type': 'content_start', 'data': {'content_type': 'text'}})}\n\n"
+                await asyncio.sleep(0.02)
+                
+                # Stream content chunks
+                for content_text in content_chunks:
+                    if content_text:
+                        yield f"data: {json.dumps({'content': content_text, 'type': 'content', 'data': {'text': content_text}})}\n\n"
+                        await asyncio.sleep(0.01)
+                
+                # Signal end of content
+                if content_complete:
+                    logger.info(
+                        f"__stream__shit Content streaming complete, signaling content_end")
+                    yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
+                    await asyncio.sleep(0.02)
+        
+        except Exception as e:
+            logger.error(
+                f"__stream__shit Error processing streaming generator: {str(e)}")
+            yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
+            content_complete = True  # Mark as complete even on error
+        
+        # Add general_knowledge to processed results
+        processed_results.append("general_knowledge")
+
+    # Fallback for older implementation - stream pre-collected content if no streaming generator
+    elif "general_knowledge_content" in context:
         content = context["general_knowledge_content"]
         # Stream in chunks
         chunk_size = 100
-        
+
         # Signal start of content (backward compatibility)
+        logger.info(
+            f"__stream__shit Starting to stream content, total length: {len(content)}")
         yield f"data: {json.dumps({'content_start': True})}\n\n"
-        
+
         # Signal start of content (new format)
         yield f"data: {json.dumps({'type': 'content_start', 'data': {'content_type': 'text'}})}\n\n"
         await asyncio.sleep(0.02)
-        
+
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i+chunk_size]
+            logger.info(
+                f"__stream__shit Sending content chunk {i//chunk_size + 1}/{(len(content)+chunk_size-1)//chunk_size}: '{chunk[:20]}...'")
             # Both old and new format for compatibility
             yield f"data: {json.dumps({'content': chunk, 'type': 'content', 'data': {'text': chunk}})}\n\n"
             # Small delay for natural streaming effect
             await asyncio.sleep(0.02)
-        
+
         # Signal end of content
+        logger.info(
+            f"__stream__shit Content streaming complete, signaling content_end")
         yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
         await asyncio.sleep(0.02)
-        
+
         # Check if we have reasoning content to send
         if "reasoning_content" in context and context["reasoning_content"]:
             reasoning_content = context["reasoning_content"]
-            
+
             # Send reasoning content in a special message
             reasoning_msg = {
                 "type": "reasoning_content",
@@ -650,31 +769,48 @@ async def process_streaming_response(context: Dict[str, Any]):
                     "reasoning": reasoning_content
                 }
             }
+            logger.info(
+                f"__stream__shit Sending reasoning content to client ({len(reasoning_content)} chars) - sample: '{reasoning_content[:50]}...'")
             yield f"data: {json.dumps(reasoning_msg)}\n\n"
-            await asyncio.sleep(0.02)
-        
+            await asyncio.sleep(0.05)
+
+            # Send additional reasoning availability signal to ensure client notice
+            reasoning_available_msg = {
+                "type": "reasoning_available",
+                "data": {
+                    "timestamp": datetime.now().isoformat(),
+                    "content_length": len(reasoning_content)
+                }
+            }
+            logger.info(
+                f"__stream__shit Sending reasoning_available signal as backup")
+            yield f"data: {json.dumps(reasoning_available_msg)}\n\n"
+            await asyncio.sleep(0.05)
+
         # Add general_knowledge to processed results
         processed_results.append("general_knowledge")
-    
+
     # Send a final summary message with all completed results
     summary = {
         "type": "summary",
         "summary": {  # For backward compatibility
             "completed_results": processed_results,
             "all_complete": True,
-            "polling_required": any(result.get("type") == "image_generation" and 
-                                  not result.get("image_url") for result in context.get("results", []))
+            "polling_required": any(result.get("type") == "image_generation" and
+                                    not result.get("image_url") for result in context.get("results", []))
         },
         "data": {
             "completed_results": processed_results,
             "all_complete": True,
-            "polling_required": any(result.get("type") == "image_generation" and 
-                                  not result.get("image_url") for result in context.get("results", []))
+            "polling_required": any(result.get("type") == "image_generation" and
+                                    not result.get("image_url") for result in context.get("results", []))
         }
     }
+    logger.info(f"__stream__shit Sending summary message: {processed_results}")
     yield f"data: {json.dumps(summary)}\n\n"
 
     # End the stream
+    logger.info(f"__stream__shit Sending final [DONE] marker")
     yield "data: [DONE]\n\n"
 
 
@@ -685,7 +821,7 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
     options = config.get("options", {})
     conversation_id = config.get("conversation_id")
     db = config.get("db")
-    
+
     # Configure message processing based on message type and options
     if message_type == "image":
         # For image generation requests
@@ -700,29 +836,30 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
         config["reasoning_effort"] = "high"
         if options.get("reasoning_model"):
             config["model"] = options["reasoning_model"]
-    
+
     # Always detect intents for text messages
     if message_type == "text":
         intents = detect_intents(config["message"])
         # Filter out low-confidence intents
-        significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
+        significant_intents = {k: v for k,
+                               v in intents.items() if v["confidence"] > 0.3}
         config["intents"] = significant_intents
-    
+
     # Handle web search option
     if options.get("perform_web_search"):
         # This would integrate with your web search command
         pass
-        
+
     # Create pipeline based on intents and message type
     pipeline = Pipeline(name="MultiIntentPipeline")
-    
+
     # Add commands based on message type and intents
     intents_dict = config.get("intents", {})
-    
+
     # For calculation
     if "calculation" in intents_dict:
         pipeline.add_command(CommandFactory.create("calculation"))
-    
+
     # For image generation
     if message_type == "image" or "image_generation" in intents_dict:
         image_command = CommandFactory.create("image_generation")
@@ -730,7 +867,7 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
             # Set model in command config
             image_command.set_option("model", options["image_model"])
         pipeline.add_command(image_command)
-        
+
     # For social media
     if message_type == "social" or "social_media" in intents_dict:
         social_command = CommandFactory.create("social_media")
@@ -738,75 +875,33 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
             # Set platforms in command config
             social_command.set_option("platforms", options["social_platforms"])
         pipeline.add_command(social_command)
-        
+
     # For conversation/general knowledge
     if message_type in ["text", "reasoning"] or "conversation" in intents_dict:
         if "conversation" in intents_dict:
             pipeline.add_command(CommandFactory.create("conversation"))
-        
+
         # Add general knowledge command for text responses
         if message_type != "image" and message_type != "social":
             pipeline.add_command(CommandFactory.create("general_knowledge"))
-    
+
     # Execute the pipeline
     result_context = await pipeline.execute(config)
-    
+
+    # Generate a message ID if not already in the context
+    if "message_id" not in result_context:
+        result_context["message_id"] = str(uuid.uuid4())
+
     # Stream the response
     try:
         async for chunk in process_streaming_response(result_context):
             yield chunk
-            
-        # After streaming is complete, update the message in the database with the complete content
-        if conversation_id and db and "general_knowledge_content" in result_context:
-            # Find the most recent assistant message for this conversation
-            query = """
-            SELECT id, metadata FROM mo_llm_messages 
-            WHERE conversation_id = :conversation_id AND role = 'assistant'
-            ORDER BY created_at DESC LIMIT 1
-            """
-            
-            recent_message = await db.fetch_one(query=query, values={"conversation_id": conversation_id})
-            
-            if recent_message:
-                message_id = recent_message["id"]
-                metadata = {}
-                
-                # Parse existing metadata if available
-                if recent_message["metadata"]:
-                    try:
-                        metadata = json.loads(recent_message["metadata"])
-                    except:
-                        pass
-                
-                # Update with reasoning content if available
-                if "reasoning_content" in result_context:
-                    metadata["reasoning_content"] = result_context["reasoning_content"]
-                    logger.info(f"Updating message {message_id} with reasoning content")
-                
-                # Include other important information
-                if "intents" in result_context:
-                    metadata["detected_intents"] = list(result_context["intents"].keys())
-                
-                # Update the message with content and metadata
-                update_query = """
-                UPDATE mo_llm_messages
-                SET content = :content, metadata = :metadata
-                WHERE id = :message_id
-                """
-                
-                await db.execute(
-                    query=update_query,
-                    values={
-                        "message_id": message_id,
-                        "content": result_context.get("general_knowledge_content", ""),
-                        "metadata": json.dumps(metadata)
-                    }
-                )
-                logger.info(f"Updated message {message_id} with complete content and metadata")
-            else:
-                logger.warning(f"No recent assistant message found for conversation {conversation_id}")
+
+        # No need to update message in the database here as that's now handled
+        # directly in the streaming generator from GeneralKnowledgeCommand
     except Exception as e:
-        logger.error(f"Error in process_message_with_pipeline streaming: {str(e)}")
+        logger.error(
+            f"Error in process_message_with_pipeline streaming: {str(e)}")
         # Still yield the error so the client knows something went wrong
         yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
         yield "data: [DONE]\n\n"
@@ -839,6 +934,9 @@ async def process_multi_intent_request(
 
     # Detect intents in the message
     intents = detect_intents(request.message)
+    # v2 pending to release
+    # raw_probs = await predict_intents(request.message)
+    # intents = {k: {"confidence": v} for k, v in raw_probs.items()}
     
     # Filter out low-confidence intents for logging
     significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
@@ -1440,9 +1538,12 @@ async def stream_multi_intent_chat(
             process_message_with_pipeline(config),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive"
+                "Cache-Control": "no-cache, no-transform, no-store, must-revalidate",
+                "X-Accel-Buffering": "no",  # Important for Nginx
+                "Connection": "keep-alive",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Transfer-Encoding": "chunked"  # Add this to force chunked transfer
             }
         )
 
@@ -1611,9 +1712,12 @@ async def stream_multi_intent_chat_legacy(
             process_streaming_response(result_context),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive"
+                "Cache-Control": "no-cache, no-transform, no-store, must-revalidate",
+                "X-Accel-Buffering": "no",  # Important for Nginx
+                "Connection": "keep-alive",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Transfer-Encoding": "chunked"  # Add this to force chunked transfer
             }
         )
 

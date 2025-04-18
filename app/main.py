@@ -145,6 +145,26 @@ app.add_middleware(
     https_only=True  # Force secure cookies in production
 )
 
+# Middleware to ensure proper streaming response handling
+@app.middleware("http")
+async def ensure_streaming(request: Request, call_next):
+    response = await call_next(request)
+    
+    # Check if this is a streaming response that needs special handling
+    if (
+        response.headers.get("Content-Type") == "text/event-stream" or
+        "X-Accel-Buffering" in response.headers
+    ):
+        # Ensure all buffering-related headers are set
+        response.headers["Cache-Control"] = "no-cache, no-transform, no-store, must-revalidate"
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Connection"] = "keep-alive"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["Transfer-Encoding"] = "chunked"
+    
+    return response
+
 # Router list (updated to include the session router)
 router_list = [
     (umami_router.router, "/api/v1/umami", ["umami"]),
@@ -213,7 +233,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/")
 async def greeting():
-    return {"message": "Nothing to see here. v0.5.2"}
+    return {"message": "Nothing to see here. v0.6.0"}
 
 
 @app.get("/check-ffmpeg")
