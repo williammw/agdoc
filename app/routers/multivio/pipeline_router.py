@@ -529,7 +529,7 @@ async def process_streaming_response(context: Dict[str, Any]):
     """
     Process the pipeline response for streaming with a consistent format.
     All intent types (image_generation, social_media, etc.) will follow the same pattern.
-    Updated to support REST-based polling for image generation and true real-time streaming.
+    Fixed to stream chunks in real-time as they arrive instead of collecting all first.
     """
     logger.info(
         f"__stream__shit Starting streaming response processing for context: {context.get('conversation_id')}")
@@ -631,104 +631,206 @@ async def process_streaming_response(context: Dict[str, Any]):
         # Initialize variables
         content_chunks = []
         reasoning_chunks = []
+        has_sent_reasoning_start = False
+        has_sent_content_start = False
         content_complete = False
-        all_chunks = []
         chunk_count = 0
-        
+
         try:
-            # First pass: collect all chunks
+            # Stream chunks in real-time as they arrive
+            logger.info(
+                f"__stream__shit Starting real-time streaming of generator output")
+
             async for chunk in context["_streaming_generator"]:
-                all_chunks.append(chunk)
                 chunk_count += 1
                 chunk_type = chunk.get("type", "content")
-                
+
+                # Process different chunk types in real-time
                 if chunk_type == "reasoning":
-                    reasoning_chunks.append(chunk.get("content", ""))
+                    reasoning_text = chunk.get("content", "")
+                    reasoning_chunks.append(reasoning_text)
+
+                    # Send reasoning start signal if first reasoning chunk
+                    if not has_sent_reasoning_start:
+                        logger.info(
+                            f"__stream__shit Starting reasoning content streaming")
+                        yield f"data: {json.dumps({'type': 'reasoning_start', 'data': {'content_type': 'reasoning'}})}\n\n"
+                        await asyncio.sleep(0.02)
+                        has_sent_reasoning_start = True
+
+                    # Send reasoning chunk immediately
+                    reasoning_msg = {
+                        "type": "reasoning_content",
+                        "data": {
+                            "reasoning": reasoning_text
+                        }
+                    }
+                    logger.info(
+                        f"__stream__shit Streaming reasoning chunk #{chunk_count} - length {len(reasoning_text)}")
+                    yield f"data: {json.dumps(reasoning_msg)}\n\n"
+                    await asyncio.sleep(0.01)
+
                 elif chunk_type == "content":
-                    content_chunks.append(chunk.get("content", ""))
+                    content_text = chunk.get("content", "")
+                    content_chunks.append(content_text)
+
+                    # Send content start signal if first content chunk
+                    if not has_sent_content_start:
+                        logger.info(
+                            f"__stream__shit Starting to stream content in real-time")
+                        # Signal for backward compatibility
+                        yield f"data: {json.dumps({'content_start': True})}\n\n"
+                        # Signal in new format
+                        yield f"data: {json.dumps({'type': 'content_start', 'data': {'content_type': 'text'}})}\n\n"
+                        await asyncio.sleep(0.02)
+                        has_sent_content_start = True
+
+                    # Stream content chunk immediately
+                    if content_text:
+                        logger.info(
+                            f"__stream__shit Streaming content chunk #{chunk_count} - length {len(content_text)}")
+                        yield f"data: {json.dumps({'content': content_text, 'type': 'content', 'data': {'text': content_text}})}\n\n"
+                        await asyncio.sleep(0.01)
+
                 elif chunk_type == "completion":
                     content_complete = True
                     logger.info(
                         f"__stream__shit Received completion signal: content_length={chunk.get('content_length', 0)}, reasoning_length={chunk.get('reasoning_length', 0)}")
+
+                    # Signal end of content if needed
+                    if has_sent_content_start:
+                        logger.info(
+                            f"__stream__shit Content streaming complete, signaling content_end")
+                        yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
+                        await asyncio.sleep(0.02)
+
+                    # Signal end of reasoning if needed
+                    if has_sent_reasoning_start:
+                        logger.info(
+                            f"__stream__shit Reasoning streaming complete, signaling reasoning_end")
+                        yield f"data: {json.dumps({'type': 'reasoning_end', 'data': {'content_type': 'reasoning'}})}\n\n"
+                        await asyncio.sleep(0.02)
+
+                        # Send reasoning available signal for backward compatibility
+                        combined_reasoning = "".join(reasoning_chunks)
+                        reasoning_available_msg = {
+                            "type": "reasoning_available",
+                            "data": {
+                                "timestamp": datetime.now().isoformat(),
+                                "content_length": len(combined_reasoning)
+                            }
+                        }
+                        logger.info(
+                            f"__stream__shit Sending reasoning_available signal for completion")
+                        yield f"data: {json.dumps(reasoning_available_msg)}\n\n"
+                        await asyncio.sleep(0.02)
+
                 elif chunk_type == "error":
                     logger.error(
                         f"__stream__shit Error in streaming generator: {chunk.get('error', 'Unknown error')}")
                     yield f"data: {json.dumps({'error': chunk.get('error', 'Unknown error'), 'type': 'error'})}\n\n"
-            
+
             # If we get here with no explicit completion, we're still complete
-            content_complete = True
-            
-            # Send reasoning chunks first if available
-            if reasoning_chunks:
-                combined_reasoning = "".join(reasoning_chunks)
-                
-                # Signal start of reasoning
-                logger.info(f"__stream__shit Starting reasoning content streaming")
-                yield f"data: {json.dumps({'type': 'reasoning_start', 'data': {'content_type': 'reasoning'}})}\n\n"
-                await asyncio.sleep(0.02)
-                
-                # Send reasoning content in a special message
-                reasoning_msg = {
-                    "type": "reasoning_content",
-                    "data": {
-                        "reasoning": combined_reasoning
-                    }
-                }
-                logger.info(
-                    f"__stream__shit Sending reasoning content to client ({len(combined_reasoning)} chars) - sample: '{combined_reasoning[:50]}...'")
-                yield f"data: {json.dumps(reasoning_msg)}\n\n"
-                await asyncio.sleep(0.05)
-                
-                # Signal end of reasoning
-                yield f"data: {json.dumps({'type': 'reasoning_end', 'data': {'content_type': 'reasoning'}})}\n\n"
-                await asyncio.sleep(0.02)
-                
-                # Additional reasoning availability signal for backward compatibility
-                reasoning_available_msg = {
-                    "type": "reasoning_available",
-                    "data": {
-                        "timestamp": datetime.now().isoformat(),
-                        "content_length": len(combined_reasoning)
-                    }
-                }
-                logger.info(
-                    f"__stream__shit Sending reasoning_available signal as backup")
-                yield f"data: {json.dumps(reasoning_available_msg)}\n\n"
-                await asyncio.sleep(0.05)
-            
-            # Now stream content
-            if content_chunks:
-                # Signal start of content (backward compatibility)
-                logger.info(f"__stream__shit Starting to stream content from generator")
-                yield f"data: {json.dumps({'content_start': True})}\n\n"
-                
-                # Signal start of content (new format)
-                yield f"data: {json.dumps({'type': 'content_start', 'data': {'content_type': 'text'}})}\n\n"
-                await asyncio.sleep(0.02)
-                
-                # Stream content chunks
-                for content_text in content_chunks:
-                    if content_text:
-                        yield f"data: {json.dumps({'content': content_text, 'type': 'content', 'data': {'text': content_text}})}\n\n"
-                        await asyncio.sleep(0.01)
-                
-                # Signal end of content
-                if content_complete:
+            if not content_complete:
+                # End content if we had content
+                if has_sent_content_start:
                     logger.info(
-                        f"__stream__shit Content streaming complete, signaling content_end")
+                        f"__stream__shit Implicit content completion, signaling content_end")
                     yield f"data: {json.dumps({'type': 'content_end', 'data': {'content_type': 'text'}})}\n\n"
                     await asyncio.sleep(0.02)
-        
+
+                # End reasoning if we had reasoning
+                if has_sent_reasoning_start:
+                    logger.info(
+                        f"__stream__shit Implicit reasoning completion, signaling reasoning_end")
+                    yield f"data: {json.dumps({'type': 'reasoning_end', 'data': {'content_type': 'reasoning'}})}\n\n"
+                    await asyncio.sleep(0.02)
+
+            # Store in database if conversation_id is provided
+            conversation_id = context.get("conversation_id")
+            db = context.get("db")
+            if conversation_id and db:
+                message_id = context.get("message_id", str(uuid.uuid4()))
+                now = datetime.now(timezone.utc)
+                combined_content = "".join(content_chunks)
+
+                # Create metadata with reasoning content if available
+                metadata = {
+                    "type": "general_knowledge",
+                    "multi_intent": len(context.get("results", [])) > 1
+                }
+
+                # Include reasoning content in metadata if available
+                if reasoning_chunks:
+                    metadata["reasoning_content"] = "".join(reasoning_chunks)
+
+                # Check if we need to create a new message or update an existing one
+                check_query = """
+                SELECT id FROM mo_llm_messages
+                WHERE conversation_id = :conversation_id
+                AND created_at > now() - interval '30 seconds'
+                AND role = 'assistant'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+
+                existing_message = await db.fetch_one(
+                    query=check_query,
+                    values={"conversation_id": conversation_id}
+                )
+
+                if existing_message:
+                    # Update existing message
+                    message_id = existing_message["id"]
+                    await db.execute(
+                        """
+                        UPDATE mo_llm_messages
+                        SET content = :content, metadata = :metadata
+                        WHERE id = :id
+                        """,
+                        {
+                            "id": message_id,
+                            "content": combined_content,
+                            "metadata": json.dumps(metadata)
+                        }
+                    )
+                    logger.info(
+                        f"Updated existing message {message_id} with complete content")
+                else:
+                    # Create new message
+                    await db.execute(
+                        """
+                        INSERT INTO mo_llm_messages (
+                            id, conversation_id, role, content, created_at, metadata
+                        ) VALUES (
+                            :id, :conversation_id, :role, :content, :created_at, :metadata
+                        )
+                        """,
+                        {
+                            "id": message_id,
+                            "conversation_id": conversation_id,
+                            "role": "assistant",
+                            "content": combined_content,
+                            "created_at": now,
+                            "metadata": json.dumps(metadata)
+                        }
+                    )
+                    logger.info(
+                        f"Created new message {message_id} with complete content")
+
+                # Store message_id in context
+                context["message_id"] = message_id
+
         except Exception as e:
             logger.error(
                 f"__stream__shit Error processing streaming generator: {str(e)}")
             yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
-            content_complete = True  # Mark as complete even on error
-        
+
         # Add general_knowledge to processed results
         processed_results.append("general_knowledge")
 
     # Fallback for older implementation - stream pre-collected content if no streaming generator
+    # (Keep the existing fallback code for backward compatibility)
     elif "general_knowledge_content" in context:
         content = context["general_knowledge_content"]
         # Stream in chunks
