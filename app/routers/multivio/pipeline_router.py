@@ -716,8 +716,9 @@ async def process_streaming_response(context: Dict[str, Any]):
 
                     # Stream content chunk immediately
                     if content_text:
-                        logger.info(
-                            f"__stream__shit Streaming content chunk #{chunk_count} - length {len(content_text)}")
+                        if chunk_count == 1 or chunk_count % 100 == 0 or len(content_text) > 100:
+                            logger.info(
+                                f"__stream__shit Streaming content chunk #{chunk_count} - length {len(content_text)}")
                         yield f"data: {json.dumps({'content': content_text, 'type': 'content', 'data': {'text': content_text}})}\n\n"
                         await asyncio.sleep(0.01)
 

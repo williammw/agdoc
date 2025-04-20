@@ -233,7 +233,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/")
 async def greeting():
-    return {"message": "Nothing to see here. v0.6.0"}
+    return {"message": "Nothing to see here. v0.8.0"}
 
 
 @app.get("/check-ffmpeg")
