@@ -154,12 +154,25 @@ class ImageGenerationCommand(Command):
                             # Send completed status through the streaming generator
                             if "_streaming_generator" in context and context["_streaming_generator"]:
                                 try:
+                                    # Send two signals - one for compatibility, one as standard event
+                                    # 1. First the standard event
                                     await context["_streaming_generator"].asend({
                                         "type": "image_generation",
                                         "status": "completed",
                                         "task_id": similar_image["id"],
                                         "image_url": image_url,
                                         "image_id": image_id,
+                                        "prompt": prompt,
+                                        "reused": True,
+                                        "message_id": message_id
+                                    })
+                                    
+                                    # 2. Then the dedicated image_ready event
+                                    await context["_streaming_generator"].asend({
+                                        "type": "image_ready",
+                                        "image_url": image_url,
+                                        "image_id": image_id,
+                                        "task_id": similar_image["id"], 
                                         "prompt": prompt,
                                         "reused": True,
                                         "message_id": message_id
@@ -246,11 +259,23 @@ class ImageGenerationCommand(Command):
             # Send image generation status through the streaming generator
             if "_streaming_generator" in context and context["_streaming_generator"]:
                 try:
+                    # Send two signals - one for compatibility, one as standard event
+                    # 1. Standard event
                     await context["_streaming_generator"].asend({
                         "type": "image_generation",
                         "status": "generating",
                         "task_id": task_id,
-                        "prompt": prompt
+                        "prompt": prompt,
+                        "message_id": message_id
+                    })
+                    
+                    # 2. Dedicated image_generating event
+                    await context["_streaming_generator"].asend({
+                        "type": "image_generating",
+                        "task_id": task_id,
+                        "prompt": prompt,
+                        "message_id": message_id,
+                        "poll_endpoint": poll_endpoint
                     })
                     logger.info(f"Sent 'generating' status to streaming generator for task {task_id}")
                 except Exception as e:

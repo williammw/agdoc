@@ -558,7 +558,7 @@ async def process_streaming_response(context: Dict[str, Any]):
     Fixed to stream chunks in real-time as they arrive instead of collecting all first.
     """
     logger.info(
-        f"__stream__shit Starting streaming response processing for context: {context.get('conversation_id')}")
+        f"__stream__chat Starting streaming response processing for context: {context.get('conversation_id')}")
         
     # Initialize image tracking variables
     image_generation_tasks = []
@@ -1030,31 +1030,60 @@ async def process_streaming_response(context: Dict[str, Any]):
         processed_results.append("general_knowledge")
 
     # Send a final summary message with all completed results
+    polling_required = any(result.get("type") == "image_generation" and
+                         not result.get("image_url") for result in context.get("results", []))
+    
+    # Include pending image tasks in the summary
+    pending_image_tasks = []
+    for result in context.get("results", []):
+        if result.get("type") == "image_generation" and not result.get("image_url"):
+            pending_image_tasks.append({
+                "task_id": result.get("task_id"),
+                "prompt": result.get("prompt"),
+                "poll_endpoint": result.get("poll_endpoint", f"/api/v1/pipeline/image-status/{result.get('task_id')}")
+            })
+    
     summary = {
-    "type": "summary",
-    "summary": {  # For backward compatibility
-    "completed_results": processed_results,
-    "all_complete": True,
-    "polling_required": any(result.get("type") == "image_generation" and
-    not result.get("image_url") for result in context.get("results", []))
-    },
-    "data": {
-    "completed_results": processed_results,
-    "all_complete": True,
-    "polling_required": any(result.get("type") == "image_generation" and
-    not result.get("image_url") for result in context.get("results", []))
+        "type": "summary",
+        "summary": {  # For backward compatibility
+            "completed_results": processed_results,
+            "all_complete": True,
+            "polling_required": polling_required,
+            "pending_image_tasks": pending_image_tasks
+        },
+        "data": {
+            "completed_results": processed_results,
+            "all_complete": True,
+            "polling_required": polling_required,
+            "pending_image_tasks": pending_image_tasks
+        }
     }
-    }
-    logger.info(f"__stream__shit Sending summary message: {processed_results}")
+    logger.info(f"__stream__chat Sending summary message: {processed_results}")
     yield f"data: {json.dumps(summary)}\n\n"
         
     # If we have pending image tasks, keep the stream alive and check for updates
     last_poll_time = datetime.now(timezone.utc)
-    max_wait_time = 60  # Wait up to 60 seconds for images
+    max_wait_time = 120  # Increase wait time to 120 seconds for images
+    polling_interval = 2  # Poll every 2 seconds
+    sent_polling_notification = False
+    
+    # If we have image tasks, notify client about continuous polling
+    if image_generation_tasks:
+        polling_notification = {
+            "type": "polling_required",
+            "data": {
+                "task_ids": [task["task_id"] for task in image_generation_tasks],
+                "message": "Image generation in progress, client should continue polling",
+                "poll_endpoint": "/api/v1/pipeline/image-status/{task_id}"
+            }
+        }
+        yield f"data: {json.dumps(polling_notification)}\n\n"
+        sent_polling_notification = True
+        logger.info(f"__stream__chat Sent polling notification for image tasks: {[task['task_id'] for task in image_generation_tasks]}")
     
     while image_generation_tasks and (datetime.now(timezone.utc) - last_poll_time).total_seconds() < max_wait_time:
-        # Poll for image status every second
-        await asyncio.sleep(1)
+        # Poll for image status at specified interval
+        await asyncio.sleep(polling_interval)
         
         # Check each pending task
         for task in image_generation_tasks:
@@ -1206,11 +1235,11 @@ async def process_streaming_response(context: Dict[str, Any]):
                 "polling_required": any(not task["completed"] for task in image_generation_tasks)
             }
         }
-        logger.info(f"__stream__shit Sending final summary after image polling")
+        logger.info(f"__stream__chat Sending final summary after image polling")
         yield f"data: {json.dumps(updated_summary)}\n\n"
 
     # End the stream
-    logger.info(f"__stream__shit Sending final [DONE] marker")
+    logger.info(f"__stream__chat Sending final [DONE] marker")
     yield "data: [DONE]\n\n"
 
 
@@ -1221,7 +1250,7 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
     options = config.get("options", {})
     conversation_id = config.get("conversation_id")
     db = config.get("db")
-
+    logger.info(f"Processing message with pipeline: {config}")
     # Configure message processing based on message type and options
     if message_type == "image":
         # For image generation requests
@@ -2043,6 +2072,320 @@ async def debug_image_status(task_id: str):
         "endpoint": endpoint,
         "timestamp": datetime.now().isoformat()
     }
+
+
+@router.get("/image-poll/{task_id}")
+async def poll_image_status(
+    task_id: str,
+    conversation_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Enhanced polling endpoint for image generation status.
+    Designed specifically for client-side polling after server-sent events.
+    """
+    logger.info(f"Poll image status endpoint called for task: {task_id}")
+    try:
+        # Query the task table for the task
+        query = """
+        SELECT id, type, parameters, status, result, error, 
+               created_at AT TIME ZONE 'UTC' as created_at,
+               completed_at AT TIME ZONE 'UTC' as completed_at
+        FROM mo_ai_tasks 
+        WHERE id = :task_id
+        """
+
+        task = await db.fetch_one(
+            query=query,
+            values={
+                "task_id": task_id
+            }
+        )
+
+        if not task:
+            return {
+                "status": "not_found",
+                "task_id": task_id,
+                "message": "Image generation task not found",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        task_dict = dict(task)
+        response = {
+            "task_id": task_id,
+            "status": task_dict["status"],
+            "timestamp": datetime.now().isoformat(),
+            "conversation_id": conversation_id,
+            "message_id": message_id
+        }
+
+        if task_dict["status"] == "completed" and task_dict["result"]:
+            # Parse the result JSON
+            result_data = json.loads(task_dict["result"])
+
+            # Get the first image from the result
+            image = result_data.get("images", [])[0] if result_data.get("images") else None
+
+            if image:
+                response.update({
+                    "image_url": image["url"],
+                    "image_id": image["id"],
+                    "prompt": image["prompt"],
+                    "created_at": image.get("created_at"),
+                    "model": image.get("model")
+                })
+            else:
+                # Result exists but no images found
+                response.update({
+                    "error": "No images found in completed result"
+                })
+
+        elif task_dict["status"] == "failed":
+            response.update({
+                "error": task_dict.get("error", "Unknown error occurred during image generation")
+            })
+
+        # Get progress information if available
+        try:
+            stages_query = """
+            SELECT stage_number, completion_percentage, image_url
+            FROM mo_image_stages
+            WHERE task_id = :task_id
+            ORDER BY stage_number
+            """
+            
+            stages = await db.fetch_all(
+                query=stages_query,
+                values={"task_id": task_id}
+            )
+            
+            if stages:
+                # Find the highest completion percentage stage
+                max_stage = max(stages, key=lambda x: x["completion_percentage"] if x["completion_percentage"] is not None else 0)
+                response["progress"] = {
+                    "percentage": max_stage["completion_percentage"],
+                    "stage": max_stage["stage_number"],
+                    "preview_url": max_stage["image_url"]
+                }
+        except Exception as stage_error:
+            logger.error(f"Error getting stages: {str(stage_error)}")
+            # Don't fail if stages query errors out
+            
+        # Include message information if we have conversation_id and message_id
+        if conversation_id and message_id:
+            try:
+                message_query = """
+                SELECT id, metadata, image_url 
+                FROM mo_llm_messages
+                WHERE id = :message_id AND conversation_id = :conversation_id
+                """
+                
+                message = await db.fetch_one(
+                    query=message_query,
+                    values={
+                        "message_id": message_id,
+                        "conversation_id": conversation_id
+                    }
+                )
+                
+                if message:
+                    # Extract message info
+                    message_dict = dict(message)
+                    metadata = {}
+                    
+                    if message_dict.get("metadata"):
+                        try:
+                            if isinstance(message_dict["metadata"], str):
+                                metadata = json.loads(message_dict["metadata"])
+                            else:
+                                metadata = message_dict["metadata"]
+                        except json.JSONDecodeError:
+                            pass  # Invalid JSON in metadata
+                            
+                    # If message has an image URL, it takes precedence
+                    if message_dict.get("image_url") and not response.get("image_url"):
+                        response["image_url"] = message_dict["image_url"]
+                        response["from_message"] = True
+                        
+                    # Include metadata image info if available
+                    if metadata.get("image_url") and not response.get("image_url"):
+                        response["image_url"] = metadata["image_url"]
+                        response["image_id"] = metadata.get("image_id")
+                        response["from_metadata"] = True
+            except Exception as msg_error:
+                logger.error(f"Error getting message info: {str(msg_error)}")
+                # Don't fail if message query errors out
+        
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in poll_image_status: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "status": "error",
+            "task_id": task_id,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@router.get("/image-poll/{task_id}")
+async def poll_image_status(
+    task_id: str,
+    conversation_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """
+    Enhanced polling endpoint for image generation status.
+    Designed specifically for client-side polling after server-sent events.
+    """
+    logger.info(f"Poll image status endpoint called for task: {task_id}")
+    try:
+        # Query the task table for the task
+        query = """
+        SELECT id, type, parameters, status, result, error, 
+               created_at AT TIME ZONE 'UTC' as created_at,
+               completed_at AT TIME ZONE 'UTC' as completed_at
+        FROM mo_ai_tasks 
+        WHERE id = :task_id
+        """
+
+        task = await db.fetch_one(
+            query=query,
+            values={
+                "task_id": task_id
+            }
+        )
+
+        if not task:
+            return {
+                "status": "not_found",
+                "task_id": task_id,
+                "message": "Image generation task not found",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        task_dict = dict(task)
+        response = {
+            "task_id": task_id,
+            "status": task_dict["status"],
+            "timestamp": datetime.now().isoformat(),
+            "conversation_id": conversation_id,
+            "message_id": message_id
+        }
+
+        if task_dict["status"] == "completed" and task_dict["result"]:
+            # Parse the result JSON
+            result_data = json.loads(task_dict["result"])
+
+            # Get the first image from the result
+            image = result_data.get("images", [])[0] if result_data.get("images") else None
+
+            if image:
+                response.update({
+                    "image_url": image["url"],
+                    "image_id": image["id"],
+                    "prompt": image["prompt"],
+                    "created_at": image.get("created_at"),
+                    "model": image.get("model")
+                })
+            else:
+                # Result exists but no images found
+                response.update({
+                    "error": "No images found in completed result"
+                })
+
+        elif task_dict["status"] == "failed":
+            response.update({
+                "error": task_dict.get("error", "Unknown error occurred during image generation")
+            })
+
+        # Get progress information if available
+        try:
+            stages_query = """
+            SELECT stage_number, completion_percentage, image_url
+            FROM mo_image_stages
+            WHERE task_id = :task_id
+            ORDER BY stage_number
+            """
+            
+            stages = await db.fetch_all(
+                query=stages_query,
+                values={"task_id": task_id}
+            )
+            
+            if stages:
+                # Find the highest completion percentage stage
+                max_stage = max(stages, key=lambda x: x["completion_percentage"] if x["completion_percentage"] is not None else 0)
+                response["progress"] = {
+                    "percentage": max_stage["completion_percentage"],
+                    "stage": max_stage["stage_number"],
+                    "preview_url": max_stage["image_url"]
+                }
+        except Exception as stage_error:
+            logger.error(f"Error getting stages: {str(stage_error)}")
+            # Don't fail if stages query errors out
+            
+        # Include message information if we have conversation_id and message_id
+        if conversation_id and message_id:
+            try:
+                message_query = """
+                SELECT id, metadata, image_url 
+                FROM mo_llm_messages
+                WHERE id = :message_id AND conversation_id = :conversation_id
+                """
+                
+                message = await db.fetch_one(
+                    query=message_query,
+                    values={
+                        "message_id": message_id,
+                        "conversation_id": conversation_id
+                    }
+                )
+                
+                if message:
+                    # Extract message info
+                    message_dict = dict(message)
+                    metadata = {}
+                    
+                    if message_dict.get("metadata"):
+                        try:
+                            if isinstance(message_dict["metadata"], str):
+                                metadata = json.loads(message_dict["metadata"])
+                            else:
+                                metadata = message_dict["metadata"]
+                        except json.JSONDecodeError:
+                            pass  # Invalid JSON in metadata
+                            
+                    # If message has an image URL, it takes precedence
+                    if message_dict.get("image_url") and not response.get("image_url"):
+                        response["image_url"] = message_dict["image_url"]
+                        response["from_message"] = True
+                        
+                    # Include metadata image info if available
+                    if metadata.get("image_url") and not response.get("image_url"):
+                        response["image_url"] = metadata["image_url"]
+                        response["image_id"] = metadata.get("image_id")
+                        response["from_metadata"] = True
+            except Exception as msg_error:
+                logger.error(f"Error getting message info: {str(msg_error)}")
+                # Don't fail if message query errors out
+        
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in poll_image_status: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "status": "error",
+            "task_id": task_id,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 
 @router.get("/api-info")

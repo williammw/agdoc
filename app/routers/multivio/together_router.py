@@ -584,15 +584,50 @@ async def generate_image_task(
         if streaming_generator:
             try:
                 for img in generated_images:
-                    await streaming_generator.asend({
-                        "type": "image_generation",
-                        "status": "completed",
-                        "task_id": task_id,
-                        "image_url": img["url"],
-                        "image_id": img["id"],
-                        "prompt": img["prompt"]
-                    })
-                logger.info(f"Sent 'completed' status to streaming generator for task {task_id}")
+                    # We need to handle various formats to ensure compatibility
+                    try:
+                        # 1. First signal in the old format for compatibility
+                        await streaming_generator.asend({
+                            "type": "image_generation",
+                            "status": "completed",
+                            "task_id": task_id,
+                            "image_url": img["url"],
+                            "image_id": img["id"],
+                            "prompt": img["prompt"],
+                            "message_id": message_id
+                        })
+                        
+                        # Add small delay between sends
+                        await asyncio.sleep(0.1)
+                        
+                        # 2. Second signal in the dedicated image_ready format
+                        await streaming_generator.asend({
+                            "type": "image_ready",
+                            "task_id": task_id,
+                            "image_url": img["url"],
+                            "image_id": img["id"],
+                            "prompt": img["prompt"],
+                            "message_id": message_id
+                        })
+                        
+                        # Add small delay between sends
+                        await asyncio.sleep(0.1)
+                        
+                        # 3. Third signal as a legacy format for backward compatibility
+                        await streaming_generator.asend({
+                            "image_generation_complete": True,
+                            "image_url": img["url"],
+                            "task_id": task_id,
+                            "message_id": message_id
+                        })
+                    except Exception as send_error:
+                        logger.error(f"Error sending image completion event: {str(send_error)}")
+                        # Continue to the next image even if one send fails
+                    
+                    logger.info(f"Sent completed image signals to streaming generator for task {task_id}")
+                    
+                    # Small delay between signals to prevent overwhelming
+                    await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error sending completion to streaming generator: {str(e)}")
                 
@@ -604,13 +639,40 @@ async def generate_image_task(
         # Notify through streaming generator if available
         if streaming_generator:
             try:
-                await streaming_generator.asend({
-                    "type": "image_generation",
-                    "status": "failed",
-                    "task_id": task_id,
-                    "error": str(e)
-                })
-                logger.info(f"Sent 'failed' status to streaming generator for task {task_id}")
+                # Send failure signal in multiple formats for redundancy
+                try:
+                    # 1. Standard format
+                    await streaming_generator.asend({
+                        "type": "image_generation",
+                        "status": "failed",
+                        "task_id": task_id,
+                        "error": str(e)
+                    })
+                    
+                    # Add small delay between sends
+                    await asyncio.sleep(0.1)
+                    
+                    # 2. Dedicated image_failed event
+                    await streaming_generator.asend({
+                        "type": "image_failed",
+                        "task_id": task_id,
+                        "error": str(e)
+                    })
+                    
+                    # Add small delay between sends
+                    await asyncio.sleep(0.1)
+                    
+                    # 3. Legacy format
+                    await streaming_generator.asend({
+                        "image_generation_failed": True,
+                        "task_id": task_id,
+                        "error": str(e)
+                    })
+                except Exception as send_error:
+                    logger.error(f"Error sending failure notification: {str(send_error)}")
+                    # Continue even if sends fail
+                
+                logger.info(f"Sent 'failed' status signals to streaming generator for task {task_id}")
             except Exception as gen_error:
                 logger.error(f"Error sending failure to streaming generator: {str(gen_error)}")
         
