@@ -1456,16 +1456,16 @@ async def process_multi_intent_request(
 
 
 # Legacy endpoint - but use new implementation internally for safety
-@router.post("/conversation")
-async def create_conversation(
-    request: GetOrCreateConversationRequest,
-    idempotency_key: Optional[str] = Header(None),
-    db: Database = Depends(get_database),
-    current_user: dict = Depends(get_current_user)
-):
-    """Create a new conversation - using the get-or-create pattern internally"""
-    # Reuse the idempotent endpoint to avoid duplicates
-    return await get_or_create_conversation_endpoint(request, idempotency_key, db, current_user)
+# @router.post("/conversation")
+# async def create_conversation(
+#     request: GetOrCreateConversationRequest,
+#     idempotency_key: Optional[str] = Header(None),
+#     db: Database = Depends(get_database),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     """Create a new conversation - using the get-or-create pattern internally"""
+#     # Reuse the idempotent endpoint to avoid duplicates
+#     return await get_or_create_conversation_endpoint(request, idempotency_key, db, current_user)
 
 
 # @router.post("/conversation/get-or-create")
@@ -1776,7 +1776,7 @@ async def stream_multi_intent_chat(
                 content={"message": "No message to process", "skipped": True}
             )
 
-        # Check if we need to create new content or conversation
+        # Check if we need to create new chat or conversation
         chat_id = request.chat_id
         conversation_id = request.conversation_id
         
@@ -1812,7 +1812,7 @@ async def stream_multi_intent_chat(
                 
                 if existing:
                     conversation_id = existing["id"]
-                    logger.info(f"Using existing conversation {conversation_id} for content {chat_id}")
+                    logger.info(f"Using existing conversation {conversation_id} for chat {chat_id}")
                 else:
                     # If still no conversation found, raise error
                     raise HTTPException(
