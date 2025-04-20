@@ -91,9 +91,10 @@ jedi==0.19.1
 Jinja2==3.1.4
 jiter==0.9.0
 jmespath==1.0.1
+joblib==1.4.2
 jupyter_client==8.6.2
 jupyter_core==5.7.2
-keras==3.4.1
+keras==3.9.2
 kombu==5.4.0
 langdetect==1.0.9
 libclang==18.1.1
@@ -103,7 +104,7 @@ markdown-it-py==3.0.0
 MarkupSafe==2.1.5
 matplotlib-inline==0.1.7
 mdurl==0.1.2
-ml-dtypes==0.4.0
+ml_dtypes==0.5.1
 moviepy==1.0.3
 mpmath==1.3.0
 msgpack==1.0.8
@@ -116,7 +117,7 @@ oauthlib==3.2.2
 openai==1.72.0
 opencv-python==4.10.0.84
 opt-einsum==3.3.0
-optree==0.12.1
+optree==0.15.0
 outcome==1.3.0.post0
 packaging==24.1
 pandas==2.2.3
@@ -165,7 +166,10 @@ rich==13.9.4
 rsa==4.9
 s3transfer==0.10.2
 safetensors==0.5.3
+scikit-learn==1.6.1
+scipy==1.15.2
 selenium==4.30.0
+sentence-transformers==4.1.0
 shellingham==1.5.4
 six==1.16.0
 sniffio==1.3.1
@@ -177,11 +181,12 @@ starlette==0.37.2
 sympy==1.13.1
 tabulate==0.9.0
 tenacity==9.0.0
-tensorboard==2.17.0
+tensorboard==2.19.0
 tensorboard-data-server==0.7.2
-tensorflow==2.17.0
+tensorflow==2.19.0
 tensorflow-io-gcs-filesystem==0.37.1
 termcolor==2.4.0
+tf_keras==2.19.0
 threadpoolctl==3.5.0
 together==1.4.1
 tokenizers==0.21.1

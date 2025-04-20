@@ -49,9 +49,9 @@ THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_NAME = os.getenv(
     "INTENT_ENCODER", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 CLASSIFIER_PATH = Path(
-    os.getenv("INTENT_CLASSIFIER_HEAD", THIS_DIR / "intent_head.pkl"))
+    os.getenv("INTENT_CLASSIFIER_HEAD", THIS_DIR / "detector/intent_head.pkl"))
 CALIBRATION_PATH = Path(
-    os.getenv("INTENT_THRESHOLDS", THIS_DIR / "intent_thresholds.json"))
+    os.getenv("INTENT_THRESHOLDS", THIS_DIR / "detector/intent_thresholds.json"))
 
 # deterministic quick‑rules – compiled once
 RULE_PATTERNS: Dict[str, List[str]] = {
@@ -68,13 +68,14 @@ RULE_REGEX = {intent: [re.compile(p, re.IGNORECASE) for p in pats]
 _ENCODER: SentenceTransformer | None = None
 _CLASSIFIER: ClassifierChain | None = None
 _MLB: MultiLabelBinarizer | None = None
+_CLASS_NAMES: List[str] = []
 _THRESHOLDS: Dict[str, float] | None = None
 _SINGLETON_LOCK = asyncio.Lock()
 
 
 async def _load():
     """Load heavy resources once per process."""
-    global _ENCODER, _CLASSIFIER, _MLB, _THRESHOLDS
+    global _ENCODER, _CLASSIFIER, _MLB, _CLASS_NAMES, _THRESHOLDS
     async with _SINGLETON_LOCK:
         if _ENCODER is None:
             _ENCODER = SentenceTransformer(DEFAULT_MODEL_NAME)
@@ -84,6 +85,12 @@ async def _load():
                     f"Classifier head not found: {CLASSIFIER_PATH}")
             _CLASSIFIER = joblib.load(CLASSIFIER_PATH)
             _MLB = _CLASSIFIER.classes_  # stored inside the chain
+            # Make sure we have the list of class names for later use
+            if hasattr(_MLB, 'classes_'):
+                _CLASS_NAMES = _MLB.classes_
+            else:
+                # Fallback - try to get class names directly from classifier
+                _CLASS_NAMES = _CLASSIFIER.classes_ if hasattr(_CLASSIFIER, 'classes_') else []
         if _THRESHOLDS is None:
             if CALIBRATION_PATH.exists():
                 _THRESHOLDS = json.loads(CALIBRATION_PATH.read_text())
@@ -115,7 +122,7 @@ async def predict_intents(text: str) -> Dict[str, float]:
         [text], convert_to_numpy=True, normalize_embeddings=True)
     logits = _CLASSIFIER.predict_proba(embeddings)[0]  # shape (num_intents,)
     ml_probs = {cls: float(prob)
-                for cls, prob in zip(_CLASSIFIER.classes_, logits)}
+                for cls, prob in zip(_CLASS_NAMES, logits)}
 
     # 3) fuse: rule‑wins else ML prob
     fused: Dict[str, float] = {**ml_probs, **
@@ -164,5 +171,5 @@ async def predict_intents_with_fallback(text: str) -> Dict[str, float]:
 
     # all below threshold – escalate
     await _load()
-    zsf = await _zero_shot_fallback(text, list(_CLASSIFIER.classes_))
+    zsf = await _zero_shot_fallback(text, _CLASS_NAMES)
     return zsf

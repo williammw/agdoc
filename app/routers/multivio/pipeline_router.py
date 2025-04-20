@@ -20,7 +20,7 @@ import re
 from firebase_admin import auth as firebase_auth
 
 from .commands.base import Pipeline, CommandFactory
-from .commands.intent_detector import detect_intents, MultilingualIntentDetector
+# from .commands.intent_detector import detect_intents, MultilingualIntentDetector
 from .commands.intent_detector_v2 import predict_intents
 # Import commands to register them with the factory - hiding web search and puppeteer
 # from .commands.web_search_command import WebSearchCommand
@@ -55,6 +55,10 @@ class MultiIntentChatRequest(BaseModel):
     max_tokens: Optional[int] = 1000
     stream: bool = True
     reasoning_effort: Optional[str] = "high"
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 # Add enhanced request model
@@ -67,8 +71,9 @@ class StreamChatRequest(BaseModel):
     stream: bool = True
     options: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
-    class Config:
-        schema_extra = {
+    model_config = {
+        'protected_namespaces': (),
+        'json_schema_extra': {
             "example": {
                 "conversation_id": "optional-for-existing-chats",
                 "content_id": "optional-content-id",
@@ -84,12 +89,17 @@ class StreamChatRequest(BaseModel):
                 }
             }
         }
+    }
 
 
 class CommandResult(BaseModel):
     type: str
     content: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 class MultiIntentResponse(BaseModel):
@@ -98,12 +108,20 @@ class MultiIntentResponse(BaseModel):
     detected_intents: List[str]
     results: List[CommandResult]
     content: str
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 class CreateConversationRequest(BaseModel):
     content_id: str
     title: Optional[str] = None
     model: Optional[str] = "grok-2-1212"
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 class Conversation(BaseModel):
@@ -115,12 +133,20 @@ class Conversation(BaseModel):
     content_id: Optional[str] = None
     user_id: str
     message_count: int = 0
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 class GetOrCreateConversationRequest(BaseModel):
     content_id: str
     model_id: Optional[str] = "grok-2-1212"
     title: Optional[str] = None
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
     
 
 async def get_or_create_conversation(content_id: str, user_id: str, model_id: str, title: str, db: Database):
@@ -665,8 +691,11 @@ async def process_streaming_response(context: Dict[str, Any]):
                             "reasoning": reasoning_text
                         }
                     }
-                    logger.info(
-                        f"__stream__shit Streaming reasoning chunk #{chunk_count} - length {len(reasoning_text)}")
+                    
+                    # Only log occasionally to avoid flooding logs
+                    if chunk_count == 1 or chunk_count % 100 == 0 or len(reasoning_text) > 100:
+                        logger.info(
+                            f"__stream__shit Streaming reasoning chunk #{chunk_count} - length {len(reasoning_text)}")
                     yield f"data: {json.dumps(reasoning_msg)}\n\n"
                     await asyncio.sleep(0.01)
 
@@ -941,7 +970,9 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
 
     # Always detect intents for text messages
     if message_type == "text":
-        intents = detect_intents(config["message"])
+        # intents = detect_intents(config["message"])
+        raw_probs = await predict_intents(config["message"])
+        intents = {k: {"confidence": v} for k, v in raw_probs.items()}
         # Filter out low-confidence intents
         significant_intents = {k: v for k,
                                v in intents.items() if v["confidence"] > 0.3}
@@ -1035,10 +1066,10 @@ async def process_multi_intent_request(
         f"Processing request for user: {current_user.get('id', current_user.get('uid', 'unknown'))}")
 
     # Detect intents in the message
-    intents = detect_intents(request.message)
+    # intents = detect_intents(request.message)
     # v2 pending to release
-    # raw_probs = await predict_intents(request.message)
-    # intents = {k: {"confidence": v} for k, v in raw_probs.items()}
+    raw_probs = await predict_intents(request.message)
+    intents = {k: {"confidence": v} for k, v in raw_probs.items()}
     
     # Filter out low-confidence intents for logging
     significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
@@ -2325,6 +2356,10 @@ class InitConversationRequest(BaseModel):
     content_id: str
     title: Optional[str] = None
     model_id: Optional[str] = "grok-3-mini-beta"
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
 
 
 @router.post("/conversation/init")
