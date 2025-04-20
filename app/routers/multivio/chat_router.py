@@ -17,7 +17,7 @@ async def create_content(
 ):
     try:
         query = """
-        INSERT INTO mo_content (
+        INSERT INTO mo_chat (
             uuid,
             firebase_uid,
             name,
@@ -53,21 +53,21 @@ async def create_content(
         logger.error(f"Error in create_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/chat/{content_id}", response_model=ContentResponse)
+@router.get("/chat/{chat_id}", response_model=ContentResponse)
 async def get_content(
-    content_id: int,
+    chat_id: int,
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
     try:
         query = """
-        SELECT * FROM mo_content 
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        SELECT * FROM mo_chat 
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         """
         
         result = await db.fetch_one(
             query=query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         )
         
         if not result:
@@ -90,7 +90,7 @@ async def list_content(
     try:
         # Base query for counting total records
         count_query = """
-        SELECT COUNT(*) as total FROM mo_content 
+        SELECT COUNT(*) as total FROM mo_chat 
         WHERE firebase_uid = :firebase_uid 
         """
         
@@ -107,7 +107,7 @@ async def list_content(
         # Main query with pagination
         if status:
             query = """
-            SELECT * FROM mo_content 
+            SELECT * FROM mo_chat 
             WHERE firebase_uid = :firebase_uid AND status = :status
             ORDER BY created_at DESC
             LIMIT :limit OFFSET :offset
@@ -120,7 +120,7 @@ async def list_content(
             }
         else:
             query = """
-            SELECT * FROM mo_content 
+            SELECT * FROM mo_chat 
             WHERE firebase_uid = :firebase_uid AND status = 'draft'
             ORDER BY created_at DESC
             LIMIT :limit OFFSET :offset
@@ -143,9 +143,9 @@ async def list_content(
         logger.error(f"Error in list_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.put("/chat/{content_id}", response_model=ContentResponse)
+@router.put("/chat/{chat_id}", response_model=ContentResponse)
 async def update_content(
-    content_id: int,
+    chat_id: int,
     content: ContentUpdate,
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database)
@@ -153,12 +153,12 @@ async def update_content(
     try:
         # First check if content exists and belongs to user
         check_query = """
-        SELECT id FROM mo_content 
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        SELECT id FROM mo_chat 
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         """
         exists = await db.fetch_one(
             query=check_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         )
         
         if not exists:
@@ -166,7 +166,7 @@ async def update_content(
 
         # Build update query dynamically based on provided fields
         update_fields = []
-        values = {"content_id": content_id, "firebase_uid": current_user["uid"]}
+        values = {"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         
         for field, value in content.dict(exclude_unset=True).items():
             if value is not None:
@@ -174,13 +174,13 @@ async def update_content(
                 values[field] = value
 
         if not update_fields:
-            return await get_content(content_id, current_user, db)
+            return await get_content(chat_id, current_user, db)
 
         update_fields.append("updated_at = CURRENT_TIMESTAMP")
         update_query = f"""
-        UPDATE mo_content 
+        UPDATE mo_chat 
         SET {", ".join(update_fields)}
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         RETURNING *
         """
         
@@ -190,9 +190,9 @@ async def update_content(
     except Exception as e:
         logger.error(f"Error in update_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-@router.patch("/chat/{content_id}", response_model=ContentResponse)
+@router.patch("/chat/{chat_id}", response_model=ContentResponse)
 async def patch_content(
-    content_id: int,
+    chat_id: int,
     content: ContentUpdate,
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database)
@@ -200,12 +200,12 @@ async def patch_content(
     try:
         # First check if content exists and belongs to user
         check_query = """
-        SELECT id FROM mo_content 
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        SELECT id FROM mo_chat 
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         """
         exists = await db.fetch_one(
             query=check_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         )
         
         if not exists:
@@ -213,7 +213,7 @@ async def patch_content(
 
         # Build update query dynamically based on provided fields
         update_fields = []
-        values = {"content_id": content_id, "firebase_uid": current_user["uid"]}
+        values = {"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         
         for field, value in content.dict(exclude_unset=True).items():
             if value is not None:
@@ -221,13 +221,13 @@ async def patch_content(
                 values[field] = value
 
         if not update_fields:
-            return await get_content(content_id, current_user, db)
+            return await get_content(chat_id, current_user, db)
 
         update_fields.append("updated_at = CURRENT_TIMESTAMP")
         update_query = f"""
-        UPDATE mo_content 
+        UPDATE mo_chat 
         SET {', '.join(update_fields)}
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         RETURNING *
         """
         
@@ -238,21 +238,21 @@ async def patch_content(
         logger.error(f"Error in patch_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.delete("/chat/{content_id}")
+@router.delete("/chat/{chat_id}")
 async def delete_content(
-    content_id: str,
+    chat_id: str,
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database)
 ):
     try:
         # First check if content exists and belongs to user
         check_query = """
-        SELECT uuid FROM mo_content 
-        WHERE CAST(id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
+        SELECT uuid FROM mo_chat 
+        WHERE CAST(id AS TEXT) = :chat_id AND firebase_uid = :firebase_uid
         """
         content_result = await db.fetch_one(
             query=check_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         )
         
         if not content_result:
@@ -268,7 +268,7 @@ async def delete_content(
             DELETE FROM mo_llm_messages 
             WHERE conversation_id IN (
                 SELECT v.id FROM mo_llm_conversations v
-                WHERE v.content_id = :content_uuid
+                WHERE v.chat_id = :content_uuid
             )
             """
             await db.execute(
@@ -279,7 +279,7 @@ async def delete_content(
             # Step 2: Delete LLM conversations associated with this content
             delete_conversations_query = """
             DELETE FROM mo_llm_conversations
-            WHERE content_id = :content_uuid
+            WHERE chat_id = :content_uuid
             """
             await db.execute(
                 query=delete_conversations_query,
@@ -289,21 +289,21 @@ async def delete_content(
             # Step 3: Delete associated versions (due to foreign key constraint)
             delete_versions_query = """
             DELETE FROM mo_content_version 
-            WHERE CAST(content_id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
+            WHERE CAST(chat_id AS TEXT) = :chat_id AND firebase_uid = :firebase_uid
             """
             await db.execute(
                 query=delete_versions_query,
-                values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+                values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
             )
             
             # Step 4: Finally delete the content
             delete_query = """
-            DELETE FROM mo_content 
-            WHERE CAST(id AS TEXT) = :content_id AND firebase_uid = :firebase_uid
+            DELETE FROM mo_chat 
+            WHERE CAST(id AS TEXT) = :chat_id AND firebase_uid = :firebase_uid
             """
             await db.execute(
                 query=delete_query,
-                values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+                values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
             )
             
             # Commit the transaction
@@ -320,9 +320,9 @@ async def delete_content(
         logger.error(f"Error in delete_content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/chat/{content_id}/version")
+@router.post("/chat/{chat_id}/version")
 async def create_content_version(
-    content_id: int,
+    chat_id: int,
     version_data: ContentVersion,
     current_user: Dict = Depends(get_current_user),
     db: Database = Depends(get_database)
@@ -330,12 +330,12 @@ async def create_content_version(
     try:
         # Check if content exists and belongs to user
         check_query = """
-        SELECT id FROM mo_content 
-        WHERE id = :content_id AND firebase_uid = :firebase_uid
+        SELECT id FROM mo_chat 
+        WHERE id = :chat_id AND firebase_uid = :firebase_uid
         """
         exists = await db.fetch_one(
             query=check_query,
-            values={"content_id": content_id, "firebase_uid": current_user["uid"]}
+            values={"chat_id": chat_id, "firebase_uid": current_user["uid"]}
         )
         
         if not exists:
@@ -344,12 +344,12 @@ async def create_content_version(
         # Create new version
         insert_query = """
         INSERT INTO mo_content_version (
-            content_id,
+            chat_id,
             firebase_uid,
             version,
             content_data
         ) VALUES (
-            :content_id,
+            :chat_id,
             :firebase_uid,
             :version,
             :content_data
@@ -357,7 +357,7 @@ async def create_content_version(
         """
         
         values = {
-            "content_id": content_id,
+            "chat_id": chat_id,
             "firebase_uid": current_user["uid"],
             "version": version_data.version,
             "content_data": version_data.content_data

@@ -48,7 +48,7 @@ class ChatMessage(BaseModel):
 
 class MultiIntentChatRequest(BaseModel):
     conversation_id: Optional[str] = None
-    content_id: Optional[str] = None
+    chat_id: Optional[str] = None
     message: str
     model: Optional[str] = "grok-3-mini-beta"
     temperature: Optional[float] = 0.7
@@ -64,7 +64,7 @@ class MultiIntentChatRequest(BaseModel):
 # Add enhanced request model
 class StreamChatRequest(BaseModel):
     conversation_id: Optional[str] = None
-    content_id: Optional[str] = None
+    chat_id: Optional[str] = None
     content_name: Optional[str] = None
     message: str
     message_type: str = "text"  # "text", "image", "social", "reasoning"
@@ -76,7 +76,7 @@ class StreamChatRequest(BaseModel):
         'json_schema_extra': {
             "example": {
                 "conversation_id": "optional-for-existing-chats",
-                "content_id": "optional-content-id",
+                "chat_id": "optional-content-id",
                 "content_name": "New Chat Title",
                 "message": "Hello, how can you help me today?",
                 "message_type": "text",
@@ -115,7 +115,7 @@ class MultiIntentResponse(BaseModel):
 
 
 class CreateConversationRequest(BaseModel):
-    content_id: str
+    chat_id: str
     title: Optional[str] = None
     model: Optional[str] = "grok-2-1212"
     
@@ -130,7 +130,7 @@ class Conversation(BaseModel):
     model: str
     created_at: datetime
     updated_at: datetime
-    content_id: Optional[str] = None
+    chat_id: Optional[str] = None
     user_id: str
     message_count: int = 0
     
@@ -140,7 +140,7 @@ class Conversation(BaseModel):
 
 
 class GetOrCreateConversationRequest(BaseModel):
-    content_id: str
+    chat_id: str
     model_id: Optional[str] = "grok-2-1212"
     title: Optional[str] = None
     
@@ -149,22 +149,22 @@ class GetOrCreateConversationRequest(BaseModel):
     }
     
 
-async def get_or_create_conversation(content_id: str, user_id: str, model_id: str, title: str, db: Database):
+async def get_or_create_conversation(chat_id: str, user_id: str, model_id: str, title: str, db: Database):
     """Get or create a conversation with database-level uniqueness"""
-    logger.info(f"get_or_create_conversation starting: content_id={content_id}, user_id={user_id}, model_id={model_id}, title={title}")
+    logger.info(f"get_or_create_conversation starting: chat_id={chat_id}, user_id={user_id}, model_id={model_id}, title={title}")
     try:
-        # First check if the content exists in mo_content
-        content_check_query = "SELECT uuid FROM mo_content WHERE uuid = :uuid"
-        content_exists = await db.fetch_one(query=content_check_query, values={"uuid": content_id})
+        # First check if the content exists in mo_chat
+        content_check_query = "SELECT uuid FROM mo_chat WHERE uuid = :uuid"
+        content_exists = await db.fetch_one(query=content_check_query, values={"uuid": chat_id})
         
         if not content_exists:
-            logger.warning(f"Content ID {content_id} does not exist in mo_content table")
+            logger.warning(f"Content ID {chat_id} does not exist in mo_chat table")
             # Try to create content entry automatically
             try:
                 # Create a new content entry
                 route = f"auto-{uuid.uuid4().hex[:8]}"  # Generate unique route
                 content_insert = """
-                INSERT INTO mo_content 
+                INSERT INTO mo_chat 
                 (uuid, firebase_uid, name, description, route, status) 
                 VALUES 
                 (:uuid, :firebase_uid, :name, :description, :route, 'draft')
@@ -173,18 +173,18 @@ async def get_or_create_conversation(content_id: str, user_id: str, model_id: st
                 """
                 
                 content_values = {
-                    "uuid": content_id,
+                    "uuid": chat_id,
                     "firebase_uid": user_id,
-                    "name": f"Auto-created Content {content_id[:8]}",
+                    "name": f"Auto-created Content {chat_id[:8]}",
                     "description": "Automatically created content for conversation",
                     "route": route
                 }
                 
                 content_result = await db.fetch_one(content_insert, content_values)
                 if content_result:
-                    logger.info(f"Created missing content entry: {content_id}")
+                    logger.info(f"Created missing content entry: {chat_id}")
                 else:
-                    logger.warning(f"Failed to create content entry for {content_id}")
+                    logger.warning(f"Failed to create content entry for {chat_id}")
             except Exception as content_error:
                 logger.error(f"Error creating content entry: {str(content_error)}")
                 # Continue anyway - the transaction below will fail if content doesn't exist
@@ -193,43 +193,43 @@ async def get_or_create_conversation(content_id: str, user_id: str, model_id: st
             # Try to get an existing conversation
             query = """
             SELECT id FROM mo_llm_conversations 
-            WHERE content_id = :content_id AND user_id = :user_id
+            WHERE chat_id = :chat_id AND user_id = :user_id
             """
-            existing = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+            existing = await db.fetch_one(query=query, values={"chat_id": chat_id, "user_id": user_id})
 
             if existing:
                 logger.info(
-                    f"Found existing conversation {existing['id']} for content {content_id}, user {user_id}")
+                    f"Found existing conversation {existing['id']} for content {chat_id}, user {user_id}")
                 return existing["id"]
 
             # Create new conversation if none exists
             new_id = str(uuid.uuid4())
             insert_query = """
             INSERT INTO mo_llm_conversations 
-            (id, user_id, content_id, model_id, title)
-            VALUES (:id, :user_id, :content_id, :model_id, :title)
+            (id, user_id, chat_id, model_id, title)
+            VALUES (:id, :user_id, :chat_id, :model_id, :title)
             RETURNING id
             """
             values = {
                 "id": new_id,
                 "user_id": user_id,
-                "content_id": content_id,
+                "chat_id": chat_id,
                 "model_id": model_id,
-                "title": title or f"Conversation about {content_id}"
+                "title": title or f"Conversation about {chat_id}"
             }
 
             result = await db.fetch_one(query=insert_query, values=values)
             logger.info(
-                f"Created new conversation {result['id']} for content {content_id}, user {user_id}")
+                f"Created new conversation {result['id']} for content {chat_id}, user {user_id}")
             return result["id"]
     except Exception as e:
         logger.error(f"Error in get_or_create_conversation: {str(e)}")
         # If there was an error, try to get again (might be a concurrent insert)
         query = """
         SELECT id FROM mo_llm_conversations 
-        WHERE content_id = :content_id AND user_id = :user_id
+        WHERE chat_id = :chat_id AND user_id = :user_id
         """
-        existing = await db.fetch_one(query=query, values={"content_id": content_id, "user_id": user_id})
+        existing = await db.fetch_one(query=query, values={"chat_id": chat_id, "user_id": user_id})
 
         if existing:
             logger.info(f"Recovered conversation {existing['id']} after error")
@@ -244,7 +244,7 @@ async def create_new_content(db: Database, user_id: str, content_name: str) -> s
     """Create new content and return its ID, checks first if similar content exists"""
     # First check if the user already has content with a similar name
     similarity_query = """
-    SELECT uuid FROM mo_content 
+    SELECT uuid FROM mo_chat 
     WHERE firebase_uid = :user_id AND name = :content_name
     LIMIT 1
     """
@@ -262,11 +262,11 @@ async def create_new_content(db: Database, user_id: str, content_name: str) -> s
         return str(existing["uuid"])
     
     # Create new content if none exists
-    content_id = str(uuid.uuid4())
+    chat_id = str(uuid.uuid4())
     route = f"auto-{uuid.uuid4().hex[:8]}"  # Generate unique route
     
     query = """
-    INSERT INTO mo_content 
+    INSERT INTO mo_chat 
     (uuid, firebase_uid, name, description, route, status) 
     VALUES 
     (:uuid, :firebase_uid, :name, :description, :route, 'draft')
@@ -274,7 +274,7 @@ async def create_new_content(db: Database, user_id: str, content_name: str) -> s
     """
     
     values = {
-        "uuid": content_id,
+        "uuid": chat_id,
         "firebase_uid": user_id,
         "name": content_name or "New Chat",
         "description": "Conversation content",
@@ -300,23 +300,23 @@ async def create_new_content(db: Database, user_id: str, content_name: str) -> s
         else:
             # If still not found, try to create with a slightly modified name
             modified_name = f"{content_name} {datetime.now().strftime('%H:%M:%S')}"
-            content_id = str(uuid.uuid4())
+            chat_id = str(uuid.uuid4())
             
-            values["uuid"] = content_id
+            values["uuid"] = chat_id
             values["name"] = modified_name
             values["route"] = f"auto-{uuid.uuid4().hex[:8]}"
             
             result = await db.fetch_one(query=query, values=values)
             return str(result["uuid"])
 
-async def create_new_conversation(db: Database, user_id: str, content_id: Optional[str] = None, model_id: str = "grok-3-mini-beta", title: Optional[str] = None) -> str:
+async def create_new_conversation(db: Database, user_id: str, chat_id: Optional[str] = None, model_id: str = "grok-3-mini-beta", title: Optional[str] = None) -> str:
     """Create new conversation and return its ID, or return existing ID if one exists"""
     
     # First check if a conversation already exists for this user and content
-    if content_id:
+    if chat_id:
         check_query = """
         SELECT id FROM mo_llm_conversations
-        WHERE user_id = :user_id AND content_id = :content_id
+        WHERE user_id = :user_id AND chat_id = :chat_id
         ORDER BY created_at DESC LIMIT 1
         """
         
@@ -324,23 +324,23 @@ async def create_new_conversation(db: Database, user_id: str, content_id: Option
             query=check_query,
             values={
                 "user_id": user_id,
-                "content_id": content_id
+                "chat_id": chat_id
             }
         )
         
         if existing:
-            logger.info(f"Reusing existing conversation {existing['id']} for content {content_id} and user {user_id}")
+            logger.info(f"Reusing existing conversation {existing['id']} for content {chat_id} and user {user_id}")
             return str(existing["id"])
     
-    # If no existing conversation or no content_id, create a new one
+    # If no existing conversation or no chat_id, create a new one
     conversation_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     
     query = """
     INSERT INTO mo_llm_conversations (
-        id, user_id, title, model_id, created_at, updated_at, content_id
+        id, user_id, title, model_id, created_at, updated_at, chat_id
     ) VALUES (
-        :id, :user_id, :title, :model, :created_at, :updated_at, :content_id
+        :id, :user_id, :title, :model, :created_at, :updated_at, :chat_id
     ) RETURNING id
     """
 
@@ -351,7 +351,7 @@ async def create_new_conversation(db: Database, user_id: str, content_id: Option
         "model": model_id,
         "created_at": now,
         "updated_at": now,
-        "content_id": content_id
+        "chat_id": chat_id
     }
 
     result = await db.fetch_one(query=query, values=values)
@@ -435,7 +435,7 @@ async def get_user(request: Request, db: Database = Depends(get_database)):
         raise HTTPException(status_code=401, detail="Authentication failed")
 
 
-async def create_conversation(db: Database, user_id: str, title: str = None, content_id: Optional[str] = None, model: str = "grok-2-1212"):
+async def create_conversation(db: Database, user_id: str, title: str = None, chat_id: Optional[str] = None, model: str = "grok-2-1212"):
     """Create a new conversation"""
     conversation_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -456,9 +456,9 @@ async def create_conversation(db: Database, user_id: str, title: str = None, con
 
     query = """
     INSERT INTO mo_llm_conversations (
-        id, user_id, title, model_id, created_at, updated_at, content_id
+        id, user_id, title, model_id, created_at, updated_at, chat_id
     ) VALUES (
-        :id, :user_id, :title, :model, :created_at, :updated_at, :content_id
+        :id, :user_id, :title, :model, :created_at, :updated_at, :chat_id
     ) RETURNING id
     """
 
@@ -469,7 +469,7 @@ async def create_conversation(db: Database, user_id: str, title: str = None, con
         "model": model,
         "created_at": now,
         "updated_at": now,
-        "content_id": content_id
+        "chat_id": chat_id
     }
 
     await db.execute(query=query, values=values)
@@ -481,7 +481,7 @@ async def get_conversation_by_id(db: Database, conversation_id: str):
     query = """
     SELECT 
         id, user_id, title, model_id as model, 
-        created_at, updated_at, content_id,
+        created_at, updated_at, chat_id,
         (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count
     FROM mo_llm_conversations 
     WHERE id = :conversation_id
@@ -494,15 +494,15 @@ async def get_conversation_by_id(db: Database, conversation_id: str):
     return dict(result)
 
 
-async def get_conversation_by_content_id(db: Database, content_id: str, user_id: str):
+async def get_conversation_by_content_id(db: Database, chat_id: str, user_id: str):
     """Get a conversation by content ID"""
     query = """
     SELECT 
         id, user_id, title, model_id as model, 
-        created_at, updated_at, content_id,
+        created_at, updated_at, chat_id,
         (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count
     FROM mo_llm_conversations 
-    WHERE content_id = :content_id
+    WHERE chat_id = :chat_id
     AND user_id = :user_id
     ORDER BY created_at DESC
     LIMIT 1
@@ -511,7 +511,7 @@ async def get_conversation_by_content_id(db: Database, content_id: str, user_id:
     result = await db.fetch_one(
         query=query,
         values={
-            "content_id": content_id,
+            "chat_id": chat_id,
             "user_id": user_id
         }
     )
@@ -559,14 +559,30 @@ async def process_streaming_response(context: Dict[str, Any]):
     """
     logger.info(
         f"__stream__shit Starting streaming response processing for context: {context.get('conversation_id')}")
+        
+    # Initialize image tracking variables
+    image_generation_tasks = []
+    has_image_generation = False
+    db = context.get("db")
+    
+    # Check if we have any image generation tasks
+    for result in context.get("results", []):
+        if result.get("type") == "image_generation":
+            has_image_generation = True
+            if not result.get("image_url"):  # Only track non-reused images
+                image_generation_tasks.append({
+                    "task_id": result.get("task_id"),
+                    "prompt": result.get("prompt"),
+                    "completed": False
+                })
 
     # First yield initialization information if we have new IDs
-    if context.get("conversation_id") or context.get("content_id"):
+    if context.get("conversation_id") or context.get("chat_id"):
         init_message = {
             "type": "initialization",
             "data": {
                 "conversation_id": context.get("conversation_id"),
-                "content_id": context.get("content_id"),
+                "chat_id": context.get("chat_id"),
                 # Add this line to include message_id
                 "message_id": context.get("message_id")
             }
@@ -587,7 +603,10 @@ async def process_streaming_response(context: Dict[str, Any]):
         f"__stream__shit Sending intents: {intents_message['data']['intents']}")
     yield f"data: {json.dumps(intents_message)}\n\n"
     await asyncio.sleep(0.05)
-
+    
+    # Direct handling for image generation mode
+    image_generation_mode = context.get("image_generation_mode", False) or context.get("message_type") == "image"
+    
     # Track which results have been processed
     processed_results = []
 
@@ -626,14 +645,48 @@ async def process_streaming_response(context: Dict[str, Any]):
                     result_message["reused"] = True
                     result_message["data"]["reused"] = True
                     result_message["result"]["reused"] = True
+                    
+                # For image generation mode, emit an image_ready event directly
+                if image_generation_mode:
+                    image_ready_event = {
+                        "type": "image_ready",
+                        "data": {
+                            "task_id": result.get("task_id"),
+                            "image_url": result["image_url"],
+                            "image_id": result.get("image_id"),
+                            "prompt": result.get("prompt")
+                        }
+                    }
+                    yield f"data: {json.dumps(image_ready_event)}\n\n"
+                    await asyncio.sleep(0.05)
             else:
                 # No image URL yet, set needs_polling
                 result_message["status"] = "needs_polling"
-                result_message["poll_endpoint"] = result.get(
-                    "poll_endpoint") or f"/api/v1/media/image-status/{result.get('task_id')}"
+                
+                # Get poll endpoint with fallback
+                poll_endpoint = result.get("poll_endpoint") or f"/api/v1/media/image-status/{result.get('task_id')}"
+                
+                # Add consistency check for poll_endpoint
+                if not poll_endpoint.startswith("/"):
+                    poll_endpoint = f"/{poll_endpoint}"
+                    
+                result_message["poll_endpoint"] = poll_endpoint
+                
                 # Include additional info about prompt
                 if "prompt" in result:
                     result_message["prompt"] = result["prompt"]
+                
+                # For image generation mode, emit an image_generating event directly
+                if image_generation_mode:
+                    image_generating_event = {
+                        "type": "image_generating",
+                        "data": {
+                            "task_id": result.get("task_id"),
+                            "prompt": result.get("prompt")
+                        }
+                    }
+                    yield f"data: {json.dumps(image_generating_event)}\n\n"
+                    await asyncio.sleep(0.05)
         else:
             result_message["status"] = "complete"
 
@@ -721,6 +774,60 @@ async def process_streaming_response(context: Dict[str, Any]):
                                 f"__stream__shit Streaming content chunk #{chunk_count} - length {len(content_text)}")
                         yield f"data: {json.dumps({'content': content_text, 'type': 'content', 'data': {'text': content_text}})}\n\n"
                         await asyncio.sleep(0.01)
+
+                elif chunk_type == "image_generation":
+                    # Handle image generation status updates
+                    status = chunk.get("status", "unknown")
+                    task_id = chunk.get("task_id", "")
+                    logger.info(f"__stream__shit Received image generation status: {status} for task {task_id}")
+                    
+                    if status == "generating":
+                        # Send image_generating event
+                        image_generating_event = {
+                            "type": "image_generating",
+                            "data": {
+                                "task_id": chunk.get("task_id"),
+                                "prompt": chunk.get("prompt")
+                            }
+                        }
+                        yield f"data: {json.dumps(image_generating_event)}\n\n"
+                        logger.info(f"__stream__shit Sent image_generating event for task {task_id}")
+                    
+                    elif status == "completed":
+                        # Send image_ready event
+                        image_ready_event = {
+                            "type": "image_ready",
+                            "data": {
+                                "task_id": chunk.get("task_id"),
+                                "image_url": chunk.get("image_url"),
+                                "image_id": chunk.get("image_id"),
+                                "prompt": chunk.get("prompt")
+                            }
+                        }
+                        yield f"data: {json.dumps(image_ready_event)}\n\n"
+                        logger.info(f"__stream__shit Sent image_ready event for task {task_id}")
+                        
+                        # Also send a backward compatibility event
+                        compat_event = {
+                            "image_generation_complete": True,
+                            "image_url": chunk.get("image_url"),
+                            "task_id": chunk.get("task_id")
+                        }
+                        yield f"data: {json.dumps(compat_event)}\n\n"
+                    
+                    elif status == "failed":
+                        # Send image_failed event
+                        image_failed_event = {
+                            "type": "image_failed",
+                            "data": {
+                                "task_id": chunk.get("task_id"),
+                                "error": chunk.get("error", "Unknown error occurred")
+                            }
+                        }
+                        yield f"data: {json.dumps(image_failed_event)}\n\n"
+                        logger.info(f"__stream__shit Sent image_failed event for task {task_id}")
+                    
+                    await asyncio.sleep(0.02)
 
                 elif chunk_type == "completion":
                     content_complete = True
@@ -924,22 +1031,183 @@ async def process_streaming_response(context: Dict[str, Any]):
 
     # Send a final summary message with all completed results
     summary = {
-        "type": "summary",
-        "summary": {  # For backward compatibility
-            "completed_results": processed_results,
-            "all_complete": True,
-            "polling_required": any(result.get("type") == "image_generation" and
-                                    not result.get("image_url") for result in context.get("results", []))
-        },
-        "data": {
-            "completed_results": processed_results,
-            "all_complete": True,
-            "polling_required": any(result.get("type") == "image_generation" and
-                                    not result.get("image_url") for result in context.get("results", []))
-        }
+    "type": "summary",
+    "summary": {  # For backward compatibility
+    "completed_results": processed_results,
+    "all_complete": True,
+    "polling_required": any(result.get("type") == "image_generation" and
+    not result.get("image_url") for result in context.get("results", []))
+    },
+    "data": {
+    "completed_results": processed_results,
+    "all_complete": True,
+    "polling_required": any(result.get("type") == "image_generation" and
+    not result.get("image_url") for result in context.get("results", []))
+    }
     }
     logger.info(f"__stream__shit Sending summary message: {processed_results}")
     yield f"data: {json.dumps(summary)}\n\n"
+        
+    # If we have pending image tasks, keep the stream alive and check for updates
+    last_poll_time = datetime.now(timezone.utc)
+    max_wait_time = 60  # Wait up to 60 seconds for images
+    
+    while image_generation_tasks and (datetime.now(timezone.utc) - last_poll_time).total_seconds() < max_wait_time:
+        # Poll for image status every second
+        await asyncio.sleep(1)
+        
+        # Check each pending task
+        for task in image_generation_tasks:
+            if task["completed"]:
+                continue
+                
+            task_id = task["task_id"]
+            
+            try:
+                # Query the task status
+                query = """
+                SELECT status, result, error FROM mo_ai_tasks 
+                WHERE id = :task_id
+                """
+                
+                task_status = await db.fetch_one(query=query, values={"task_id": task_id})
+                    
+                if task_status:
+                    logger.info(f"__stream__shit Checking image task {task_id}: status={task_status['status']}")
+                    
+                    if task_status["status"] == "completed" and task_status["result"]:
+                        # Parse the result JSON
+                        result_data = json.loads(task_status["result"])
+                        
+                        # Get the image data
+                        if "images" in result_data and result_data["images"]:
+                            image = result_data["images"][0]
+                            image_url = image.get("url")
+                            image_id = image.get("id")
+                                
+                            # Send image_ready event
+                            image_ready_event = {
+                                "type": "image_ready",
+                                "data": {
+                                    "task_id": task_id,
+                                    "image_url": image_url,
+                                    "image_id": image_id,
+                                    "prompt": task["prompt"]
+                                }
+                            }
+                            yield f"data: {json.dumps(image_ready_event)}\n\n"
+                            logger.info(f"__stream__shit Sent image_ready event for task {task_id}")
+                            
+                            # Also send a backward compatibility event
+                            compat_event = {
+                                "image_generation_complete": True,
+                                "image_url": image_url,
+                                "task_id": task_id
+                            }
+                            yield f"data: {json.dumps(compat_event)}\n\n"
+                                
+                            # Mark task as completed
+                            task["completed"] = True
+                            last_poll_time = datetime.now(timezone.utc)  # Reset the timer when we find a completed image
+                                
+                            # Update message in database with image URL
+                            message_id = context.get("message_id")
+                            conversation_id = context.get("conversation_id")
+                            
+                            if message_id and conversation_id and db:
+                                try:
+                                    # Check if message exists
+                                    check_query = "SELECT id FROM mo_llm_messages WHERE id = :id AND conversation_id = :conversation_id"
+                                    message_exists = await db.fetch_one(
+                                        query=check_query,
+                                        values={
+                                            "id": message_id,
+                                            "conversation_id": conversation_id
+                                        }
+                                    )
+                                        
+                                    if message_exists:
+                                        # Create updated metadata with image info
+                                        metadata_query = "SELECT metadata FROM mo_llm_messages WHERE id = :id"
+                                        metadata_result = await db.fetch_one(
+                                            query=metadata_query,
+                                            values={"id": message_id}
+                                        )
+                                        
+                                        metadata = {}
+                                        if metadata_result and metadata_result["metadata"]:
+                                            try:
+                                                metadata = json.loads(metadata_result["metadata"])
+                                            except:
+                                                pass
+                                                    
+                                        # Update with image information
+                                        metadata["image_url"] = image_url
+                                        metadata["image_id"] = image_id
+                                        metadata["image_task_id"] = task_id
+                                        metadata["image_prompt"] = task["prompt"]
+                                        metadata["image_status"] = "completed"
+                                        
+                                        # Update the message
+                                        update_query = """
+                                        UPDATE mo_llm_messages 
+                                        SET image_url = :image_url, 
+                                            metadata = :metadata
+                                        WHERE id = :id
+                                        """
+                                            
+                                        await db.execute(
+                                            query=update_query,
+                                            values={
+                                                "id": message_id,
+                                                "image_url": image_url,
+                                                "metadata": json.dumps(metadata)
+                                            }
+                                        )
+                                        
+                                        logger.info(f"__stream__shit Updated message {message_id} with image URL {image_url}")
+                                except Exception as e:
+                                    logger.error(f"__stream__shit Error updating message with image: {str(e)}")
+                    
+                    elif task_status["status"] == "failed":
+                        # Send image_failed event
+                        image_failed_event = {
+                            "type": "image_failed",
+                            "data": {
+                                "task_id": task_id,
+                                "error": task_status.get("error", "Unknown error")
+                            }
+                        }
+                        yield f"data: {json.dumps(image_failed_event)}\n\n"
+                        logger.info(f"__stream__shit Sent image_failed event for task {task_id}")
+                        
+                        # Mark task as completed (failed is still completed)
+                        task["completed"] = True
+            except Exception as e:
+                logger.error(f"__stream__shit Error polling image task {task_id}: {str(e)}")
+        
+        # Break if all tasks are completed
+        if all(task["completed"] for task in image_generation_tasks):
+            logger.info("__stream__shit All image tasks completed, ending polling")
+            break
+    
+    # Send updated summary if we had image tasks
+    if image_generation_tasks:
+        updated_summary = {
+            "type": "summary",
+            "summary": {
+                "completed_results": processed_results,
+                "all_complete": True,
+                "polling_required": any(not task["completed"] for task in image_generation_tasks)
+            },
+            "data": {
+                "completed_results": processed_results,
+                "all_complete": True,
+                "polling_required": any(not task["completed"] for task in image_generation_tasks)
+            }
+        }
+        logger.info(f"__stream__shit Sending final summary after image polling")
+        yield f"data: {json.dumps(updated_summary)}\n\n"
 
     # End the stream
     logger.info(f"__stream__shit Sending final [DONE] marker")
@@ -1047,13 +1315,13 @@ async def process_multi_intent_request(
     current_user: dict,
     db: Database
 ) -> Dict[str, Any]:
-    logger.info(f"process_multi_intent_request starting: content_id={request.content_id}, conversation_id={request.conversation_id}")
+    logger.info(f"process_multi_intent_request starting: chat_id={request.chat_id}, conversation_id={request.conversation_id}")
     
-    # If we have a content_id, try to fetch content info
-    if request.content_id:
+    # If we have a chat_id, try to fetch content info
+    if request.chat_id:
         try:
-            content_query = "SELECT id, name, description FROM mo_content WHERE uuid = :content_id"
-            content = await db.fetch_one(content_query, {"content_id": request.content_id})
+            content_query = "SELECT id, name, description FROM mo_chat WHERE uuid = :chat_id"
+            content = await db.fetch_one(content_query, {"chat_id": request.chat_id})
             if content:
                 logger.info(f"Found content for request: ID={content['id']}, Name='{content['name']}'")
         except Exception as e:
@@ -1092,7 +1360,7 @@ async def process_multi_intent_request(
             db=db,
             user_id=current_user.get('id', current_user.get('uid')),
             title=title,
-            content_id=request.content_id
+            chat_id=request.chat_id
         )
 
     # Store user message in database
@@ -1121,7 +1389,7 @@ async def process_multi_intent_request(
     context = {
         "message": request.message,
         "conversation_id": conversation_id,
-        "content_id": request.content_id,  # Explicitly include content_id 
+        "chat_id": request.chat_id,  # Explicitly include chat_id 
         "user_id": current_user.get('id', current_user.get('uid')),
         "db": db,
         "background_tasks": background_tasks,
@@ -1134,8 +1402,8 @@ async def process_multi_intent_request(
         "results": []  # Ensure results list is always initialized
     }
     
-    # Log the content_id we're using
-    logger.info(f"Processing message with content_id: {request.content_id}")
+    # Log the chat_id we're using
+    logger.info(f"Processing message with chat_id: {request.chat_id}")
 
     # Create pipeline based on intents
     pipeline = Pipeline(name="MultiIntentPipeline")
@@ -1213,49 +1481,49 @@ async def create_conversation(
 #     # if not user_id:
 #     #     logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
 #     #     user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
-#     logger.info(f"get_or_create_conversation_endpoint starting: content_id={request.content_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
+#     logger.info(f"get_or_create_conversation_endpoint starting: chat_id={request.chat_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
 
 #     conversation_id = await get_or_create_conversation(
-#         request.content_id, user_id, request.model_id, request.title, db
+#         request.chat_id, user_id, request.model_id, request.title, db
 #     )
 
-#     return {"id": conversation_id, "content_id": request.content_id, "user_id": user_id}
+#     return {"id": conversation_id, "chat_id": request.chat_id, "user_id": user_id}
 
 
 # Endpoint removed - consolidated into get_conversation_by_content
 
 # Get a conversation by content ID
-@router.get("/conversation/by-content/{content_id}")
+@router.get("/conversation/by-content/{chat_id}")
 async def get_conversation_by_content(
-    content_id: str,
+    chat_id: str,
     db: Database = Depends(get_database),
     current_user: dict = Depends(get_current_user)
 ):
     """Get a conversation by content ID with all associated messages"""
     try:
-        logger.info(f"Content ID endpoint called for: {content_id}")
+        logger.info(f"Content ID endpoint called for: {chat_id}")
         
         # Get user ID
         user_id = current_user.get("uid")
         
-        logger.info(f"Getting conversation and messages for content {content_id}, user {user_id}")
+        logger.info(f"Getting conversation and messages for content {chat_id}, user {user_id}")
 
         # Updated query to fetch conversations and messages in one request
         query = """
-        SELECT c.id as conversation_id, c.user_id, c.content_id, c.model_id, c.title, 
+        SELECT c.id as conversation_id, c.user_id, c.chat_id, c.model_id, c.title, 
                c.created_at as conversation_created_at, c.updated_at, c.metadata as conversation_metadata,
                m.id as message_id, m.role, m.content as message_content, 
                m.created_at as message_created_at, m.function_call, 
                m.metadata as message_metadata, m.image_url, m.image_metadata
         FROM mo_llm_conversations c
         LEFT JOIN mo_llm_messages m ON c.id = m.conversation_id
-        WHERE c.content_id = :content_id AND c.user_id = :user_id
+        WHERE c.chat_id = :chat_id AND c.user_id = :user_id
         ORDER BY c.created_at DESC, m.created_at ASC
         """
-        results = await db.fetch_all(query=query, values={"content_id": content_id, "user_id": user_id})
+        results = await db.fetch_all(query=query, values={"chat_id": chat_id, "user_id": user_id})
 
         if not results:
-            logger.info(f"No existing conversation found for content {content_id}")
+            logger.info(f"No existing conversation found for content {chat_id}")
             return {"conversation": None, "messages": [], "found": False}
 
         # Extract conversation details from the first row
@@ -1263,7 +1531,7 @@ async def get_conversation_by_content(
         conversation = {
             "id": first_row.get("conversation_id"),
             "user_id": first_row.get("user_id"),
-            "content_id": first_row.get("content_id"),
+            "chat_id": first_row.get("chat_id"),
             "model_id": first_row.get("model_id"),
             "title": first_row.get("title"),
             "created_at": first_row.get("conversation_created_at"),
@@ -1296,7 +1564,7 @@ async def get_conversation_by_content(
                             
                 messages.append(message)
 
-        logger.info(f"Found conversation with {len(messages)} messages for content {content_id}")
+        logger.info(f"Found conversation with {len(messages)} messages for content {chat_id}")
         return {
             "conversation": conversation,
             "messages": messages,
@@ -1492,10 +1760,13 @@ async def stream_multi_intent_chat(
     """
     Stream a chat response with enhanced options and payload support.
     Handles content/conversation creation and message processing in a unified API.
+    chat_id means the sidebar chat id
+    conversation_id hold what model was used
+    message_id is the actual message by user input or generated by the model
     """
     try:
         user_id = current_user.get('id', current_user.get('uid'))
-        logger.info(f"Received stream request: type={request.message_type}, content_id={request.content_id}, conversation_id={request.conversation_id}")
+        logger.info(f"Received stream request: type={request.message_type}, chat_id={request.chat_id}, conversation_id={request.conversation_id}")
         
         # Skip processing if there's no message
         if not request.message or request.message.strip() == "":
@@ -1506,20 +1777,20 @@ async def stream_multi_intent_chat(
             )
 
         # Check if we need to create new content or conversation
-        content_id = request.content_id
+        chat_id = request.chat_id
         conversation_id = request.conversation_id
         
-        # If we have a content_id but no conversation_id, create a new conversation in the existing content
-        if content_id and not conversation_id:
-            logger.info(f"Creating new conversation thread in existing content {content_id}")
+        # If we have a chat_id but no conversation_id, create a new conversation in the existing content
+        if chat_id and not conversation_id:
+            logger.info(f"Creating new conversation thread in existing content {chat_id}")
             try:
                 conversation_id = await create_new_conversation(
                     db=db,
                     user_id=user_id,
-                    content_id=content_id,
+                    chat_id=chat_id,
                     title=request.content_name or "New Thread"
                 )
-                logger.info(f"Created new conversation {conversation_id} for existing content {content_id}")
+                logger.info(f"Created new conversation {conversation_id} for existing content {chat_id}")
             except Exception as e:
                 # If creation fails, try to find existing conversation
                 logger.error(f"Error creating conversation: {str(e)}")
@@ -1527,33 +1798,33 @@ async def stream_multi_intent_chat(
                 # Try to get existing conversation for this content
                 query = """
                 SELECT id FROM mo_llm_conversations
-                WHERE content_id = :content_id AND user_id = :user_id
+                WHERE chat_id = :chat_id AND user_id = :user_id
                 ORDER BY created_at DESC LIMIT 1
                 """
                 
                 existing = await db.fetch_one(
                     query=query,
                     values={
-                        "content_id": content_id,
+                        "chat_id": chat_id,
                         "user_id": user_id
                     }
                 )
                 
                 if existing:
                     conversation_id = existing["id"]
-                    logger.info(f"Using existing conversation {conversation_id} for content {content_id}")
+                    logger.info(f"Using existing conversation {conversation_id} for content {chat_id}")
                 else:
                     # If still no conversation found, raise error
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to create or find conversation for content {content_id}"
+                        detail=f"Failed to create or find conversation for content {chat_id}"
                     )
-        # If we have neither content_id nor conversation_id, create both (completely new chat)
-        elif not content_id and not conversation_id:
+        # If we have neither chat_id nor conversation_id, create both (completely new chat)
+        elif not chat_id and not conversation_id:
             logger.info("Creating new content and conversation for completely new chat")
             try:
                 # Create new content first
-                content_id = await create_new_content(
+                chat_id = await create_new_content(
                     db=db, 
                     user_id=user_id, 
                     content_name=request.content_name or "New Chat"
@@ -1563,29 +1834,29 @@ async def stream_multi_intent_chat(
                 conversation_id = await create_new_conversation(
                     db=db,
                     user_id=user_id,
-                    content_id=content_id,
+                    chat_id=chat_id,
                     title=request.content_name or "New Chat"
                 )
                 
-                logger.info(f"Created new content {content_id} and conversation {conversation_id}")
+                logger.info(f"Created new content {chat_id} and conversation {conversation_id}")
             except Exception as e:
                 logger.error(f"Error creating content and conversation: {str(e)}")
                 raise HTTPException(
                     status_code=500,
                     detail=f"Failed to create new chat: {str(e)}"
                 )
-        # If we have neither or missing content_id, return error
-        elif not content_id and conversation_id:
-            # Look up the content_id from the conversation
+        # If we have neither or missing chat_id, return error
+        elif not chat_id and conversation_id:
+            # Look up the chat_id from the conversation
             conversation = await get_conversation_by_id(db, conversation_id)
-            if conversation and conversation.get("content_id"):
-                content_id = conversation["content_id"]
-                logger.info(f"Retrieved content_id {content_id} from conversation {conversation_id}")
+            if conversation and conversation.get("chat_id"):
+                chat_id = conversation["chat_id"]
+                logger.info(f"Retrieved chat_id {chat_id} from conversation {conversation_id}")
             else:
-                logger.error("Conversation has no content_id and none was provided")
+                logger.error("Conversation has no chat_id and none was provided")
                 return JSONResponse(
                     status_code=400,
-                    content={"error": "Conversation has no content_id and none was provided"}
+                    content={"error": "Conversation has no chat_id and none was provided"}
                 )
         
         # Store user message in database
@@ -1620,17 +1891,18 @@ async def stream_multi_intent_chat(
         
         # Create the processing configuration
         config = {
-            "message": request.message,
-            "message_type": request.message_type,
-            "options": request.options or {},
-            "conversation_id": conversation_id,
-            "content_id": content_id,
-            "user_id": user_id,
-            "db": db,
-            "background_tasks": background_tasks,
-            "current_user": current_user,
-            "results": []
-        }
+        "message": request.message,
+        "message_type": request.message_type,
+        "options": request.options or {},
+        "conversation_id": conversation_id,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "db": db,
+        "background_tasks": background_tasks,
+        "current_user": current_user,
+        "results": [],
+            "image_generation_mode": True  # Flag for special handling of image generation
+            }
         
         # Create assistant message placeholder
         assistant_message_id = str(uuid.uuid4())
@@ -1689,9 +1961,9 @@ async def stream_multi_intent_chat(
         if "duplicate key value" in str(e) and "unique_user_content" in str(e):
             # This is likely a race condition where another request created the same conversation
             try:
-                # Extract the content_id from the error message
+                # Extract the chat_id from the error message
                 error_msg = str(e)
-                match = re.search(r"Key \(user_id, content_id\)=\((.*?), (.*?)\)", error_msg)
+                match = re.search(r"Key \(user_id, chat_id\)=\((.*?), (.*?)\)", error_msg)
                 
                 if match and len(match.groups()) == 2:
                     user_id_from_error = match.group(1)
@@ -1702,7 +1974,7 @@ async def stream_multi_intent_chat(
                     # Find the existing conversation
                     query = """
                     SELECT id FROM mo_llm_conversations
-                    WHERE user_id = :user_id AND content_id = :content_id
+                    WHERE user_id = :user_id AND chat_id = :chat_id
                     ORDER BY created_at DESC LIMIT 1
                     """
                     
@@ -1710,7 +1982,7 @@ async def stream_multi_intent_chat(
                         query=query,
                         values={
                             "user_id": user_id_from_error,
-                            "content_id": content_id_from_error
+                            "chat_id": content_id_from_error
                         }
                     )
                     
@@ -1721,7 +1993,7 @@ async def stream_multi_intent_chat(
                             content={
                                 "message": "This conversation already exists",
                                 "conversation_id": existing["id"],
-                                "content_id": content_id_from_error,
+                                "chat_id": content_id_from_error,
                                 "error_type": "duplicate_conversation"
                             }
                         )
@@ -1735,133 +2007,6 @@ async def stream_multi_intent_chat(
         )
 
 
-# Legacy streaming endpoint - supports old format requests
-@router.post("/chat/stream-legacy")
-async def stream_multi_intent_chat_legacy(
-    request: MultiIntentChatRequest,
-    background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_user),
-    db: Database = Depends(get_database)
-):
-    logger.info(f"Received legacy stream request with content_id: {request.content_id}, conversation_id: {request.conversation_id}")
-    """
-    Stream a multi-intent chat response.
-    Updated to support REST-based image generation.
-    """
-    try:
-        # Skip processing if there's no message (likely a new conversation initialization)
-        if not request.message or request.message.strip() == "":
-            logger.info(f"Skipping stream_multi_intent_chat for empty message")
-            return JSONResponse(
-                status_code=200,
-                content={"message": "No message to process", "skipped": True}
-            )
-            
-        # Process the request
-        result_context = await process_multi_intent_request(request, background_tasks, current_user, db)
-        
-        # Store results in DB before streaming
-        message_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-        
-        # Create assistant message record
-        response_content = ""
-        # Extract content from general knowledge if available
-        if "general_knowledge_content" in result_context:
-            response_content = result_context["general_knowledge_content"]
-        
-        # Check if there's an image generation result
-        image_generation_result = None
-        for result in result_context.get("results", []):
-            if result.get("type") == "image_generation":
-                image_generation_result = result
-                break
-                
-        # Create metadata with all results for later retrieval
-        metadata = {
-            "multi_intent": True,
-            "detected_intents": [intent for intent in result_context.get("intents", {}).keys() 
-                               if result_context["intents"][intent]["confidence"] > 0.3],
-            "results": result_context.get("results", []),
-            "message_id": message_id
-        }
-        
-        # Add image information to metadata if available
-        if image_generation_result:
-            if "image_url" in image_generation_result and image_generation_result["image_url"]:
-                # Image already available
-                metadata["has_image"] = True
-                metadata["image_url"] = image_generation_result["image_url"]
-                metadata["image_status"] = "completed"
-            else:
-                # Image being generated, needs polling
-                metadata["has_image"] = True
-                metadata["image_status"] = "processing"
-                metadata["image_task_id"] = image_generation_result.get("task_id")
-                metadata["image_poll_endpoint"] = image_generation_result.get("poll_endpoint")
-                
-        # Check if this message already exists to prevent duplicates
-        check_query = """
-        SELECT id FROM mo_llm_messages
-        WHERE conversation_id = :conversation_id
-        AND created_at > now() - interval '5 seconds'
-        AND role = 'assistant'
-        """
-        
-        existing_message = await db.fetch_one(
-            query=check_query,
-            values={"conversation_id": result_context["conversation_id"]}
-        )
-        
-        # Only insert if no recent message exists
-        if not existing_message:
-            # Store the assistant message
-            await db.execute(
-                """
-                INSERT INTO mo_llm_messages (
-                    id, conversation_id, role, content, created_at, metadata
-                ) VALUES (
-                    :id, :conversation_id, :role, :content, :created_at, :metadata
-                )
-                """,
-                {
-                    "id": message_id,
-                    "conversation_id": result_context["conversation_id"],
-                    "role": "assistant",
-                    "content": response_content,
-                    "created_at": now,
-                    "metadata": json.dumps(metadata)
-                }
-            )
-            
-            # Update the message_id in the context
-            result_context["message_id"] = message_id
-        else:
-            # Use existing message ID
-            result_context["message_id"] = existing_message["id"]
-            logger.info(f"Using existing message: {existing_message['id']}")
-
-        # Return streaming response with proper headers to prevent caching
-        return StreamingResponse(
-            process_streaming_response(result_context),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform, no-store, must-revalidate",
-                "X-Accel-Buffering": "no",  # Important for Nginx
-                "Connection": "keep-alive",
-                "Pragma": "no-cache",
-                "Expires": "0",
-                "Transfer-Encoding": "chunked"  # Add this to force chunked transfer
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error in stream_multi_intent_chat: {str(e)}")
-        logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
 
 
 @router.get("/commands")
@@ -1886,10 +2031,16 @@ async def debug_image_status(task_id: str):
     Debug endpoint for image status.
     """
     logger.info(f"Debug image status endpoint called for task: {task_id}")
+    endpoint = f"/api/v1/pipeline/debug-image-status/{task_id}"
+    
+    # Ensure endpoint starts with a slash for consistency
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+        
     return {
         "message": "Debug endpoint reached",
         "task_id": task_id,
-        "endpoint": "/api/v1/pipeline/debug-image-status/{task_id}",
+        "endpoint": endpoint,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -1909,7 +2060,7 @@ async def api_info(
                 "username": current_user.get('username', 'unknown')
             },
             "endpoints": {
-                "conversation_by_content": "/api/v1/pipeline/conversation/by-content/{content_id}",
+                "conversation_by_content": "/api/v1/pipeline/conversation/by-content/{chat_id}",
                 "conversation_by_id": "/api/v1/pipeline/conversation/{conversation_id}"
             },
             "features": {
@@ -1942,12 +2093,12 @@ async def run_diagnostics(
             "fixed": []
         }
         
-        # 1. Check for orphaned conversations (content_id doesn't exist in mo_content)
+        # 1. Check for orphaned conversations (chat_id doesn't exist in mo_chat)
         orphaned_query = """
-        SELECT c.id, c.content_id, c.user_id 
+        SELECT c.id, c.chat_id, c.user_id 
         FROM mo_llm_conversations c
-        LEFT JOIN mo_content m ON c.content_id = m.uuid
-        WHERE m.uuid IS NULL AND c.content_id IS NOT NULL
+        LEFT JOIN mo_chat m ON c.chat_id = m.uuid
+        WHERE m.uuid IS NULL AND c.chat_id IS NOT NULL
         LIMIT 50
         """
         orphaned = await db.fetch_all(orphaned_query)
@@ -1963,14 +2114,14 @@ async def run_diagnostics(
             if repair:
                 fixed_count = 0
                 for row in orphaned:
-                    content_id = row['content_id']
+                    chat_id = row['chat_id']
                     user_id = row['user_id']
                     
                     try:
                         # Create a new content entry
                         route = f"repair-{uuid.uuid4().hex[:8]}"  # Generate unique route
                         content_insert = """
-                        INSERT INTO mo_content 
+                        INSERT INTO mo_chat 
                         (uuid, firebase_uid, name, description, route, status) 
                         VALUES 
                         (:uuid, :firebase_uid, :name, :description, :route, 'draft')
@@ -1979,9 +2130,9 @@ async def run_diagnostics(
                         """
                         
                         content_values = {
-                            "uuid": content_id,
+                            "uuid": chat_id,
                             "firebase_uid": user_id,
-                            "name": f"Repaired Content {content_id[:8]}",
+                            "name": f"Repaired Content {chat_id[:8]}",
                             "description": "Automatically repaired content for orphaned conversation",
                             "route": route
                         }
@@ -2000,7 +2151,7 @@ async def run_diagnostics(
         # 2. Check for inconsistent content entries
         inconsistent_query = """
         SELECT id, uuid, firebase_uid, name, route 
-        FROM mo_content
+        FROM mo_chat
         WHERE route IS NULL OR name IS NULL OR firebase_uid IS NULL
         LIMIT 20
         """
@@ -2020,7 +2171,7 @@ async def run_diagnostics(
                     try:
                         # Update with valid values
                         update_query = """
-                        UPDATE mo_content
+                        UPDATE mo_chat
                         SET 
                             name = COALESCE(name, :default_name),
                             route = COALESCE(route, :default_route),
@@ -2050,7 +2201,7 @@ async def run_diagnostics(
         # 3. Check for total counts
         count_query = """
         SELECT 
-            (SELECT COUNT(*) FROM mo_content) AS content_count,
+            (SELECT COUNT(*) FROM mo_chat) AS content_count,
             (SELECT COUNT(*) FROM mo_llm_conversations) AS conversation_count,
             (SELECT COUNT(*) FROM mo_llm_messages) AS message_count
         """
@@ -2082,6 +2233,10 @@ async def get_image_status(
         # Use relative URL since we're on the same server
         api_url = f"/api/v1/media/image-status/{task_id}"
         
+        # Ensure api_url starts with a slash for consistency
+        if not api_url.startswith("/"):
+            api_url = f"/{api_url}"
+            
         # Get token from current_user for authentication
         token = current_user.get("token", "")
         
@@ -2320,20 +2475,20 @@ async def delete_conversation(
             )
 
             # Optional: Handle content as before
-            content_id = conversation.get("content_id")
+            chat_id = conversation.get("chat_id")
             # ... rest of your content handling code ...
             logger.info(f"Deleted conversation: {conversation_id}")
-            logger.info(f"Content ID: {content_id}")
-            # update mo_content status to 'deleted' - use uuid column, not id
-            if content_id:
+            logger.info(f"Content ID: {chat_id}")
+            # update mo_chat status to 'deleted' - use uuid column, not id
+            if chat_id:
                 update_content_status_query = """
-                UPDATE mo_content
+                UPDATE mo_chat
                 SET status = 'deleted'
-                WHERE uuid = :content_id
+                WHERE uuid = :chat_id
                 """
                 await db.execute(
                     query=update_content_status_query,
-                    values={"content_id": content_id}
+                    values={"chat_id": chat_id}
                 )
 
         return {
@@ -2354,7 +2509,7 @@ async def delete_conversation(
 
 
 class InitConversationRequest(BaseModel):
-    content_id: str
+    chat_id: str
     title: Optional[str] = None
     model_id: Optional[str] = "grok-3-mini-beta"
     
@@ -2372,15 +2527,15 @@ async def init_conversation(
 ):
     """Create a new thread by creating a new content that references the original"""
     user_id = current_user.get("uid")
-    original_content_id = request.content_id
+    original_content_id = request.chat_id
 
     logger.info(
-        f"init_conversation: Creating new thread for original content_id={original_content_id}, user_id={user_id}")
+        f"init_conversation: Creating new thread for original chat_id={original_content_id}, user_id={user_id}")
 
     try:
         # Get original content details for reference
         orig_content_query = """
-        SELECT uuid, name, description, route, status FROM mo_content 
+        SELECT uuid, name, description, route, status FROM mo_chat 
         WHERE uuid = :uuid
         """
         orig_content = await db.fetch_one(query=orig_content_query, values={"uuid": original_content_id})
@@ -2398,7 +2553,7 @@ async def init_conversation(
         # Look for content items where the metadata contains the parent_content_id
         # Using the JSONB containment operator @>
         count_query = """
-        SELECT COUNT(*) as count FROM mo_content 
+        SELECT COUNT(*) as count FROM mo_chat 
         WHERE firebase_uid = :user_id AND 
               (metadata IS NOT NULL AND 
                metadata::jsonb->>'parent_content_id' = :original_content_id)
@@ -2426,7 +2581,7 @@ async def init_conversation(
 
         # Create a new content entry
         content_insert = """
-        INSERT INTO mo_content 
+        INSERT INTO mo_chat 
         (uuid, firebase_uid, name, description, route, status, metadata) 
         VALUES 
         (:uuid, :user_id, :name, :description, :route, :status, :metadata)
@@ -2459,16 +2614,16 @@ async def init_conversation(
 
         conversation_insert = """
         INSERT INTO mo_llm_conversations 
-        (id, user_id, content_id, model_id, title, created_at, updated_at) 
+        (id, user_id, chat_id, model_id, title, created_at, updated_at) 
         VALUES 
-        (:id, :user_id, :content_id, :model_id, :title, :created_at, :updated_at)
+        (:id, :user_id, :chat_id, :model_id, :title, :created_at, :updated_at)
         RETURNING id
         """
 
         conversation_values = {
             "id": conversation_id,
             "user_id": user_id,
-            "content_id": new_content_id,
+            "chat_id": new_content_id,
             "model_id": request.model_id,
             "title": new_title or f"Thread {thread_number}",
             "created_at": now,
@@ -2486,7 +2641,7 @@ async def init_conversation(
         # Return both the new content and conversation IDs
         return {
             "id": conversation_id,
-            "content_id": new_content_id,
+            "chat_id": new_content_id,
             "content_name": thread_name,
             "thread_number": thread_number,
             "original_content_id": original_content_id,

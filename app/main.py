@@ -39,6 +39,8 @@ import os
 import traceback
 import logging
 import colorlog
+# Set environment variables to avoid warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # os.environ["KMP_INIT_AT_FORK"] = "FALSE"
 
 

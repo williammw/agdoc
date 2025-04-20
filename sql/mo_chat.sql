@@ -1,4 +1,4 @@
--- Content table to store the main content information
+-- Chat table to store the main chat information
 CREATE TABLE mo_chat (
     id SERIAL,
     uuid VARCHAR(36) NOT NULL,
@@ -15,8 +15,8 @@ CREATE TABLE mo_chat (
     FOREIGN KEY (firebase_uid) REFERENCES mo_user_info(id)
 );
 
--- Content version table to keep track of content revisions
-CREATE TABLE mo_content_version (
+-- Chat version table to keep track of chat revisions
+CREATE TABLE mo_chat_version (
     id SERIAL,
     chat_id INTEGER NOT NULL,
     firebase_uid VARCHAR(128) NOT NULL,  -- Firebase user ID for ownership
@@ -27,12 +27,12 @@ CREATE TABLE mo_content_version (
     FOREIGN KEY (chat_id, firebase_uid) REFERENCES mo_chat(id, firebase_uid)
 );
 
--- Social media posts table to track posts for each content
+-- Social media posts table to track posts for each chat
 CREATE TABLE mo_social_post (
     id SERIAL,
     chat_id INTEGER NOT NULL,
     firebase_uid VARCHAR(128) NOT NULL,  -- Firebase user ID for ownership
-    content_version_id INTEGER NOT NULL,
+    chat_version_id INTEGER NOT NULL,
     platform VARCHAR(50) NOT NULL,  -- facebook, twitter, instagram, etc.
     platform_account_id VARCHAR(255) NOT NULL,  -- ID of the social media account
     post_status VARCHAR(50) DEFAULT 'draft',  -- draft, scheduled, published, failed
@@ -44,20 +44,13 @@ CREATE TABLE mo_social_post (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id, firebase_uid),
     FOREIGN KEY (chat_id, firebase_uid) REFERENCES mo_chat(id, firebase_uid),
-    FOREIGN KEY (content_version_id, firebase_uid) REFERENCES mo_content_version(id, firebase_uid)
+    FOREIGN KEY (chat_version_id, firebase_uid) REFERENCES mo_chat_version(id, firebase_uid)
 );
 
 -- Create indexes for better query performance
-CREATE INDEX idx_content_firebase_uid ON mo_chat(firebase_uid);
-CREATE INDEX idx_content_status ON mo_chat(status);
-CREATE INDEX idx_content_version_content_id ON mo_content_version(chat_id, firebase_uid);
-CREATE INDEX idx_social_post_content_id ON mo_social_post(chat_id, firebase_uid);
+CREATE INDEX idx_chat_firebase_uid ON mo_chat(firebase_uid);
+CREATE INDEX idx_chat_status ON mo_chat(status);
+CREATE INDEX idx_chat_version_chat_id ON mo_chat_version(chat_id, firebase_uid);
+CREATE INDEX idx_social_post_chat_id ON mo_social_post(chat_id, firebase_uid);
 CREATE INDEX idx_social_post_platform ON mo_social_post(platform);
 CREATE INDEX idx_social_post_status ON mo_social_post(post_status);
-
-
-ALTER TABLE mo_social_accounts
-ADD COLUMN oauth1_token TEXT,
-ADD COLUMN oauth1_token_secret TEXT;
-
-CREATE INDEX idx_social_accounts_oauth1 ON mo_social_accounts(oauth1_token) WHERE oauth1_token IS NOT NULL;

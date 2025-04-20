@@ -151,7 +151,7 @@
 
 # class ChatRequest(BaseModel):
 #     conversation_id: Optional[str] = None
-#     content_id: Optional[str] = None
+#     chat_id: Optional[str] = None
 #     message: str
 #     model: str = DEFAULT_GROK_MODEL
 #     system_prompt: Optional[str] = None
@@ -707,16 +707,16 @@
 #     return [dict(msg) for msg in messages]
 
 
-# async def create_conversation(db: Database, user_id: str, model: str, title: Optional[str] = None, content_id: Optional[str] = None):
+# async def create_conversation(db: Database, user_id: str, model: str, title: Optional[str] = None, chat_id: Optional[str] = None):
 #     """Create a new conversation"""
 #     conversation_id = str(uuid.uuid4())
 #     now = datetime.now(timezone.utc)
 
 #     query = """
 #     INSERT INTO mo_llm_conversations (
-#         id, user_id, title, model_id, created_at, updated_at, content_id
+#         id, user_id, title, model_id, created_at, updated_at, chat_id
 #     ) VALUES (
-#         :id, :user_id, :title, :model, :created_at, :updated_at, :content_id
+#         :id, :user_id, :title, :model, :created_at, :updated_at, :chat_id
 #     ) RETURNING id
 #     """
 
@@ -727,7 +727,7 @@
 #         "model": model,
 #         "created_at": now,
 #         "updated_at": now,
-#         "content_id": content_id
+#         "chat_id": chat_id
 #     }
 
 #     await db.execute(query=query, values=values)
@@ -1357,30 +1357,30 @@
 # async def list_conversations(
 #     current_user: dict = Depends(get_current_user),
 #     db: Database = Depends(get_database),
-#     content_id: Optional[str] = None
+#     chat_id: Optional[str] = None
 # ):
-#     """List all conversations for a user, optionally filtered by content_id"""
+#     """List all conversations for a user, optionally filtered by chat_id"""
 #     query_values = {"user_id": current_user["uid"]}
 
-#     if content_id:
+#     if chat_id:
 #         query = """
 #         SELECT
 #             id, title, model_id as model,
-#             created_at, updated_at, content_id,
+#             created_at, updated_at, chat_id,
 #             (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count,
 #             (SELECT content FROM mo_llm_messages
 #             WHERE conversation_id = mo_llm_conversations.id AND role = 'user'
 #             ORDER BY created_at DESC LIMIT 1) as last_message
 #         FROM mo_llm_conversations
-#         WHERE user_id = :user_id AND content_id = :content_id
+#         WHERE user_id = :user_id AND chat_id = :chat_id
 #         ORDER BY updated_at DESC
 #         """
-#         query_values["content_id"] = content_id
+#         query_values["chat_id"] = chat_id
 #     else:
 #         query = """
 #         SELECT
 #             id, title, model_id as model,
-#             created_at, updated_at, content_id,
+#             created_at, updated_at, chat_id,
 #             (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count,
 #             (SELECT content FROM mo_llm_messages
 #             WHERE conversation_id = mo_llm_conversations.id AND role = 'user'
@@ -1515,7 +1515,7 @@
 #             user_id=current_user["uid"],
 #             model=request.model,
 #             title=None,  # We'll update this later based on first message
-#             content_id=request.content_id
+#             chat_id=request.chat_id
 #         )
 #     else:
 #         # Verify conversation exists and belongs to user
@@ -1915,21 +1915,21 @@
 #                     status_code=500, detail=f"Vision API error: {str(e)}")
 
 
-# @router.get("/content/{content_id}/conversation")
+# @router.get("/content/{chat_id}/conversation")
 # async def get_content_conversation(
-#     content_id: str,
+#     chat_id: str,
 #     current_user: dict = Depends(get_current_user),
 #     db: Database = Depends(get_database)
 # ):
 #     """Get or create a conversation for a content item"""
 #     # Check if content exists and belongs to user
 #     content_query = """
-#     SELECT uuid FROM mo_content 
-#     WHERE uuid = :content_id AND firebase_uid = :user_id
+#     SELECT uuid FROM mo_chat 
+#     WHERE uuid = :chat_id AND firebase_uid = :user_id
 #     """
 #     content = await db.fetch_one(
 #         query=content_query,
-#         values={"content_id": content_id, "user_id": current_user["uid"]}
+#         values={"chat_id": chat_id, "user_id": current_user["uid"]}
 #     )
 #     if not content:
 #         raise HTTPException(status_code=404, detail="Content not found")
@@ -1939,19 +1939,19 @@
 #     SELECT 
 #         id, title, model_id as model,
 #         created_at, updated_at, 
-#         content_id,
+#         chat_id,
 #         (SELECT COUNT(*) FROM mo_llm_messages WHERE conversation_id = mo_llm_conversations.id) as message_count,
 #         (SELECT content FROM mo_llm_messages 
 #         WHERE conversation_id = mo_llm_conversations.id AND role = 'user'
 #         ORDER BY created_at DESC LIMIT 1) as last_message
 #     FROM mo_llm_conversations
-#     WHERE content_id = :content_id AND user_id = :user_id
+#     WHERE chat_id = :chat_id AND user_id = :user_id
 #     ORDER BY updated_at DESC
 #     LIMIT 1
 #     """
 #     conversation = await db.fetch_one(
 #         query=conversation_query,
-#         values={"content_id": content_id, "user_id": current_user["uid"]}
+#         values={"chat_id": chat_id, "user_id": current_user["uid"]}
 #     )
 
 #     if conversation:
@@ -1981,7 +1981,7 @@
 #             user_id=current_user["uid"],
 #             model=DEFAULT_GROK_MODEL,
 #             title=f"Content Chat",
-#             content_id=content_id
+#             chat_id=chat_id
 #         )
 
 #         # Get the new conversation

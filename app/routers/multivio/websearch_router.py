@@ -36,7 +36,7 @@
 #     message: Optional[str] = None
 #     system_prompt: Optional[str] = None
 #     conversation_id: Optional[str] = None
-#     content_id: Optional[str] = None
+#     chat_id: Optional[str] = None
 #     stream: bool = True
 #     perform_web_search: Optional[bool] = False
 #     reasoning_effort: Optional[str] = "high"
@@ -149,7 +149,7 @@
 #             modified_request = GeneralChatRequest(
 #                 messages=modified_messages,
 #                 conversation_id=conversation_id,
-#                 content_id=getattr(request, 'content_id', None),
+#                 chat_id=getattr(request, 'chat_id', None),
 #                 message=user_message,
 #                 stream=True
 #             )
@@ -171,7 +171,7 @@
 #             fallback_request = GeneralChatRequest(
 #                 messages=fallback_messages,
 #                 conversation_id=getattr(request, 'conversation_id', None),
-#                 content_id=getattr(request, 'content_id', None),
+#                 chat_id=getattr(request, 'chat_id', None),
 #                 message=user_message,
 #                 stream=True
 #             )

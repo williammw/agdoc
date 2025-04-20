@@ -21,7 +21,7 @@ router = APIRouter(tags=["direct-search"])
 class WebSearchRequest(BaseModel):
     query: str
     conversation_id: Optional[str] = None
-    content_id: Optional[str] = None
+    chat_id: Optional[str] = None
 
 class WebSearchResponse(BaseModel):
     success: bool
@@ -84,7 +84,7 @@ async def direct_search_chat(
         logger.info("=================== DIRECT SEARCH CHAT INVOKED ====================")
         logger.info(f"Query: '{request.query}'")
         logger.info(f"Conversation ID: {request.conversation_id}")
-        logger.info(f"Content ID: {request.content_id}")
+        logger.info(f"Content ID: {request.chat_id}")
         
         # Force web search 
         search_results = await perform_web_search(request.query)

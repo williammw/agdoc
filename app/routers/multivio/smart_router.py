@@ -162,7 +162,7 @@
 #         from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
 #         modified_request = GeneralChatRequest(
 #             conversation_id=conversation_id,
-#             content_id=getattr(request, 'content_id', None),
+#             chat_id=getattr(request, 'chat_id', None),
 #             message=user_message,
 #             stream=True,
 #             system_prompt=search_instruction
@@ -335,7 +335,7 @@
 #             from app.routers.multivio.general_router import ChatRequest as GeneralChatRequest
 #             modified_request = GeneralChatRequest(
 #                 conversation_id=conversation_id,
-#                 content_id=getattr(request, 'content_id', None),
+#                 chat_id=getattr(request, 'chat_id', None),
 #                 message=user_message,
 #                 stream=True,
 #                 system_prompt=puppeteer_context  # Pass the puppeteer context as system prompt
@@ -628,7 +628,7 @@
 #     # Add this field to match frontend request
 #     system_prompt: Optional[str] = None
 #     conversation_id: Optional[str] = None
-#     content_id: Optional[str] = None
+#     chat_id: Optional[str] = None
 #     stream: bool = True
 #     # Add this new field for explicit web search request
 #     perform_web_search: Optional[bool] = False

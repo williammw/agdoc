@@ -57,7 +57,10 @@ class ImageGenerationCommand(Command):
                 # Use full message as prompt if no pattern matches
                 prompt = message
         
-        logger.info(f"ImageGenerationCommand executing with prompt: '{prompt}'")
+        # Special handling for image generation mode (message_type == "image")
+        image_generation_mode = context.get("image_generation_mode", False) or context.get("message_type") == "image"
+        
+        logger.info(f"ImageGenerationCommand executing with prompt: '{prompt}', image_mode: {image_generation_mode}")
         
         # Get needed dependencies from context
         db = context.get("db")
@@ -117,6 +120,13 @@ class ImageGenerationCommand(Command):
                         if image_url and image_id:
                             logger.info(f"Found similar previously generated image: {image_id}")
                             
+                            # Get message_id from context or generate one if not present
+                            message_id = context.get("message_id")
+                            if not message_id:
+                                message_id = str(uuid.uuid4())
+                                context["message_id"] = message_id
+                                logger.info(f"Generated new message_id {message_id} for reused image {image_id}")
+                            
                             # Add to context that we're reusing an image
                             context["image_generation"] = {
                                 "task_id": similar_image["id"],
@@ -124,7 +134,8 @@ class ImageGenerationCommand(Command):
                                 "status": "completed",
                                 "image_url": image_url,
                                 "image_id": image_id,
-                                "reused": True
+                                "reused": True,
+                                "message_id": message_id
                             }
                             
                             # Add to results collection with image URL already available
@@ -136,8 +147,26 @@ class ImageGenerationCommand(Command):
                                 "image_url": image_url,
                                 "image_id": image_id,
                                 "reused": True,
-                                "poll_endpoint": None  # No polling needed for reused image
+                                "poll_endpoint": None,  # No polling needed for reused image
+                                "message_id": message_id
                             })
+                            
+                            # Send completed status through the streaming generator
+                            if "_streaming_generator" in context and context["_streaming_generator"]:
+                                try:
+                                    await context["_streaming_generator"].asend({
+                                        "type": "image_generation",
+                                        "status": "completed",
+                                        "task_id": similar_image["id"],
+                                        "image_url": image_url,
+                                        "image_id": image_id,
+                                        "prompt": prompt,
+                                        "reused": True,
+                                        "message_id": message_id
+                                    })
+                                    logger.info(f"Sent 'completed' status to streaming generator for reused image {image_id}")
+                                except Exception as e:
+                                    logger.error(f"Error sending reused image to streaming generator: {str(e)}")
                             
                             # Return context - we don't need to generate a new image
                             return context
@@ -187,6 +216,7 @@ class ImageGenerationCommand(Command):
             from app.routers.multivio.together_router import generate_image_task
             
             # Start background task
+            message_id = context.get("message_id")
             background_tasks.add_task(
                 generate_image_task,
                 task_id,
@@ -195,15 +225,43 @@ class ImageGenerationCommand(Command):
                 None,  # No folder_id for chat-based images
                 db,
                 conversation_id,
-                None  # No message_id
+                message_id,  # Pass the message_id from context
+                context.get("_streaming_generator")  # Pass the streaming generator
             )
             
             # Add to context
+            poll_endpoint = f"/api/v1/pipeline/image/{task_id}"
+            
+            # Add consistency check for poll_endpoint
+            if not poll_endpoint.startswith("/"):
+                poll_endpoint = f"/{poll_endpoint}"
+                
+            # Get message_id from context or generate one if not present
+            message_id = context.get("message_id")
+            if not message_id:
+                message_id = str(uuid.uuid4())
+                context["message_id"] = message_id
+                logger.info(f"Generated new message_id {message_id} for image task {task_id}")
+                
+            # Send image generation status through the streaming generator
+            if "_streaming_generator" in context and context["_streaming_generator"]:
+                try:
+                    await context["_streaming_generator"].asend({
+                        "type": "image_generation",
+                        "status": "generating",
+                        "task_id": task_id,
+                        "prompt": prompt
+                    })
+                    logger.info(f"Sent 'generating' status to streaming generator for task {task_id}")
+                except Exception as e:
+                    logger.error(f"Error sending to streaming generator: {str(e)}")
+            
             context["image_generation"] = {
                 "task_id": task_id,
                 "prompt": prompt,
                 "status": "processing",
-                "poll_endpoint": f"/api/v1/pipeline/image/{task_id}"  # Use the compatible endpoint
+                "poll_endpoint": poll_endpoint,
+                "message_id": message_id  # Include message_id here
             }
             
             # Add to results collection
@@ -212,7 +270,8 @@ class ImageGenerationCommand(Command):
                 "task_id": task_id,
                 "prompt": prompt,
                 "status": "processing",
-                "poll_endpoint": f"/api/v1/pipeline/image/{task_id}"  # Use the compatible endpoint
+                "poll_endpoint": poll_endpoint,
+                "message_id": message_id  # Include message_id here
             })
             
             return context

@@ -34,18 +34,18 @@ CREATE TABLE mo_llm_function_calls (
 );
 
 --  additional for mo_llm_conversations
--- Migration script to add content_id to mo_llm_conversations
+-- Migration script to add chat_id to mo_llm_conversations
 
--- Add the column with character varying(36) type to match mo_content.uuid
+-- Add the column with character varying(36) type to match mo_chat.uuid
 ALTER TABLE mo_llm_conversations
-ADD COLUMN content_id character varying(36) NULL;
+ADD COLUMN chat_id character varying(36) NULL;
 
 -- Add foreign key constraint
 ALTER TABLE mo_llm_conversations
 ADD CONSTRAINT fk_content_id
-    FOREIGN KEY (content_id)
-    REFERENCES mo_content (uuid)
+    FOREIGN KEY (chat_id)
+    REFERENCES mo_chat (uuid)
     ON DELETE SET NULL;
 
 -- Add index for performance
-CREATE INDEX idx_conversations_content_id ON mo_llm_conversations (content_id);
+CREATE INDEX idx_conversations_content_id ON mo_llm_conversations (chat_id);

@@ -153,7 +153,8 @@ async def generate_image_task(
     folder_id: Optional[str],
     db: Database,
     conversation_id: Optional[str] = None,
-    message_id: Optional[str] = None
+    message_id: Optional[str] = None,
+    streaming_generator = None
 ):
     try:
         logger.info(f"Starting image generation task {task_id}")
@@ -431,6 +432,10 @@ async def generate_image_task(
                 if not existing_msg:
                     logger.warning(f"Message {message_id} not found in conversation {conversation_id}. Creating new message.")
                     # If message doesn't exist, create it
+                    
+                    # Use detailed logging to track what's happening
+                    logger.info(f"Attempting to update message {message_id} in conversation {conversation_id} with image URL: {image_url}")
+                    
                     insert_fields = [
                         "id", "conversation_id", "role", "content", "created_at", "metadata"
                     ]
@@ -462,6 +467,30 @@ async def generate_image_task(
                     
                     await db.execute(query=insert_query, values=insert_values)
                     update_succeeded = True
+                    
+                    # Add this after the database operation
+                    logger.info(f"Successfully created new message with image: message_id={message_id}, image_url={image_url}")
+                    
+                    # Force a notification to ensure frontend knows about the new message
+                    try:
+                        await broadcast_to_conversation(
+                            conversation_id,
+                            {
+                                "type": "message_created",
+                                "messageId": message_id,
+                                "message": {
+                                    "id": message_id,
+                                    "role": "assistant",
+                                    "content": message_content,
+                                    "metadata": metadata,
+                                    "image_url": image_url,
+                                    "created_at": now.isoformat()
+                                }
+                            }
+                        )
+                        logger.info(f"Sent message_created WebSocket notification for new image message in conversation {conversation_id}")
+                    except Exception as ws_error:
+                        logger.error(f"WebSocket notification error for new message: {str(ws_error)}")
                 else:
                     # Update the existing message with appropriate fields
                     update_fields = ["content"]
@@ -470,6 +499,9 @@ async def generate_image_task(
                         "message_id": message_id,
                         "conversation_id": conversation_id
                     }
+                    
+                    # Use detailed logging to track what's happening
+                    logger.info(f"Attempting to update message {message_id} in conversation {conversation_id} with image URL: {image_url}")
                     
                     # Log the update operation to help debug any issues
                     logger.info(f"Updating message {message_id} in conversation {conversation_id} with image content")
@@ -499,19 +531,88 @@ async def generate_image_task(
                     
                     await db.execute(query=update_query, values=update_values)
                     update_succeeded = True
+                    
+                    # Add this after the database operation
+                    logger.info(f"Successfully updated message with image: message_id={message_id}, image_url={image_url}")
+                    
+                    # Force a notification to ensure frontend knows about the update
+                    try:
+                        await broadcast_to_conversation(
+                            conversation_id,
+                            {
+                                "type": "message_update",
+                                "messageId": message_id,
+                                "updates": {
+                                    "content": message_content,
+                                    "metadata": metadata,
+                                    "image_url": image_url
+                                }
+                            }
+                        )
+                        logger.info(f"Sent message_update WebSocket notification for updated image in conversation {conversation_id}")
+                    except Exception as ws_error:
+                        logger.error(f"WebSocket notification error for message update: {str(ws_error)}")
                 
-                # The WebSocket notification code is removed as we're now using REST polling
+                # Send additional notification even though we are using REST polling as a fallback mechanism
+                # This helps ensure the frontend gets notified about the image being ready
+                if update_succeeded:
+                    try:
+                        # Create an image_ready event to notify clients
+                        image_data = {
+                            "type": "image_ready",
+                            "task_id": task_id,
+                            "message_id": message_id,
+                            "conversation_id": conversation_id,
+                            "image_url": image_url,
+                            "image_id": first_image.get("id"),
+                            "prompt": prompt
+                        }
+                        
+                        # Broadcast to the conversation
+                        await broadcast_to_conversation(conversation_id, image_data)
+                        logger.info(f"Sent image_ready WebSocket notification for task {task_id}")
+                    except Exception as ws_error:
+                        logger.error(f"WebSocket notification error for image_ready: {str(ws_error)}")
                 
                 logger.info(f"Successfully updated conversation message with image URL and metadata")
             except Exception as e:
-                logger.error(f"Error updating conversation message: {str(e)}")
+                logger.error(f"Error updating message with image: {str(e)}")
                 logger.error(traceback.format_exc())
                 # Continue even if message update fails
         
+        # Send completed status through streaming generator if available
+        if streaming_generator:
+            try:
+                for img in generated_images:
+                    await streaming_generator.asend({
+                        "type": "image_generation",
+                        "status": "completed",
+                        "task_id": task_id,
+                        "image_url": img["url"],
+                        "image_id": img["id"],
+                        "prompt": img["prompt"]
+                    })
+                logger.info(f"Sent 'completed' status to streaming generator for task {task_id}")
+            except Exception as e:
+                logger.error(f"Error sending completion to streaming generator: {str(e)}")
+                
         logger.info(f"Completed image generation task {task_id} with {len(generated_images)} images")
         
     except Exception as e:
         logger.error(f"Error in image generation task: {str(e)}")
+        
+        # Notify through streaming generator if available
+        if streaming_generator:
+            try:
+                await streaming_generator.asend({
+                    "type": "image_generation",
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error": str(e)
+                })
+                logger.info(f"Sent 'failed' status to streaming generator for task {task_id}")
+            except Exception as gen_error:
+                logger.error(f"Error sending failure to streaming generator: {str(gen_error)}")
         
         # Update task status to failed
         try:
@@ -745,7 +846,8 @@ async def generate_image(
             request.folder_id,
             db,
             conversation_id,
-            message_id
+            message_id,
+            None  # No streaming generator for direct endpoint calls
         )
         
         return ImageGenerationResponse(

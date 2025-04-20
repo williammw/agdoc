@@ -79,13 +79,13 @@ class GeneralKnowledgeCommand(Command):
             system_prompt = DEFAULT_SYSTEM_PROMPT
 
             # Add content information if available
-            content_id = context.get("content_id")
+            chat_id = context.get("chat_id")
             db = context.get("db")
-            if content_id and db:
+            if chat_id and db:
                 try:
-                    # Query to get content name by content_id
-                    query = "SELECT name, description FROM mo_content WHERE uuid = :content_id"
-                    content_info = await db.fetch_one(query=query, values={"content_id": content_id})
+                    # Query to get content name by chat_id
+                    query = "SELECT name, description FROM mo_chat WHERE uuid = :chat_id"
+                    content_info = await db.fetch_one(query=query, values={"chat_id": chat_id})
 
                     if content_info:
                         content_name = content_info["name"]
@@ -104,7 +104,7 @@ class GeneralKnowledgeCommand(Command):
                             f"Added content context to prompt: Content name '{content_name}'")
                     else:
                         logger.warning(
-                            f"Content with ID {content_id} not found in database")
+                            f"Content with ID {chat_id} not found in database")
                 except Exception as e:
                     logger.error(f"Error fetching content info: {str(e)}")
 
@@ -184,7 +184,7 @@ class GeneralKnowledgeCommand(Command):
         try:
             # Call the API with streaming enabled
             logger.info(
-                f"__stream__shit Calling {params['model']} API for general knowledge with streaming")
+                f"Calling {params['model']} API for general knowledge with streaming")
             stream = client.chat.completions.create(**params)
 
             # Initialize collector variables
@@ -212,7 +212,7 @@ class GeneralKnowledgeCommand(Command):
                     # Log occasionally or for larger chunks
                     if chunk_count % 100 == 0 or len(content_chunk) > 20:
                         logger.info(
-                            f"__stream__shit Received content chunk #{chunk_count}: '{content_chunk[:20]}...'")
+                            f"Received content chunk #{chunk_count}: '{content_chunk[:20]}...'")
 
                     # Yield the chunk for streaming to client
                     yield {
@@ -234,7 +234,7 @@ class GeneralKnowledgeCommand(Command):
                     # Log occasionally or for larger chunks
                     if chunk_count % 100 == 0 or len(reasoning_chunk) > 20:
                         logger.info(
-                            f"__stream__shit Received reasoning chunk: '{reasoning_chunk[:20]}...'")
+                            f"Received reasoning chunk: '{reasoning_chunk[:20]}...'")
 
                     # Also yield reasoning chunks, but with a different type
                     yield {
@@ -248,7 +248,7 @@ class GeneralKnowledgeCommand(Command):
 
             # Log completion
             logger.info(
-                f"__stream__shit Streaming complete. Received {chunk_count} chunks, content length: {len(content_collector)}, reasoning length: {len(reasoning_collector)}")
+                f"Streaming complete. Received {chunk_count} chunks, content length: {len(content_collector)}, reasoning length: {len(reasoning_collector)}")
 
             # If we have no reasoning content from streaming, try a fallback
             if not reasoning_collector:
@@ -260,7 +260,7 @@ class GeneralKnowledgeCommand(Command):
 
                     # Make a separate non-streaming call just to get reasoning content
                     logger.info(
-                        f"__stream__shit No reasoning from stream, making separate call to get reasoning content")
+                        f"No reasoning from stream, making separate call to get reasoning content")
                     completion = client.chat.completions.create(
                         **nonstream_params)
 
@@ -268,7 +268,7 @@ class GeneralKnowledgeCommand(Command):
                     if hasattr(completion.choices[0].message, 'reasoning_content'):
                         reasoning = completion.choices[0].message.reasoning_content
                         logger.info(
-                            f"__stream__shit Successfully extracted reasoning content from non-streaming call ({len(reasoning)} chars)")
+                            f"Successfully extracted reasoning content from non-streaming call ({len(reasoning)} chars)")
                         context["reasoning_content"] = reasoning
 
                         # Also yield the reasoning content
@@ -280,7 +280,7 @@ class GeneralKnowledgeCommand(Command):
                         }
                     else:
                         logger.warning(
-                            f"__stream__shit Fallback call didn't return reasoning content either")
+                            f"Fallback call didn't return reasoning content either")
                 except Exception as fallback_error:
                     logger.error(
                         f"Error in fallback reasoning content extraction: {str(fallback_error)}")
