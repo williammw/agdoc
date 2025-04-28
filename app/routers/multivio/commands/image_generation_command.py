@@ -227,9 +227,32 @@ class ImageGenerationCommand(Command):
             
             # Import the image generation task to avoid circular imports
             from app.routers.multivio.together_router import generate_image_task
+            import asyncio  # Add asyncio import for create_task
             
-            # Start background task
+            # Add timing log before starting task
+            logger.info(f"⏱️ TIMING: About to start image generation task {task_id} at {datetime.now().isoformat()}")
+            
+            # Get message_id from context
             message_id = context.get("message_id")
+            
+            # CRITICAL FIX: Use asyncio.create_task instead of background_tasks to start immediately
+            # This will run concurrently with the streaming response
+            asyncio.create_task(
+                generate_image_task(
+                    task_id,
+                    api_data,
+                    current_user["uid"],
+                    None,  # No folder_id for chat-based images
+                    db,
+                    conversation_id,
+                    message_id,  # Pass the message_id from context
+                    context.get("_streaming_generator")  # Pass the streaming generator
+                )
+            )
+            
+            logger.info(f"⏳ TIMING: Started image generation task {task_id} with asyncio.create_task at {datetime.now().isoformat()}")
+            
+            # Also add to background_tasks as backup (in case the first approach fails)
             background_tasks.add_task(
                 generate_image_task,
                 task_id,
@@ -249,16 +272,22 @@ class ImageGenerationCommand(Command):
             if not poll_endpoint.startswith("/"):
                 poll_endpoint = f"/{poll_endpoint}"
                 
-            # Get message_id from context or generate one if not present
+            # Get message_id from context - CRITICAL to use existing ID if present
             message_id = context.get("message_id")
             if not message_id:
                 message_id = str(uuid.uuid4())
                 context["message_id"] = message_id
-                logger.info(f"Generated new message_id {message_id} for image task {task_id}")
+                logger.info(f"⚠️ WARNING: No existing message_id found in context! Generated new message_id {message_id} for image task {task_id}")
+            else:
+                # Log that we're using the existing message ID to ensure consistency
+                logger.info(f"✅ Using existing message_id {message_id} from context for image task {task_id}")
                 
             # Send image generation status through the streaming generator
             if "_streaming_generator" in context and context["_streaming_generator"]:
                 try:
+                    # Add extra correlation logging for message_id and task_id
+                    logger.info(f"🔄 CORRELATION: message_id={message_id}, task_id={task_id}, conversation_id={conversation_id}")
+                    
                     # Send two signals - one for compatibility, one as standard event
                     # 1. Standard event
                     await context["_streaming_generator"].asend({

@@ -146,20 +146,457 @@ async def call_together_api(endpoint: str, data: Dict, method: str = "POST"):
             raise HTTPException(status_code=500, detail=f"API request failed: {str(e)}")
 
 # Background task for image generation
+# async def generate_image_task(
+#     task_id: str,
+#     api_data: Dict[str, Any], 
+#     user_id: str,
+#     folder_id: Optional[str],
+#     db: Database,
+#     conversation_id: Optional[str] = None,
+#     message_id: Optional[str] = None,
+#     streaming_generator = None
+# ):
+#     try:
+#         logger.info(f"Starting image generation task {task_id} - SIMPLIFIED VERSION NO POLLING")
+        
+#         # Update to 10% progress stage
+#         try:
+#             # Create a unique path for this stage
+#             timestamp_folder = datetime.now(timezone.utc).strftime('%Y/%m/%d')
+#             stage_path = f"generations/{task_id}/10_percent.png"
+            
+#             # Update stage record
+#             stage_query = """
+#             INSERT INTO mo_image_stages
+#             (task_id, stage_number, completion_percentage, image_path, image_url)
+#             VALUES (:task_id, 2, 10, :image_path, NULL)
+#             ON CONFLICT (task_id, stage_number) 
+#             DO UPDATE SET completion_percentage = 10, image_path = :image_path
+#             """
+#             await db.execute(
+#                 query=stage_query,
+#                 values={
+#                     "task_id": task_id,
+#                     "image_path": stage_path
+#                 }
+#             )
+            
+#             # Update main task status
+#             update_query = """
+#             UPDATE mo_ai_tasks 
+#             SET updated_at = CURRENT_TIMESTAMP
+#             WHERE id = :task_id
+#             """
+#             await db.execute(query=update_query, values={"task_id": task_id})
+#         except Exception as e:
+#             logger.error(f"Error updating 10% stage: {str(e)}")
+        
+#         # Simulate initial processing time (in production this would be actual processing time)
+#         await asyncio.sleep(1)
+        
+#         # Update to 50% progress stage
+#         try:
+#             # Create a unique path for this stage
+#             stage_path = f"generations/{task_id}/50_percent.png"
+            
+#             # Update stage record
+#             stage_query = """
+#             INSERT INTO mo_image_stages
+#             (task_id, stage_number, completion_percentage, image_path, image_url)
+#             VALUES (:task_id, 3, 50, :image_path, NULL)
+#             ON CONFLICT (task_id, stage_number) 
+#             DO UPDATE SET completion_percentage = 50, image_path = :image_path
+#             """
+#             await db.execute(
+#                 query=stage_query,
+#                 values={
+#                     "task_id": task_id,
+#                     "image_path": stage_path
+#                 }
+#             )
+#         except Exception as e:
+#             logger.error(f"Error updating 50% stage: {str(e)}")
+        
+#         # Simulate more processing time
+#         await asyncio.sleep(2)
+        
+#         # Call together.ai API
+#         result = await call_together_api("images/generations", api_data)
+        
+#         # Process the result
+#         now = datetime.now(timezone.utc)
+#         generated_images = []
+        
+#         # Generate timestamp for folder structure
+#         timestamp_folder = now.strftime('%Y/%m/%d')
+        
+#         for i, img_data in enumerate(result.get("data", [])):
+#             image_url = img_data.get("url")
+            
+#             if image_url:
+#                 # Generate a unique ID
+#                 image_id = str(uuid.uuid4())
+#                 timestamp_file = now.strftime('%Y-%m-%d_%H-%M-%S')
+#                 name = f"Flux_image_{timestamp_file}_{i+1}.png"
+                
+#                 # Check if it's a base64 data URL
+#                 if image_url.startswith('data:image/'):
+#                     try:
+#                         # Extract the base64 data
+#                         base64_data = image_url.split(',')[1]
+#                         image_data = base64.b64decode(base64_data)
+                        
+#                         # Define the path in R2
+#                         r2_key = f"flux-images/{user_id}/{timestamp_folder}/{image_id}.png"
+                        
+#                         # Create a temporary file for the image
+#                         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
+#                             temp_file.write(image_data)
+#                             temp_file_path = temp_file.name
+                        
+#                         try:
+#                             # Upload the file to R2
+#                             with open(temp_file_path, 'rb') as file_to_upload:
+#                                 s3_client.upload_fileobj(
+#                                     file_to_upload,
+#                                     bucket_name,
+#                                     r2_key,
+#                                     ExtraArgs={
+#                                         "ContentType": "image/png", 
+#                                         "ACL": "public-read"
+#                                     }
+#                                 )
+                            
+#                             # Update the image URL to the R2 URL
+#                             image_url = f"https://{CDN_DOMAIN}/{r2_key}"
+#                             logger.info(f"Uploaded image to R2: {image_url}")
+                            
+#                             # Get file size
+#                             file_size = os.path.getsize(temp_file_path)
+#                         finally:
+#                             # Clean up the temporary file
+#                             os.unlink(temp_file_path)
+#                     except Exception as e:
+#                         logger.error(f"Error uploading to R2: {str(e)}")
+#                         # Continue with the base64 URL if upload fails
+#                         file_size = len(image_data) if 'image_data' in locals() else 0
+#                 else:
+#                     file_size = 0  # We don't know the file size
+                
+#                 # Store in assets table
+#                 asset_query = """
+#                 INSERT INTO mo_assets (
+#                     id, name, type, url, content_type, file_size, folder_id, 
+#                     created_by, processing_status, metadata, is_deleted, created_at, updated_at,
+#                     original_name
+#                 ) VALUES (
+#                     :id, :name, :type, :url, :content_type, :file_size, :folder_id,
+#                     :created_by, :processing_status, :metadata, false, :created_at, :created_at,
+#                     :original_name
+#                 )
+#                 """
+                
+#                 metadata = {
+#                     "prompt": api_data["prompt"],
+#                     "model": api_data["model"],
+#                     "source": "together_ai",
+#                     "generation_task_id": task_id
+#                 }
+                
+#                 await db.execute(
+#                     query=asset_query,
+#                     values={
+#                         "id": image_id,
+#                         "name": name,
+#                         "type": "image",
+#                         "url": image_url,
+#                         "content_type": "image/png",
+#                         "file_size": file_size,
+#                         "folder_id": folder_id,
+#                         "created_by": user_id,
+#                         "processing_status": "completed",
+#                         "metadata": json.dumps(metadata),
+#                         "created_at": now,
+#                         "original_name": name
+#                     }
+#                 )
+                
+#                 generated_images.append({
+#                     "id": image_id,
+#                     "url": image_url,
+#                     "prompt": api_data["prompt"],
+#                     "model": api_data["model"],
+#                     "created_at": now.isoformat()
+#                 })
+                
+#                 # Update the 100% progress stage
+#                 try:
+#                     final_stage_query = """
+#                     INSERT INTO mo_image_stages
+#                     (task_id, stage_number, completion_percentage, image_path, image_url)
+#                     VALUES (:task_id, 4, 100, :image_path, :image_url)
+#                     ON CONFLICT (task_id, stage_number) 
+#                     DO UPDATE SET completion_percentage = 100, 
+#                                  image_path = :image_path,
+#                                  image_url = :image_url
+#                     """
+#                     await db.execute(
+#                         query=final_stage_query,
+#                         values={
+#                             "task_id": task_id,
+#                             "image_path": r2_key,
+#                             "image_url": image_url
+#                         }
+#                     )
+#                 except Exception as e:
+#                     logger.error(f"Error updating final stage: {str(e)}")
+        
+#         # Update task status
+#         task_query = """
+#         UPDATE mo_ai_tasks 
+#         SET status = :status, 
+#             result = :result,
+#             completed_at = :completed_at,
+#             updated_at = :updated_at
+#         WHERE id = :task_id AND created_by = :user_id
+#         """
+        
+#         await db.execute(
+#             query=task_query,
+#             values={
+#                 "status": "completed",
+#                 "result": json.dumps({"images": generated_images}),
+#                 "completed_at": now,
+#                 "updated_at": now,
+#                 "task_id": task_id,
+#                 "user_id": user_id
+#             }
+#         )
+        
+#         # Update the conversation message if we have conversation_id and message_id
+#         if conversation_id and message_id and generated_images:
+#             try:
+#                 # Get image info
+#                 first_image = generated_images[0]
+#                 image_url = first_image.get("url")
+#                 image_id = first_image.get("id")
+#                 prompt = first_image.get("prompt", "")
+                
+#                 logger.info(f"Updating message {message_id} with image data. URL: {image_url}")
+                
+#                 # Create markdown content
+#                 content = f"![Generated image: {prompt}]({image_url})"
+                
+#                 # Create updated metadata - CRITICAL TO INCLUDE IMAGE INFO
+#                 metadata_dict = {
+#                     "is_image": True,
+#                     "image_task_id": task_id,
+#                     "image_id": image_id,
+#                     "image_url": image_url,
+#                     "prompt": prompt,
+#                     "status": "completed",
+#                     "message_type": "image"  # Override original message_type
+#                 }
+                
+#                 # Update ALL necessary fields in one query
+#                 logger.info(f"__stream__shit Updating message {message_id} with image URL {image_url}")
+#                 update_query = """
+#                 UPDATE mo_llm_messages
+#                 SET content = :content,
+#                     image_url = :image_url,
+#                     metadata = :metadata
+#                 WHERE id = :message_id AND conversation_id = :conversation_id
+#                 """
+                
+#                 await db.execute(
+#                     query=update_query,
+#                     values={
+#                         "content": content,
+#                         "image_url": image_url,
+#                         "metadata": json.dumps(metadata_dict),
+#                         "message_id": message_id,
+#                         "conversation_id": conversation_id
+#                     }
+#                 )
+                
+#                 # Verify the update worked
+#                 verify_query = """
+#                 SELECT image_url FROM mo_llm_messages 
+#                 WHERE id = :message_id AND conversation_id = :conversation_id
+#                 """
+                
+#                 result = await db.fetch_one(
+#                     query=verify_query,
+#                     values={
+#                         "message_id": message_id,
+#                         "conversation_id": conversation_id
+#                     }
+#                 )
+                
+#                 if result and result['image_url'] == image_url:
+#                     logger.info(f"✅ Successfully updated message {message_id} with image URL")
+#                 else:
+#                     logger.error(f"❌ Failed to update message {message_id} with image URL")
+                    
+#             except Exception as e:
+#                 logger.error(f"Error updating message with image: {str(e)}")
+#                 logger.error(traceback.format_exc())  # Full stack trace
+        
+#         # Send completed status through streaming generator if available
+#         if streaming_generator:
+#             try:
+#                 for img in generated_images:
+#                     # We need to handle various formats to ensure compatibility
+#                     try:
+#                         # 1. First signal in the old format for compatibility
+#                         await streaming_generator.asend({
+#                             "type": "image_generation",
+#                             "status": "completed",
+#                             "task_id": task_id,
+#                             "image_url": img["url"],
+#                             "image_id": img["id"],
+#                             "prompt": img["prompt"],
+#                             "message_id": message_id
+#                         })
+                        
+#                         # Add small delay between sends
+#                         await asyncio.sleep(0.1)
+                        
+#                         # 2. Second signal in the dedicated image_ready format
+#                         await streaming_generator.asend({
+#                             "type": "image_ready",
+#                             "task_id": task_id,
+#                             "image_url": img["url"],
+#                             "image_id": img["id"],
+#                             "prompt": img["prompt"],
+#                             "message_id": message_id
+#                         })
+                        
+#                         # Add small delay between sends
+#                         await asyncio.sleep(0.1)
+                        
+#                         # 3. Third signal as a legacy format for backward compatibility
+#                         await streaming_generator.asend({
+#                             "image_generation_complete": True,
+#                             "image_url": img["url"],
+#                             "task_id": task_id,
+#                             "message_id": message_id
+#                         })
+#                     except Exception as send_error:
+#                         logger.error(f"Error sending image completion event: {str(send_error)}")
+#                         # Continue to the next image even if one send fails
+                    
+#                     logger.info(f"Sent completed image signals to streaming generator for task {task_id}")
+                    
+#                     # Small delay between signals to prevent overwhelming
+#                     await asyncio.sleep(0.1)
+#             except Exception as e:
+#                 logger.error(f"Error sending completion to streaming generator: {str(e)}")
+                
+#         logger.info(f"Completed image generation task {task_id} with {len(generated_images)} images")
+        
+#     except Exception as e:
+#         logger.error(f"Error in image generation task: {str(e)}")
+        
+#         # Notify through streaming generator if available
+#         if streaming_generator:
+#             try:
+#                 # Send failure signal in multiple formats for redundancy
+#                 try:
+#                     # 1. Standard format
+#                     await streaming_generator.asend({
+#                         "type": "image_generation",
+#                         "status": "failed",
+#                         "task_id": task_id,
+#                         "error": str(e)
+#                     })
+                    
+#                     # Add small delay between sends
+#                     await asyncio.sleep(0.1)
+                    
+#                     # 2. Dedicated image_failed event
+#                     await streaming_generator.asend({
+#                         "type": "image_failed",
+#                         "task_id": task_id,
+#                         "error": str(e)
+#                     })
+                    
+#                     # Add small delay between sends
+#                     await asyncio.sleep(0.1)
+                    
+#                     # 3. Legacy format
+#                     await streaming_generator.asend({
+#                         "image_generation_failed": True,
+#                         "task_id": task_id,
+#                         "error": str(e)
+#                     })
+#                 except Exception as send_error:
+#                     logger.error(f"Error sending failure notification: {str(send_error)}")
+#                     # Continue even if sends fail
+                
+#                 logger.info(f"Sent 'failed' status signals to streaming generator for task {task_id}")
+#             except Exception as gen_error:
+#                 logger.error(f"Error sending failure to streaming generator: {str(gen_error)}")
+        
+#         # Update task status to failed
+#         try:
+#             await db.execute(
+#                 """
+#                 UPDATE mo_ai_tasks 
+#                 SET status = 'failed', 
+#                     error = :error,
+#                     updated_at = :updated_at
+#                 WHERE id = :task_id AND created_by = :user_id
+#                 """,
+#                 {
+#                     "error": str(e),
+#                     "updated_at": datetime.now(timezone.utc),
+#                     "task_id": task_id,
+#                     "user_id": user_id
+#                 }
+#             )
+            
+#             # Add a failed stage entry
+#             try:
+#                 failed_stage_query = """
+#                 INSERT INTO mo_image_stages
+#                 (task_id, stage_number, completion_percentage, image_path, image_url)
+#                 VALUES (:task_id, 99, 0, '', NULL)
+#                 ON CONFLICT (task_id, stage_number) DO NOTHING
+#                 """
+#                 await db.execute(
+#                     query=failed_stage_query,
+#                     values={"task_id": task_id}
+#                 )
+#             except Exception as stage_error:
+#                 logger.error(f"Error adding failed stage: {str(stage_error)}")
+            
+#         except Exception as db_error:
+#             logger.error(f"Failed to update task status: {str(db_error)}")
+
+# Modified version of generate_image_task with polling removed
+
+
 async def generate_image_task(
     task_id: str,
-    api_data: Dict[str, Any], 
+    api_data: Dict[str, Any],
     user_id: str,
     folder_id: Optional[str],
     db: Database,
     conversation_id: Optional[str] = None,
     message_id: Optional[str] = None,
-    streaming_generator = None
+    streaming_generator=None
 ):
     try:
-        logger.info(f"Starting image generation task {task_id}")
-        
-        # Update to 10% progress stage
+        # Record task start time and detailed info
+        start_time = datetime.now()
+        logger.info(
+            f"⏱️ TASK STARTED at {start_time.isoformat()}: Image generation task {task_id} - c_id={conversation_id}, m_id={message_id}")
+        logger.info(
+            f"Starting image generation task {task_id} - SIMPLIFIED VERSION NO POLLING")
+
+        # COMMENTED: Progress stages updates
+        '''
         try:
             # Create a unique path for this stage
             timestamp_folder = datetime.now(timezone.utc).strftime('%Y/%m/%d')
@@ -219,41 +656,42 @@ async def generate_image_task(
         
         # Simulate more processing time
         await asyncio.sleep(2)
-        
+        '''
+
         # Call together.ai API
         result = await call_together_api("images/generations", api_data)
-        
+
         # Process the result
         now = datetime.now(timezone.utc)
         generated_images = []
-        
+
         # Generate timestamp for folder structure
         timestamp_folder = now.strftime('%Y/%m/%d')
-        
+
         for i, img_data in enumerate(result.get("data", [])):
             image_url = img_data.get("url")
-            
+
             if image_url:
                 # Generate a unique ID
                 image_id = str(uuid.uuid4())
                 timestamp_file = now.strftime('%Y-%m-%d_%H-%M-%S')
                 name = f"Flux_image_{timestamp_file}_{i+1}.png"
-                
+
                 # Check if it's a base64 data URL
                 if image_url.startswith('data:image/'):
                     try:
                         # Extract the base64 data
                         base64_data = image_url.split(',')[1]
                         image_data = base64.b64decode(base64_data)
-                        
+
                         # Define the path in R2
                         r2_key = f"flux-images/{user_id}/{timestamp_folder}/{image_id}.png"
-                        
+
                         # Create a temporary file for the image
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
                             temp_file.write(image_data)
                             temp_file_path = temp_file.name
-                        
+
                         try:
                             # Upload the file to R2
                             with open(temp_file_path, 'rb') as file_to_upload:
@@ -262,15 +700,15 @@ async def generate_image_task(
                                     bucket_name,
                                     r2_key,
                                     ExtraArgs={
-                                        "ContentType": "image/png", 
+                                        "ContentType": "image/png",
                                         "ACL": "public-read"
                                     }
                                 )
-                            
+
                             # Update the image URL to the R2 URL
                             image_url = f"https://{CDN_DOMAIN}/{r2_key}"
                             logger.info(f"Uploaded image to R2: {image_url}")
-                            
+
                             # Get file size
                             file_size = os.path.getsize(temp_file_path)
                         finally:
@@ -279,10 +717,11 @@ async def generate_image_task(
                     except Exception as e:
                         logger.error(f"Error uploading to R2: {str(e)}")
                         # Continue with the base64 URL if upload fails
-                        file_size = len(image_data) if 'image_data' in locals() else 0
+                        file_size = len(
+                            image_data) if 'image_data' in locals() else 0
                 else:
                     file_size = 0  # We don't know the file size
-                
+
                 # Store in assets table
                 asset_query = """
                 INSERT INTO mo_assets (
@@ -295,14 +734,14 @@ async def generate_image_task(
                     :original_name
                 )
                 """
-                
+
                 metadata = {
                     "prompt": api_data["prompt"],
                     "model": api_data["model"],
                     "source": "together_ai",
                     "generation_task_id": task_id
                 }
-                
+
                 await db.execute(
                     query=asset_query,
                     values={
@@ -320,7 +759,7 @@ async def generate_image_task(
                         "original_name": name
                     }
                 )
-                
+
                 generated_images.append({
                     "id": image_id,
                     "url": image_url,
@@ -328,8 +767,9 @@ async def generate_image_task(
                     "model": api_data["model"],
                     "created_at": now.isoformat()
                 })
-                
-                # Update the 100% progress stage
+
+                # COMMENTED: Update the 100% progress stage
+                '''
                 try:
                     final_stage_query = """
                     INSERT INTO mo_image_stages
@@ -350,7 +790,8 @@ async def generate_image_task(
                     )
                 except Exception as e:
                     logger.error(f"Error updating final stage: {str(e)}")
-        
+                '''
+
         # Update task status
         task_query = """
         UPDATE mo_ai_tasks 
@@ -360,7 +801,7 @@ async def generate_image_task(
             updated_at = :updated_at
         WHERE id = :task_id AND created_by = :user_id
         """
-        
+
         await db.execute(
             query=task_query,
             values={
@@ -372,215 +813,177 @@ async def generate_image_task(
                 "user_id": user_id
             }
         )
-        
+
         # Update the conversation message if we have conversation_id and message_id
         if conversation_id and message_id and generated_images:
             try:
-                # Use the first generated image for the conversation
+                # Get image info
                 first_image = generated_images[0]
                 image_url = first_image.get("url")
+                image_id = first_image.get("id")
                 prompt = first_image.get("prompt", "")
+
+                logger.info(
+                    f"✅ UPDATING MESSAGE WITH IMAGE URL: conversation_id={conversation_id}, message_id={message_id}")
+                logger.info(f"✅ IMAGE DATA: url={image_url}, id={image_id}")
                 
-                logger.info(f"Updating conversation {conversation_id}, message {message_id} with image URL: {image_url}")
-                
-                # IMPORTANT: Update the database FIRST before sending WebSocket notification
-                # Create a message that references the image
-                message_content = f"![Generated image for: {prompt}]({image_url})"
-                
-                # Create metadata with image information
-                metadata = {
-                    "is_image": True,
-                    "image_task_id": task_id,
-                    "image_id": first_image.get("id"),
-                    "image_url": image_url,
-                    "prompt": prompt,
-                    "status": "completed"
-                }
-                
-                # Check if various columns exist
-                check_image_url_query = """
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'mo_llm_messages' AND column_name = 'image_url'
+                # Add diagnostic query to verify message exists before attempting update
+                verify_message_query = """
+                SELECT id, conversation_id, role, content, metadata, image_url
+                FROM mo_llm_messages
+                WHERE id = :message_id AND conversation_id = :conversation_id
                 """
-                has_image_url = await db.fetch_one(check_image_url_query)
                 
-                check_metadata_query = """
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'mo_llm_messages' AND column_name = 'metadata'
-                """
-                has_metadata = await db.fetch_one(check_metadata_query)
-                
-                check_updated_at_query = """
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'mo_llm_messages' AND column_name = 'updated_at'
-                """
-                has_updated_at = await db.fetch_one(check_updated_at_query)
-                
-                # First check if the message exists
-                check_msg_query = "SELECT id FROM mo_llm_messages WHERE id = :message_id AND conversation_id = :conversation_id"
-                existing_msg = await db.fetch_one(
-                    query=check_msg_query,
+                message_check = await db.fetch_one(
+                    query=verify_message_query,
                     values={
                         "message_id": message_id,
                         "conversation_id": conversation_id
                     }
                 )
                 
-                # Flag to track if update succeeded
-                update_succeeded = False
-                
-                if not existing_msg:
-                    logger.warning(f"Message {message_id} not found in conversation {conversation_id}. Creating new message.")
-                    # If message doesn't exist, create it
+                if message_check:
+                    logger.info(f"✅ VERIFIED: Message {message_id} exists in database. Current image_url: {message_check['image_url']}")
+                else:
+                    logger.error(f"⚠️ MESSAGE NOT FOUND: id={message_id}, conversation_id={conversation_id}")
                     
-                    # Use detailed logging to track what's happening
-                    logger.info(f"Attempting to update message {message_id} in conversation {conversation_id} with image URL: {image_url}")
-                    
-                    insert_fields = [
-                        "id", "conversation_id", "role", "content", "created_at", "metadata"
-                    ]
-                    insert_values = {
-                        "id": message_id,
-                        "conversation_id": conversation_id,
-                        "role": "assistant",
-                        "content": message_content,
-                        "created_at": now,
-                        "metadata": json.dumps(metadata)
-                    }
-                    
-                    # Add image_url if the column exists
-                    if has_image_url:
-                        insert_fields.append("image_url")
-                        insert_values["image_url"] = image_url
-                    
-                    # Build dynamic query based on available columns
-                    fields_str = ", ".join(insert_fields)
-                    placeholders_str = ", ".join([f":{field}" for field in insert_fields])
-                    
-                    insert_query = f"""
-                    INSERT INTO mo_llm_messages (
-                        {fields_str}
-                    ) VALUES (
-                        {placeholders_str}
-                    )
+                    # Try to find any messages in this conversation
+                    fallback_query = """
+                    SELECT id, role, created_at 
+                    FROM mo_llm_messages
+                    WHERE conversation_id = :conversation_id
+                    ORDER BY created_at DESC
+                    LIMIT 5
                     """
                     
-                    await db.execute(query=insert_query, values=insert_values)
-                    update_succeeded = True
+                    fallback_messages = await db.fetch_all(
+                        query=fallback_query,
+                        values={"conversation_id": conversation_id}
+                    )
                     
-                    # Add this after the database operation
-                    logger.info(f"Successfully created new message with image: message_id={message_id}, image_url={image_url}")
+                    if fallback_messages:
+                        logger.info(f"ℹ️ Found {len(fallback_messages)} recent messages in conversation {conversation_id}:")
+                        for idx, msg in enumerate(fallback_messages):
+                            logger.info(f"ℹ️ [{idx+1}] id={msg['id']}, role={msg['role']}, created_at={msg['created_at']}")
+                            
+                        # Try to use the most recent assistant message as fallback
+                        assistant_messages = [m for m in fallback_messages if m['role'] == 'assistant']
+                        if assistant_messages:
+                            new_message_id = assistant_messages[0]['id']
+                            logger.info(f"🔄 ATTEMPTING FALLBACK: Will try to update most recent assistant message {new_message_id} instead")
+                            message_id = new_message_id
+                    else:
+                        logger.error(f"⛔ NO MESSAGES found in conversation {conversation_id}")
+
+                # Create markdown content
+                content = f"![Generated image: {prompt}]({image_url})"
+
+                # Create updated metadata - CRITICAL TO INCLUDE IMAGE INFO
+                metadata_dict = {
+                    "is_image": True,
+                    "image_task_id": task_id,
+                    "image_id": image_id,
+                    "image_url": image_url,
+                    "prompt": prompt,
+                    "status": "completed",
+                    "message_type": "image"  # Override original message_type
+                }
+
+                # Add extra debug logs
+                logger.info(f"METADATA TO SAVE: {json.dumps(metadata_dict)}")
+
+                # Update ALL necessary fields in one query with better error handling
+                try:
+                    update_query = """
+                    UPDATE mo_llm_messages
+                    SET content = :content,
+                        image_url = :image_url,
+                        metadata = :metadata
+                    WHERE id = :message_id AND conversation_id = :conversation_id
+                    RETURNING id, image_url;
+                    """
+
+                    logger.info(f"🔄 Executing database update for message_id={message_id}, conversation_id={conversation_id}")
+                    result = await db.fetch_one(
+                        query=update_query,
+                        values={
+                            "content": content,
+                            "image_url": image_url,
+                            "metadata": json.dumps(metadata_dict),
+                            "message_id": message_id,
+                            "conversation_id": conversation_id
+                        }
+                    )
+                    logger.info(f"🔄 Database update completed. Result: {result}")
+                except Exception as db_error:
+                    logger.error(f"⛔ DATABASE ERROR during update: {str(db_error)}")
+                    logger.error(traceback.format_exc())
+
+                # Enhanced verification with more details
+                if result and result['image_url'] == image_url:
+                    logger.info(f"✅ ✅ ✅ SUCCESSFULLY UPDATED message {message_id} with image URL: {image_url}")
+                    logger.info(f"✅ Update result: {result}")
                     
-                    # Force a notification to ensure frontend knows about the new message
-                    try:
-                        await broadcast_to_conversation(
-                            conversation_id,
-                            {
-                                "type": "message_created",
-                                "messageId": message_id,
-                                "message": {
-                                    "id": message_id,
-                                    "role": "assistant",
-                                    "content": message_content,
-                                    "metadata": metadata,
-                                    "image_url": image_url,
-                                    "created_at": now.isoformat()
-                                }
-                            }
-                        )
-                        logger.info(f"Sent message_created WebSocket notification for new image message in conversation {conversation_id}")
-                    except Exception as ws_error:
-                        logger.error(f"WebSocket notification error for new message: {str(ws_error)}")
+                    # Verify the message can be retrieved in another query to confirm persistence
+                    verify_read_query = """
+                    SELECT id, image_url, metadata FROM mo_llm_messages
+                    WHERE id = :message_id
+                    """
+                    
+                    verify_result = await db.fetch_one(
+                        query=verify_read_query,
+                        values={"message_id": message_id}
+                    )
+                    
+                    if verify_result and verify_result['image_url'] == image_url:
+                        logger.info(f"✅ VERIFIED message update is persisted in database")
+                    else:
+                        logger.warning(f"⚠️ Could not verify persistence - follow-up query returned: {verify_result}")
                 else:
-                    # Update the existing message with appropriate fields
-                    update_fields = ["content"]
-                    update_values = {
-                        "content": message_content,
-                        "message_id": message_id,
-                        "conversation_id": conversation_id
-                    }
-                    
-                    # Use detailed logging to track what's happening
-                    logger.info(f"Attempting to update message {message_id} in conversation {conversation_id} with image URL: {image_url}")
-                    
-                    # Log the update operation to help debug any issues
-                    logger.info(f"Updating message {message_id} in conversation {conversation_id} with image content")
-                    
-                    # Add metadata if the column exists
-                    if has_metadata:
-                        update_fields.append("metadata")
-                        update_values["metadata"] = json.dumps(metadata)
-                    
-                    # Add image_url if the column exists
-                    if has_image_url:
-                        update_fields.append("image_url")
-                        update_values["image_url"] = image_url
-                    
-                    # Add updated_at if the column exists
-                    if has_updated_at:
-                        update_fields.append("updated_at")
-                        update_values["updated_at"] = now
-                    
-                    # Build the update query dynamically
-                    set_clause = ", ".join([f"{field} = :{field}" for field in update_fields])
-                    update_query = f"""
-                    UPDATE mo_llm_messages 
-                    SET {set_clause}
+                    logger.error(
+                        f"❌ FAILED TO UPDATE message {message_id} with image URL")
+
+                    # Enhanced diagnostic query with metadata decoded
+                    check_query = """
+                    SELECT id, image_url, metadata, content FROM mo_llm_messages
                     WHERE id = :message_id AND conversation_id = :conversation_id
                     """
-                    
-                    await db.execute(query=update_query, values=update_values)
-                    update_succeeded = True
-                    
-                    # Add this after the database operation
-                    logger.info(f"Successfully updated message with image: message_id={message_id}, image_url={image_url}")
-                    
-                    # Force a notification to ensure frontend knows about the update
-                    try:
-                        await broadcast_to_conversation(
-                            conversation_id,
-                            {
-                                "type": "message_update",
-                                "messageId": message_id,
-                                "updates": {
-                                    "content": message_content,
-                                    "metadata": metadata,
-                                    "image_url": image_url
-                                }
-                            }
-                        )
-                        logger.info(f"Sent message_update WebSocket notification for updated image in conversation {conversation_id}")
-                    except Exception as ws_error:
-                        logger.error(f"WebSocket notification error for message update: {str(ws_error)}")
-                
-                # Send additional notification even though we are using REST polling as a fallback mechanism
-                # This helps ensure the frontend gets notified about the image being ready
-                if update_succeeded:
-                    try:
-                        # Create an image_ready event to notify clients
-                        image_data = {
-                            "type": "image_ready",
-                            "task_id": task_id,
+
+                    check_result = await db.fetch_one(
+                        query=check_query,
+                        values={
                             "message_id": message_id,
-                            "conversation_id": conversation_id,
-                            "image_url": image_url,
-                            "image_id": first_image.get("id"),
-                            "prompt": prompt
+                            "conversation_id": conversation_id
                         }
-                        
-                        # Broadcast to the conversation
-                        await broadcast_to_conversation(conversation_id, image_data)
-                        logger.info(f"Sent image_ready WebSocket notification for task {task_id}")
-                    except Exception as ws_error:
-                        logger.error(f"WebSocket notification error for image_ready: {str(ws_error)}")
-                
-                logger.info(f"Successfully updated conversation message with image URL and metadata")
+                    )
+
+                    if check_result:
+                        # Try to decode metadata JSON for better debugging
+                        metadata_decoded = {}
+                        try:
+                            if check_result['metadata']:
+                                if isinstance(check_result['metadata'], str):
+                                    metadata_decoded = json.loads(check_result['metadata'])
+                                else:
+                                    metadata_decoded = check_result['metadata']
+                        except Exception as json_e:
+                            logger.error(f"Error decoding metadata: {str(json_e)}")
+                            
+                        logger.info(f"MESSAGE EXISTS but update failed. Details:")
+                        logger.info(f"  > ID: {check_result['id']}")
+                        logger.info(f"  > IMAGE URL: {check_result['image_url']}")
+                        logger.info(f"  > CONTENT: {check_result['content'][:100]}...")
+                        logger.info(f"  > RAW METADATA: {check_result['metadata'][:200]}...")
+                        logger.info(f"  > DECODED METADATA: {metadata_decoded}")
+                    else:
+                        logger.error(f"MESSAGE NOT FOUND: id={message_id}, conversation_id={conversation_id}")
+
             except Exception as e:
-                logger.error(f"Error updating message with image: {str(e)}")
-                logger.error(traceback.format_exc())
-                # Continue even if message update fails
-        
-        # Send completed status through streaming generator if available
+                logger.error(f"ERROR UPDATING MESSAGE WITH IMAGE: {str(e)}")
+                logger.error(traceback.format_exc())  # Full stack trace
+
+        # COMMENTED: Send completed status through streaming generator
+        '''
         if streaming_generator:
             try:
                 for img in generated_images:
@@ -630,13 +1033,17 @@ async def generate_image_task(
                     await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error sending completion to streaming generator: {str(e)}")
-                
-        logger.info(f"Completed image generation task {task_id} with {len(generated_images)} images")
-        
+        '''
+
+        logger.info(
+            f"Completed image generation task {task_id} with {len(generated_images)} images")
+
     except Exception as e:
         logger.error(f"Error in image generation task: {str(e)}")
-        
-        # Notify through streaming generator if available
+        logger.error(traceback.format_exc())  # Add full stack trace
+
+        # COMMENTED: Streaming notifications
+        '''
         if streaming_generator:
             try:
                 # Send failure signal in multiple formats for redundancy
@@ -675,7 +1082,8 @@ async def generate_image_task(
                 logger.info(f"Sent 'failed' status signals to streaming generator for task {task_id}")
             except Exception as gen_error:
                 logger.error(f"Error sending failure to streaming generator: {str(gen_error)}")
-        
+        '''
+
         # Update task status to failed
         try:
             await db.execute(
@@ -693,22 +1101,6 @@ async def generate_image_task(
                     "user_id": user_id
                 }
             )
-            
-            # Add a failed stage entry
-            try:
-                failed_stage_query = """
-                INSERT INTO mo_image_stages
-                (task_id, stage_number, completion_percentage, image_path, image_url)
-                VALUES (:task_id, 99, 0, '', NULL)
-                ON CONFLICT (task_id, stage_number) DO NOTHING
-                """
-                await db.execute(
-                    query=failed_stage_query,
-                    values={"task_id": task_id}
-                )
-            except Exception as stage_error:
-                logger.error(f"Error adding failed stage: {str(stage_error)}")
-            
         except Exception as db_error:
             logger.error(f"Failed to update task status: {str(db_error)}")
 
@@ -840,6 +1232,7 @@ async def generate_image(
                 
                 if not existing_msg:
                     # Create a new message with pending status
+                    logger.info(f"__stream__shit Creating new message {message_id}")
                     insert_query = """
                     INSERT INTO mo_llm_messages (
                         id, conversation_id, role, content, created_at, metadata
@@ -861,6 +1254,7 @@ async def generate_image(
                     )
                 else:
                     # Update existing message with pending status
+                    logger.info(f"__stream__shit Updating existing message {message_id}")
                     update_query = """
                     UPDATE mo_llm_messages
                     SET content = :content,

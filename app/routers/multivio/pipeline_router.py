@@ -918,6 +918,7 @@ async def process_streaming_response(context: Dict[str, Any]):
 
                 if existing_message:
                     # Update existing message
+                    logger.info(f"__stream__shit Updating existing message {existing_message['id']}")
                     message_id = existing_message["id"]
                     await db.execute(
                         """
@@ -935,6 +936,7 @@ async def process_streaming_response(context: Dict[str, Any]):
                         f"Updated existing message {message_id} with complete content")
                 else:
                     # Create new message
+                    logger.info(f"__stream__shit Creating new message {message_id}")
                     await db.execute(
                         """
                         INSERT INTO mo_llm_messages (
@@ -1069,6 +1071,7 @@ async def process_streaming_response(context: Dict[str, Any]):
     
     # If we have image tasks, notify client about continuous polling
     if image_generation_tasks:
+        polling_time = datetime.now()
         polling_notification = {
             "type": "polling_required",
             "data": {
@@ -1079,6 +1082,7 @@ async def process_streaming_response(context: Dict[str, Any]):
         }
         yield f"data: {json.dumps(polling_notification)}\n\n"
         sent_polling_notification = True
+        logger.info(f"⏱️ TIMING: Sending polling notification at {polling_time.isoformat()}")
         logger.info(f"__stream__chat Sent polling notification for image tasks: {[task['task_id'] for task in image_generation_tasks]}")
     
     while image_generation_tasks and (datetime.now(timezone.utc) - last_poll_time).total_seconds() < max_wait_time:
@@ -1102,7 +1106,8 @@ async def process_streaming_response(context: Dict[str, Any]):
                 task_status = await db.fetch_one(query=query, values={"task_id": task_id})
                     
                 if task_status:
-                    logger.info(f"__stream__shit Checking image task {task_id}: status={task_status['status']}")
+                    # Commented out noisy log message
+                    # logger.info(f"__stream__shit Checking image task {task_id}: status={task_status['status']}")
                     
                     if task_status["status"] == "completed" and task_status["result"]:
                         # Parse the result JSON
@@ -1178,6 +1183,7 @@ async def process_streaming_response(context: Dict[str, Any]):
                                         metadata["image_status"] = "completed"
                                         
                                         # Update the message
+                                        logger.info(f"__stream__shit Updating message {message_id} with image URL {image_url}")
                                         update_query = """
                                         UPDATE mo_llm_messages 
                                         SET image_url = :image_url, 
@@ -1243,6 +1249,258 @@ async def process_streaming_response(context: Dict[str, Any]):
     yield "data: [DONE]\n\n"
 
 
+# async def process_message_with_pipeline(config: Dict[str, Any]):
+#     """Process message through pipeline and yield formatted chunks"""
+#     # Extract request parameters
+#     message_type = config.get("message_type", "text")
+#     options = config.get("options", {})
+#     conversation_id = config.get("conversation_id")
+#     db = config.get("db")
+#     logger.info(f"Processing message with pipeline: {config}")
+#     # Configure message processing based on message type and options
+#     if message_type == "image":
+#         # For image generation requests
+#         config["intents"] = {"image_generation": {"confidence": 1.0}}
+#     elif message_type == "social":
+#         # For social media content requests
+#         config["intents"] = {"social_media": {"confidence": 1.0}}
+#         if options.get("social_platforms"):
+#             config["social_platforms"] = options["social_platforms"]
+#     elif message_type == "reasoning":
+#         # For reasoning-focused requests
+#         config["reasoning_effort"] = "high"
+#         if options.get("reasoning_model"):
+#             config["model"] = options["reasoning_model"]
+
+#     # Always detect intents for text messages
+#     if message_type == "text":
+#         # intents = detect_intents(config["message"])
+#         raw_probs = await predict_intents(config["message"])
+#         intents = {k: {"confidence": v} for k, v in raw_probs.items()}
+#         # Filter out low-confidence intents
+#         significant_intents = {k: v for k,
+#                                v in intents.items() if v["confidence"] > 0.3}
+#         config["intents"] = significant_intents
+        
+#         # Update message_type based on detected intents
+#         if "image_generation" in significant_intents and significant_intents["image_generation"]["confidence"] > 0.5:
+#             logger.info(f"Updating message_type from 'text' to 'image' based on intent detection")
+#             config["message_type"] = "image"
+#             message_type = "image"  # Update local variable too
+#         elif "social_media" in significant_intents and significant_intents["social_media"]["confidence"] > 0.5:
+#             logger.info(f"Updating message_type from 'text' to 'social' based on intent detection")
+#             config["message_type"] = "social"
+#             message_type = "social"  # Update local variable too
+
+#     # Handle web search option
+#     if options.get("perform_web_search"):
+#         # This would integrate with your web search command
+#         pass
+
+#     # Create pipeline based on intents and message type
+#     pipeline = Pipeline(name="MultiIntentPipeline")
+
+#     # Add commands based on message type and intents
+#     intents_dict = config.get("intents", {})
+
+#     # For calculation
+#     if "calculation" in intents_dict:
+#         pipeline.add_command(CommandFactory.create("calculation"))
+
+#     # For image generation
+#     if message_type == "image" or "image_generation" in intents_dict:
+#         logger.info(f"__stream__shit Adding image generation command")
+#         image_command = CommandFactory.create("image_generation")
+#         if options.get("image_model"):
+#             # Set model in command config
+#             image_command.set_option("model", options["image_model"])
+#         pipeline.add_command(image_command)
+
+#     # For social media
+#     if message_type == "social" or "social_media" in intents_dict:
+#         social_command = CommandFactory.create("social_media")
+#         if options.get("social_platforms"):
+#             # Set platforms in command config
+#             social_command.set_option("platforms", options["social_platforms"])
+#         pipeline.add_command(social_command)
+
+#     # For conversation/general knowledge
+#     if message_type in ["text", "reasoning"] or "conversation" in intents_dict:
+#         if "conversation" in intents_dict:
+#             pipeline.add_command(CommandFactory.create("conversation"))
+
+#         # Add general knowledge command for text responses
+#         if message_type != "image" and message_type != "social":
+#             pipeline.add_command(CommandFactory.create("general_knowledge"))
+
+#     # Execute the pipeline
+#     result_context = await pipeline.execute(config)
+
+#     # Generate a message ID if not already in the context
+#     if "message_id" not in result_context:
+#         result_context["message_id"] = str(uuid.uuid4())
+
+#     # Stream the response
+#     try:
+#         async for chunk in process_streaming_response(result_context):
+#             yield chunk
+
+#         # No need to update message in the database here as that's now handled
+#         # directly in the streaming generator from GeneralKnowledgeCommand
+#     except Exception as e:
+#         logger.error(
+#             f"Error in process_message_with_pipeline streaming: {str(e)}")
+#         # Still yield the error so the client knows something went wrong
+#         yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
+#         yield "data: [DONE]\n\n"
+
+
+# async def process_multi_intent_request(
+#     request: MultiIntentChatRequest,
+#     background_tasks: BackgroundTasks,
+#     current_user: dict,
+#     db: Database
+# ) -> Dict[str, Any]:
+#     logger.info(f"process_multi_intent_request starting: chat_id={request.chat_id}, conversation_id={request.conversation_id}")
+    
+#     # If we have a chat_id, try to fetch content info
+#     if request.chat_id:
+#         try:
+#             content_query = "SELECT id, name, description FROM mo_chat WHERE uuid = :chat_id"
+#             content = await db.fetch_one(content_query, {"chat_id": request.chat_id})
+#             if content:
+#                 logger.info(f"Found content for request: ID={content['id']}, Name='{content['name']}'")
+#         except Exception as e:
+#             logger.error(f"Error fetching content info: {str(e)}")
+#             # Continue processing even if this fails
+#     """
+#     Process a multi-intent request using the pipeline pattern.
+#     """
+#     # Log the user for debugging
+#     logger.info(
+#         f"Processing request for user: {current_user.get('id', current_user.get('uid', 'unknown'))}")
+
+#     # Detect intents in the message
+#     # intents = detect_intents(request.message)
+#     # v2 pending to release
+#     raw_probs = await predict_intents(request.message)
+#     intents = {k: {"confidence": v} for k, v in raw_probs.items()}
+    
+#     # Filter out low-confidence intents for logging
+#     significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
+    
+#     # Filter out web_search and puppeteer intents
+#     if "web_search" in significant_intents:
+#         del significant_intents["web_search"]
+#     if "puppeteer" in significant_intents:
+#         del significant_intents["puppeteer"]
+    
+#     logger.info(f"Detected intents: {list(significant_intents.keys())}")
+
+#     # Create or get conversation
+#     conversation_id = request.conversation_id
+#     if not conversation_id:
+#         title = f"Multi-Intent: {request.message[:30]}..." if len(
+#             request.message) > 30 else request.message
+#         conversation_id = await create_conversation(
+#             db=db,
+#             user_id=current_user.get('id', current_user.get('uid')),
+#             title=title,
+#             chat_id=request.chat_id
+#         )
+
+#     # Store user message in database
+#     user_message_id = str(uuid.uuid4())
+#     now = datetime.now(timezone.utc)
+#     logger.info(f"__stream__shit Storing user message {user_message_id} in database")
+#     await db.execute(
+#         """
+#         INSERT INTO mo_llm_messages (
+#             id, conversation_id, role, content, created_at, metadata
+#         ) VALUES (
+#             :id, :conversation_id, :role, :content, :created_at, :metadata
+#         )
+#         """,
+#         {
+#             "id": user_message_id,
+#             "conversation_id": conversation_id,
+#             "role": "user",
+#             "content": request.message,
+#             "created_at": now,
+#             "metadata": json.dumps({"multi_intent": True, "detected_intents": list(significant_intents.keys())})
+#         }
+#     )
+
+#     # Create initial context
+#     context = {
+#         "message": request.message,
+#         "conversation_id": conversation_id,
+#         "chat_id": request.chat_id,  # Explicitly include chat_id 
+#         "user_id": current_user.get('id', current_user.get('uid')),
+#         "db": db,
+#         "background_tasks": background_tasks,
+#         "current_user": current_user,
+#         "intents": significant_intents,
+#         "model": request.model,
+#         "temperature": request.temperature,
+#         "max_tokens": request.max_tokens,
+#         "reasoning_effort": request.reasoning_effort,
+#         "results": []  # Ensure results list is always initialized
+#     }
+    
+#     # Log the chat_id we're using
+#     logger.info(f"Processing message with chat_id: {request.chat_id}")
+
+#     # Create pipeline based on intents
+#     pipeline = Pipeline(name="MultiIntentPipeline")
+
+#     # REMOVED web search and puppeteer commands    
+
+#     # Initialize skip_general_knowledge flag
+#     skip_general_knowledge = False
+
+#     # REMOVED web search and puppeteer commands
+
+#     # Calculation command for math operations
+#     if "calculation" in significant_intents:
+#         pipeline.add_command(CommandFactory.create("calculation"))
+
+#     # Image generation next (if present)
+#     if "image_generation" in significant_intents:
+#         pipeline.add_command(CommandFactory.create("image_generation"))
+#         # Skip general knowledge for image generation requests
+#         skip_general_knowledge = True
+#         logger.info(
+#             f"Skipping general_knowledge because image_generation intent was detected")
+
+#     # Social media content generation next
+#     if "social_media" in significant_intents:
+#         pipeline.add_command(CommandFactory.create("social_media"))
+#         # Skip general knowledge for social media requests
+#         skip_general_knowledge = True
+#         logger.info(
+#             f"Skipping general_knowledge because social_media intent was detected")
+
+#     # Add conversation command for simple chats/greetings
+#     if "conversation" in significant_intents:
+#         pipeline.add_command(CommandFactory.create("conversation"))
+#         # ALWAYS add general knowledge command when conversation intent is detected
+#         # since conversation command doesn't generate text itself
+#         pipeline.add_command(CommandFactory.create("general_knowledge"))
+#     else:
+#         # Only add general knowledge if we haven't decided to skip it
+#         if not skip_general_knowledge and significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
+#             pipeline.add_command(CommandFactory.create("general_knowledge"))
+
+#     # Execute the pipeline
+#     result_context = await pipeline.execute(context)
+
+#     # Return the context for further processing
+#     return result_context
+
+# ADDED NEW ENDPOINTS FOR CONVERSATION MANAGEMENT
+
+# remove polling
 async def process_message_with_pipeline(config: Dict[str, Any]):
     """Process message through pipeline and yield formatted chunks"""
     # Extract request parameters
@@ -1250,11 +1508,19 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
     options = config.get("options", {})
     conversation_id = config.get("conversation_id")
     db = config.get("db")
-    logger.info(f"Processing message with pipeline: {config}")
+
+    # Add debug logging
+    logger.info(f"ENHANCED processing message with pipeline: {config}")
+    logger.info(
+        f"MESSAGE TYPE: {message_type}, CONVERSATION_ID: {conversation_id}")
+
     # Configure message processing based on message type and options
     if message_type == "image":
         # For image generation requests
         config["intents"] = {"image_generation": {"confidence": 1.0}}
+        # Set image generation mode flag
+        config["image_generation_mode"] = True
+        logger.info("Setting image_generation_mode=True for image request")
     elif message_type == "social":
         # For social media content requests
         config["intents"] = {"social_media": {"confidence": 1.0}}
@@ -1276,10 +1542,21 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
                                v in intents.items() if v["confidence"] > 0.3}
         config["intents"] = significant_intents
 
-    # Handle web search option
-    if options.get("perform_web_search"):
-        # This would integrate with your web search command
-        pass
+        # Update message_type based on detected intents
+        if "image_generation" in significant_intents and significant_intents["image_generation"]["confidence"] > 0.5:
+            logger.info(
+                f"Updating message_type from 'text' to 'image' based on intent detection")
+            config["message_type"] = "image"
+            message_type = "image"  # Update local variable too
+            # Set image generation mode flag
+            config["image_generation_mode"] = True
+            logger.info(
+                "Setting image_generation_mode=True based on intent detection")
+        elif "social_media" in significant_intents and significant_intents["social_media"]["confidence"] > 0.5:
+            logger.info(
+                f"Updating message_type from 'text' to 'social' based on intent detection")
+            config["message_type"] = "social"
+            message_type = "social"  # Update local variable too
 
     # Create pipeline based on intents and message type
     pipeline = Pipeline(name="MultiIntentPipeline")
@@ -1291,13 +1568,26 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
     if "calculation" in intents_dict:
         pipeline.add_command(CommandFactory.create("calculation"))
 
-    # For image generation
+    # For image generation - ENHANCED LOGGING
     if message_type == "image" or "image_generation" in intents_dict:
+        logger.info(f"__ENHANCED_PIPELINE__ Adding image generation command")
         image_command = CommandFactory.create("image_generation")
         if options.get("image_model"):
             # Set model in command config
             image_command.set_option("model", options["image_model"])
         pipeline.add_command(image_command)
+
+        # Make sure we're recording this is an image generation specifically
+        config["is_image_generation"] = True
+
+        # Add assistant message_id to config if it exists
+        if "message_id" in config:
+            logger.info(
+                f"__ENHANCED_PIPELINE__ Using existing message_id {config['message_id']} for image")
+        else:
+            config["message_id"] = str(uuid.uuid4())
+            logger.info(
+                f"__ENHANCED_PIPELINE__ Generated new message_id {config['message_id']} for image")
 
     # For social media
     if message_type == "social" or "social_media" in intents_dict:
@@ -1316,210 +1606,49 @@ async def process_message_with_pipeline(config: Dict[str, Any]):
         if message_type != "image" and message_type != "social":
             pipeline.add_command(CommandFactory.create("general_knowledge"))
 
-    # Execute the pipeline
+    # Execute the pipeline with additional logging
+    logger.info(
+        f"__ENHANCED_PIPELINE__ Executing pipeline for {message_type} message")
     result_context = await pipeline.execute(config)
+    logger.info(
+        f"__ENHANCED_PIPELINE__ Pipeline execution completed, results: {len(result_context.get('results', []))}")
 
     # Generate a message ID if not already in the context
     if "message_id" not in result_context:
         result_context["message_id"] = str(uuid.uuid4())
+        logger.info(
+            f"__ENHANCED_PIPELINE__ Generated message_id {result_context['message_id']} after pipeline execution")
 
-    # Stream the response
+    # For image generation, verify we have the task_id in the message_id mapping
+    if config.get("is_image_generation", False):
+        for result in result_context.get("results", []):
+            if result.get("type") == "image_generation":
+                logger.info(
+                    f"__ENHANCED_PIPELINE__ Image generation result: {result}")
+                image_task_id = result.get("task_id")
+                if image_task_id:
+                    logger.info(
+                        f"__ENHANCED_PIPELINE__ Image task_id {image_task_id} is associated with message_id {result_context['message_id']}")
+                else:
+                    logger.warning(
+                        f"__ENHANCED_PIPELINE__ Image generation result missing task_id")
+
+    # Stream the response with enhanced error handling
     try:
+        logger.info(
+            f"__ENHANCED_PIPELINE__ Starting to stream response for message_id {result_context['message_id']}")
         async for chunk in process_streaming_response(result_context):
             yield chunk
 
-        # No need to update message in the database here as that's now handled
-        # directly in the streaming generator from GeneralKnowledgeCommand
+        logger.info(
+            f"__ENHANCED_PIPELINE__ Completed streaming response for message_id {result_context['message_id']}")
     except Exception as e:
         logger.error(
-            f"Error in process_message_with_pipeline streaming: {str(e)}")
+            f"__ENHANCED_PIPELINE__ Error in process_message_with_pipeline streaming: {str(e)}")
+        logger.error(traceback.format_exc())  # Add stack trace
         # Still yield the error so the client knows something went wrong
         yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
         yield "data: [DONE]\n\n"
-
-
-async def process_multi_intent_request(
-    request: MultiIntentChatRequest,
-    background_tasks: BackgroundTasks,
-    current_user: dict,
-    db: Database
-) -> Dict[str, Any]:
-    logger.info(f"process_multi_intent_request starting: chat_id={request.chat_id}, conversation_id={request.conversation_id}")
-    
-    # If we have a chat_id, try to fetch content info
-    if request.chat_id:
-        try:
-            content_query = "SELECT id, name, description FROM mo_chat WHERE uuid = :chat_id"
-            content = await db.fetch_one(content_query, {"chat_id": request.chat_id})
-            if content:
-                logger.info(f"Found content for request: ID={content['id']}, Name='{content['name']}'")
-        except Exception as e:
-            logger.error(f"Error fetching content info: {str(e)}")
-            # Continue processing even if this fails
-    """
-    Process a multi-intent request using the pipeline pattern.
-    """
-    # Log the user for debugging
-    logger.info(
-        f"Processing request for user: {current_user.get('id', current_user.get('uid', 'unknown'))}")
-
-    # Detect intents in the message
-    # intents = detect_intents(request.message)
-    # v2 pending to release
-    raw_probs = await predict_intents(request.message)
-    intents = {k: {"confidence": v} for k, v in raw_probs.items()}
-    
-    # Filter out low-confidence intents for logging
-    significant_intents = {k: v for k, v in intents.items() if v["confidence"] > 0.3}
-    
-    # Filter out web_search and puppeteer intents
-    if "web_search" in significant_intents:
-        del significant_intents["web_search"]
-    if "puppeteer" in significant_intents:
-        del significant_intents["puppeteer"]
-    
-    logger.info(f"Detected intents: {list(significant_intents.keys())}")
-
-    # Create or get conversation
-    conversation_id = request.conversation_id
-    if not conversation_id:
-        title = f"Multi-Intent: {request.message[:30]}..." if len(
-            request.message) > 30 else request.message
-        conversation_id = await create_conversation(
-            db=db,
-            user_id=current_user.get('id', current_user.get('uid')),
-            title=title,
-            chat_id=request.chat_id
-        )
-
-    # Store user message in database
-    user_message_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-
-    await db.execute(
-        """
-        INSERT INTO mo_llm_messages (
-            id, conversation_id, role, content, created_at, metadata
-        ) VALUES (
-            :id, :conversation_id, :role, :content, :created_at, :metadata
-        )
-        """,
-        {
-            "id": user_message_id,
-            "conversation_id": conversation_id,
-            "role": "user",
-            "content": request.message,
-            "created_at": now,
-            "metadata": json.dumps({"multi_intent": True, "detected_intents": list(significant_intents.keys())})
-        }
-    )
-
-    # Create initial context
-    context = {
-        "message": request.message,
-        "conversation_id": conversation_id,
-        "chat_id": request.chat_id,  # Explicitly include chat_id 
-        "user_id": current_user.get('id', current_user.get('uid')),
-        "db": db,
-        "background_tasks": background_tasks,
-        "current_user": current_user,
-        "intents": significant_intents,
-        "model": request.model,
-        "temperature": request.temperature,
-        "max_tokens": request.max_tokens,
-        "reasoning_effort": request.reasoning_effort,
-        "results": []  # Ensure results list is always initialized
-    }
-    
-    # Log the chat_id we're using
-    logger.info(f"Processing message with chat_id: {request.chat_id}")
-
-    # Create pipeline based on intents
-    pipeline = Pipeline(name="MultiIntentPipeline")
-
-    # REMOVED web search and puppeteer commands    
-
-    # Initialize skip_general_knowledge flag
-    skip_general_knowledge = False
-
-    # REMOVED web search and puppeteer commands
-
-    # Calculation command for math operations
-    if "calculation" in significant_intents:
-        pipeline.add_command(CommandFactory.create("calculation"))
-
-    # Image generation next (if present)
-    if "image_generation" in significant_intents:
-        pipeline.add_command(CommandFactory.create("image_generation"))
-        # Skip general knowledge for image generation requests
-        skip_general_knowledge = True
-        logger.info(
-            f"Skipping general_knowledge because image_generation intent was detected")
-
-    # Social media content generation next
-    if "social_media" in significant_intents:
-        pipeline.add_command(CommandFactory.create("social_media"))
-        # Skip general knowledge for social media requests
-        skip_general_knowledge = True
-        logger.info(
-            f"Skipping general_knowledge because social_media intent was detected")
-
-    # Add conversation command for simple chats/greetings
-    if "conversation" in significant_intents:
-        pipeline.add_command(CommandFactory.create("conversation"))
-        # ALWAYS add general knowledge command when conversation intent is detected
-        # since conversation command doesn't generate text itself
-        pipeline.add_command(CommandFactory.create("general_knowledge"))
-    else:
-        # Only add general knowledge if we haven't decided to skip it
-        if not skip_general_knowledge and significant_intents.get("general_knowledge", {}).get("confidence", 0) > 0.3:
-            pipeline.add_command(CommandFactory.create("general_knowledge"))
-
-    # Execute the pipeline
-    result_context = await pipeline.execute(context)
-
-    # Return the context for further processing
-    return result_context
-
-# ADDED NEW ENDPOINTS FOR CONVERSATION MANAGEMENT
-
-
-# Legacy endpoint - but use new implementation internally for safety
-# @router.post("/conversation")
-# async def create_conversation(
-#     request: GetOrCreateConversationRequest,
-#     idempotency_key: Optional[str] = Header(None),
-#     db: Database = Depends(get_database),
-#     current_user: dict = Depends(get_current_user)
-# ):
-#     """Create a new conversation - using the get-or-create pattern internally"""
-#     # Reuse the idempotent endpoint to avoid duplicates
-#     return await get_or_create_conversation_endpoint(request, idempotency_key, db, current_user)
-
-
-# @router.post("/conversation/get-or-create")
-# @idempotent("get_or_create_conversation")
-# async def get_or_create_conversation_endpoint(
-#     request: GetOrCreateConversationRequest,
-#     idempotency_key: Optional[str] = Header(None),
-#     db: Database = Depends(get_database),
-#     current_user: dict = Depends(get_current_user)
-# ):
-#     """Get an existing conversation or create a new one with idempotency support"""
-#     user_id = current_user.get("uid")
-#     # if not user_id:
-#     #     logger.warning("Using fallback user: qbrm9IljDFdmGPVlw3ri3eLMVIA2")
-#     #     user_id = "qbrm9IljDFdmGPVlw3ri3eLMVIA2"
-#     logger.info(f"get_or_create_conversation_endpoint starting: chat_id={request.chat_id}, user_id={user_id}, model_id={request.model_id}, title={request}")
-
-#     conversation_id = await get_or_create_conversation(
-#         request.chat_id, user_id, request.model_id, request.title, db
-#     )
-
-#     return {"id": conversation_id, "chat_id": request.chat_id, "user_id": user_id}
-
-
-# Endpoint removed - consolidated into get_conversation_by_content
 
 # Get a conversation by content ID
 @router.get("/conversation/by-content/{chat_id}")
@@ -1746,6 +1875,7 @@ async def multi_intent_chat(
         )
         
         # Only insert if no recent message exists
+        logger.info(f"__stream__shit Checking if message {message_id} exists")
         if not existing_message:
             # Store the assistant message
             await db.execute(
@@ -1900,6 +2030,7 @@ async def stream_multi_intent_chat(
         }
         
         # Store the user message
+        logger.info(f"__stream__shit Storing user message {user_message_id} in database")
         await db.execute(
             """
             INSERT INTO mo_llm_messages (
@@ -1930,8 +2061,8 @@ async def stream_multi_intent_chat(
         "background_tasks": background_tasks,
         "current_user": current_user,
         "results": [],
-            "image_generation_mode": True  # Flag for special handling of image generation
-            }
+        "image_generation_mode": request.message_type == "image"  # Flag for special handling of image generation
+        }
         
         # Create assistant message placeholder
         assistant_message_id = str(uuid.uuid4())
@@ -1950,6 +2081,7 @@ async def stream_multi_intent_chat(
             logger.info(f"Created message with reasoning_enabled=True")
         
         # We'll update this with content later
+        logger.info(f"__stream__shit Storing assistant message {assistant_message_id} in database")
         await db.execute(
             """
             INSERT INTO mo_llm_messages (
@@ -1967,6 +2099,10 @@ async def stream_multi_intent_chat(
                 "metadata": json.dumps(metadata)
             }
         )
+        
+        # CRITICAL: Add the message_id to the config to ensure it's used throughout the pipeline
+        config["message_id"] = assistant_message_id
+        logger.info(f"__stream__critical Added assistant_message_id {assistant_message_id} to pipeline config")
         
         # Return streaming response
         return StreamingResponse(

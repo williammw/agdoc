@@ -321,6 +321,7 @@ class GeneralKnowledgeCommand(Command):
                 if existing_message:
                     # Update existing message
                     message_id = existing_message["id"]
+                    logger.info(f"__stream__shit Updating existing message {message_id}")
                     await db.execute(
                         """
                         UPDATE mo_llm_messages
