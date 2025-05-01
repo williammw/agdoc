@@ -3134,3 +3134,111 @@ async def init_conversation(
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500, detail=f"Failed to create new thread: {str(e)}")
+
+class SaveMessageRequest(BaseModel):
+    message_id: str
+    conversation_id: str
+    content: str
+    role: Optional[str] = "assistant"
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "message_id": "msg_123",
+                "conversation_id": "conv_456",
+                "content": "Hello, how can I help you?",
+                "role": "assistant",
+                "metadata": {"source": "api"}
+            }
+        }
+    }
+
+@router.post("/message/save")
+async def save_message(
+    message_data: SaveMessageRequest,
+    user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Explicitly save a message that may have failed to save during streaming"""
+    try:
+        # First check if message already exists
+        check_query = """
+        SELECT id FROM mo_llm_messages 
+        WHERE id = :message_id
+        """
+        existing = await db.fetch_one(
+            query=check_query, 
+            values={"message_id": message_data.message_id}
+        )
+        
+        if existing:
+            # Message exists, update it
+            update_query = """
+            UPDATE mo_llm_messages
+            SET content = :content, metadata = :metadata
+            WHERE id = :message_id
+            RETURNING id
+            """
+            result = await db.fetch_one(
+                query=update_query,
+                values={
+                    "message_id": message_data.message_id,
+                    "content": message_data.content,
+                    "metadata": json.dumps(message_data.metadata)
+                }
+            )
+            return {"message": "Message updated", "id": result["id"]}
+        else:
+            # Message doesn't exist, create it
+            insert_query = """
+            INSERT INTO mo_llm_messages (
+                id, conversation_id, role, content, created_at, metadata
+            ) VALUES (
+                :message_id, :conversation_id, :role, :content, 
+                CURRENT_TIMESTAMP, :metadata
+            ) RETURNING id
+            """
+            result = await db.fetch_one(
+                query=insert_query,
+                values={
+                    "message_id": message_data.message_id,
+                    "conversation_id": message_data.conversation_id,
+                    "role": message_data.role,
+                    "content": message_data.content,
+                    "metadata": json.dumps(message_data.metadata)
+                }
+            )
+            return {"message": "Message created", "id": result["id"]}
+            
+    except Exception as e:
+        logger.error(f"Error in save_message: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/message/{message_id}")
+async def get_message(
+    message_id: str,
+    user: dict = Depends(get_current_user),
+    db: Database = Depends(get_database)
+):
+    """Get a specific message by ID"""
+    try:
+        query = """
+        SELECT * FROM mo_llm_messages 
+        WHERE id = :message_id
+        """
+        message = await db.fetch_one(
+            query=query,
+            values={"message_id": message_id}
+        )
+        
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+            
+        return dict(message)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_message: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
