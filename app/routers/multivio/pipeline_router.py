@@ -1741,6 +1741,125 @@ async def get_conversation_by_content(
             }
         )
 
+class BulkChatIdsRequest(BaseModel):
+    chat_ids: List[str]
+    
+    model_config = {
+        'protected_namespaces': ()
+    }
+
+@router.post("/conversations/bulk")
+async def get_conversations_bulk(
+    request: BulkChatIdsRequest,
+    current_user: dict = Depends(get_user),
+    db: Database = Depends(get_database)
+):
+    """Get conversations and messages for multiple chat IDs in a single request"""
+    try:
+        # Get user ID
+        user_id = current_user.get("uid")
+        
+        if not request.chat_ids:
+            return {"conversations": {}, "found": False}
+            
+        logger.info(f"Fetching bulk conversations for {len(request.chat_ids)} chat IDs")
+        
+        # Single SQL query to get all conversations and their messages
+        # Using a WITH clause for cleaner SQL
+        query = """
+        WITH conversations AS (
+            SELECT c.id, c.user_id, c.chat_id, c.model_id, c.title, 
+                  c.created_at, c.updated_at, c.metadata
+            FROM mo_llm_conversations c
+            WHERE c.chat_id = ANY(:chat_ids) 
+            AND c.user_id = :user_id
+            ORDER BY c.created_at DESC
+        )
+        SELECT 
+            c.id as conversation_id, c.user_id, c.chat_id, c.model_id, c.title,
+            c.created_at as conversation_created_at, c.updated_at, c.metadata as conversation_metadata,
+            m.id as message_id, m.role, m.content as message_content,
+            m.created_at as message_created_at, m.function_call,
+            m.metadata as message_metadata, m.image_url, m.image_metadata
+        FROM conversations c
+        LEFT JOIN mo_llm_messages m ON c.id = m.conversation_id
+        ORDER BY c.created_at DESC, m.created_at ASC
+        """
+        
+        results = await db.fetch_all(
+            query=query, 
+            values={
+                "chat_ids": request.chat_ids,
+                "user_id": user_id
+            }
+        )
+        
+        if not results:
+            return {"conversations": {}, "found": False}
+            
+        # Organize results by chat_id
+        organized_data = {}
+        
+        for row in results:
+            chat_id = row["chat_id"]
+            conversation_id = row["conversation_id"]
+            
+            # Initialize conversation data if not exists
+            if chat_id not in organized_data:
+                organized_data[chat_id] = {
+                    "conversation": {
+                        "id": conversation_id,
+                        "user_id": row["user_id"],
+                        "chat_id": chat_id,
+                        "model_id": row["model_id"],
+                        "title": row["title"],
+                        "created_at": row["conversation_created_at"],
+                        "updated_at": row["updated_at"],
+                        "metadata": row["conversation_metadata"]
+                    },
+                    "messages": []
+                }
+            
+            # Add message data if it exists
+            if row["message_id"]:
+                message = {
+                    "id": row["message_id"],
+                    "role": row["role"],
+                    "content": row["message_content"],
+                    "created_at": row["message_created_at"],
+                    "function_call": row["function_call"],
+                    "metadata": row["message_metadata"],
+                    "image_url": row["image_url"],
+                    "image_metadata": row["image_metadata"]
+                }
+                
+                # Process metadata and function_call as JSON if they're strings
+                for field in ["metadata", "function_call"]:
+                    if message[field] and isinstance(message[field], str):
+                        try:
+                            message[field] = json.loads(message[field])
+                        except json.JSONDecodeError:
+                            pass
+                
+                organized_data[chat_id]["messages"].append(message)
+        
+        return {
+            "conversations": organized_data,
+            "found": True,
+            "cached": False
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_conversations_bulk: {str(e)}")
+        logger.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "error": f"Error retrieving bulk conversations: {str(e)}",
+                "trace": traceback.format_exc()
+            }
+        )
+
 
 @router.get("/conversation/{conversation_id}")
 async def get_conversation(

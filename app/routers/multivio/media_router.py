@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timezone, timedelta, date
 import logging
 from app.dependencies import get_current_user, get_database
-from databases import Database
 import boto3
 import os
 import uuid
@@ -109,7 +108,6 @@ def configure_r2_cors():
         print(f"Error configuring CORS: {str(e)}")
 
 
-
 router = APIRouter()
 
 
@@ -124,30 +122,40 @@ async def get_files(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Get files with filtering, sorting and pagination"""
     try:
         # Build base query
-        conditions = ["created_by = :user_id", "is_deleted = false"]
-        params = {"user_id": current_user["uid"]}
+        query = db.table("mo_assets").select("*").eq("created_by", current_user["uid"]).eq("is_deleted", False)
 
         # Add filters
         if folder_id:
-            conditions.append("folder_id = :folder_id")
-            params["folder_id"] = folder_id
-
+            query = query.eq("folder_id", folder_id)
+        
         if type:
-            conditions.append("type = :type")
-            params["type"] = type
-
+            query = query.eq("type", type)
+            
         if search:
-            conditions.append("name ILIKE :search")
-            params["search"] = f"%{search}%"
-
-        # Build WHERE clause
-        where_clause = " AND ".join(conditions)
-
+            query = query.ilike("name", f"%{search}%")
+        
+        # Get count for pagination with a separate query
+        count_query = db.table("mo_assets").select("id").eq("created_by", current_user["uid"]).eq("is_deleted", False)
+        
+        # Apply the same filters to count query
+        if folder_id:
+            count_query = count_query.eq("folder_id", folder_id)
+        
+        if type:
+            count_query = count_query.eq("type", type)
+            
+        if search:
+            count_query = count_query.ilike("name", f"%{search}%")
+        
+        # Execute count query - synchronous, not awaitable
+        count_result = count_query.execute()
+        total = len(count_result.data) if count_result.data else 0
+        
         # Map sort fields
         sort_field_map = {
             "name": "name",
@@ -157,35 +165,18 @@ async def get_files(
             "usage": "usage_count"
         }
         sort_field = sort_field_map.get(sort_by, "created_at")
-
-        # Get total count
-        count_query = f"""
-        SELECT COUNT(*) as total
-        FROM mo_assets
-        WHERE {where_clause}
-        """
-        count = await db.fetch_one(count_query, params)
-        total = count["total"] if count else 0
-
-        # Get files with pagination
-        query = f"""
-        SELECT *
-        FROM mo_assets
-        WHERE {where_clause}
-        ORDER BY {sort_field} {sort_order}
-        LIMIT :limit OFFSET :offset
-        """
-
-        params["limit"] = limit
-        params["offset"] = (page - 1) * limit
-
-        files = await db.fetch_all(query, params)
-
+        
+        # Apply sorting and pagination
+        query = query.order(sort_field, desc=(sort_order.lower() == "desc"))
+        query = query.range((page-1)*limit, page*limit-1)
+        
+        # Execute the query - synchronous, not awaitable
+        result = query.execute()
+        
         return {
-            "files": [dict(f) for f in files],
+            "files": result.data,
             "total": total
         }
-
     except Exception as e:
         logger.error(f"Error in get_files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,29 +186,17 @@ async def get_files(
 async def get_file(
     file_id: str,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Get a specific file"""
     try:
-        query = """
-        SELECT * FROM mo_assets
-        WHERE id = :file_id 
-        AND created_by = :user_id 
-        AND is_deleted = false
-        """
+        result = db.table("mo_assets").select("*").eq("id", file_id) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).single().execute()
 
-        file = await db.fetch_one(
-            query=query,
-            values={
-                "file_id": file_id,
-                "user_id": current_user["uid"]
-            }
-        )
-
-        if not file:
+        if not result.data:
             raise HTTPException(status_code=404, detail="File not found")
 
-        return dict(file)
+        return result.data
 
     except HTTPException:
         raise
@@ -231,82 +210,51 @@ async def update_file(
     file_id: str,
     file: MediaUpdate,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Update a file"""
     try:
         # Verify file exists and belongs to user
-        verify_query = """
-        SELECT id FROM mo_assets 
-        WHERE id = :file_id 
-        AND created_by = :user_id 
-        AND is_deleted = false
-        """
-        exists = await db.fetch_one(
-            query=verify_query,
-            values={
-                "file_id": file_id,
-                "user_id": current_user["uid"]
-            }
-        )
-        if not exists:
+        exists = db.table("mo_assets").select("id").eq("id", file_id) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
+            
+        if not exists.data:
             raise HTTPException(status_code=404, detail="File not found")
 
         # Verify folder if specified
         if file.folder_id:
-            folder_query = """
-            SELECT id FROM mo_folders 
-            WHERE id = :folder_id 
-            AND created_by = :user_id 
-            AND is_deleted = false
-            """
-            folder = await db.fetch_one(
-                query=folder_query,
-                values={
-                    "folder_id": file.folder_id,
-                    "user_id": current_user["uid"]
-                }
-            )
-            if not folder:
+            folder = db.table("mo_folders").select("id").eq("id", file.folder_id) \
+                .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
+                
+            if not folder.data:
                 raise HTTPException(status_code=404, detail="Folder not found")
 
-        # Update the file
-        update_parts = []
-        values = {
-            "file_id": file_id,
-            "user_id": current_user["uid"]
-        }
-
+        # Prepare update data
+        update_data = {}
+        
         if file.name is not None:
-            update_parts.append("name = :name")
-            values["name"] = file.name
-
+            update_data["name"] = file.name
+            
         if file.folder_id is not None:
-            update_parts.append("folder_id = :folder_id")
-            values["folder_id"] = file.folder_id
-
+            update_data["folder_id"] = file.folder_id
+            
         if file.metadata is not None:
-            update_parts.append("metadata = :metadata")
-            values["metadata"] = file.metadata
-
-        if not update_parts:
+            update_data["metadata"] = file.metadata
+            
+        if not update_data:
             return await get_file(file_id, current_user, db)
-
-        update_parts.append("updated_at = CURRENT_TIMESTAMP")
-        update_query = f"""
-        UPDATE mo_assets
-        SET {", ".join(update_parts)}
-        WHERE id = :file_id
-        AND created_by = :user_id
-        AND is_deleted = false
-        RETURNING *
-        """
-
-        result = await db.fetch_one(update_query, values)
-        if not result:
+            
+        # Add updated timestamp
+        update_data["updated_at"] = datetime.now().isoformat()
+        
+        # Perform update
+        result = db.table("mo_assets").update(update_data).eq("id", file_id) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).single().execute()
+            
+        if not result.data:
             raise HTTPException(status_code=404, detail="File not found")
-
-        return dict(result)
+            
+        return result.data
 
     except HTTPException:
         raise
@@ -319,32 +267,25 @@ async def update_file(
 async def delete_files(
     file_ids: List[str] = Body(...),
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Delete multiple files"""
     try:
-        verify_query = """
-        SELECT id FROM mo_assets
-        WHERE id = ANY(:file_ids)
-        AND created_by = :user_id
-        AND is_deleted = false
-        """
-        files = await db.fetch_all(
-            verify_query,
-            {"file_ids": file_ids, "user_id": current_user["uid"]}
-        )
-
-        if len(files) != len(file_ids):
+        # Verify files exist and belong to user
+        files = db.table("mo_assets").select("id").in_("id", file_ids) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
+            
+        if len(files.data) != len(file_ids):
             raise HTTPException(status_code=404, detail="One or more files not found")
 
-        await db.execute(
-            """
-            UPDATE mo_assets
-            SET is_deleted = true, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ANY(:file_ids) AND created_by = :user_id
-            """,
-            {"file_ids": file_ids, "user_id": current_user["uid"]}
-        )
+        # Perform soft delete
+        update_data = {
+            "is_deleted": True,
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        db.table("mo_assets").update(update_data).in_("id", file_ids) \
+            .eq("created_by", current_user["uid"]).execute()
 
         return {"success": True}
     except HTTPException:
@@ -358,7 +299,7 @@ async def delete_files(
 async def move_files(
     payload: dict = Body(...),  # This will parse the request body
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Move files to a different folder"""
     try:
@@ -369,56 +310,28 @@ async def move_files(
             raise HTTPException(status_code=400, detail="No files specified")
 
         # Verify files exist and belong to user
-        verify_query = """
-        SELECT id FROM mo_assets
-        WHERE id = ANY(:file_ids)
-        AND created_by = :user_id
-        AND is_deleted = false
-        """
-        files = await db.fetch_all(
-            verify_query,
-            {"file_ids": file_ids, "user_id": current_user["uid"]}
-        )
-
-        if len(files) != len(file_ids):
-            raise HTTPException(
-                status_code=404, detail="One or more files not found")
+        files = db.table("mo_assets").select("id").in_("id", file_ids) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
+            
+        if len(files.data) != len(file_ids):
+            raise HTTPException(status_code=404, detail="One or more files not found")
 
         # Verify target folder if specified
         if folder_id:
-            folder_query = """
-            SELECT id FROM mo_folders
-            WHERE id = :folder_id
-            AND created_by = :user_id
-            AND is_deleted = false
-            """
-            folder = await db.fetch_one(
-                folder_query,
-                {"folder_id": folder_id, "user_id": current_user["uid"]}
-            )
-            if not folder:
-                raise HTTPException(
-                    status_code=404, detail="Target folder not found")
+            folder = db.table("mo_folders").select("id").eq("id", folder_id) \
+                .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
+                
+            if not folder.data:
+                raise HTTPException(status_code=404, detail="Target folder not found")
 
-        # Move the files
-        move_query = """
-        UPDATE mo_assets
-        SET 
-            folder_id = :folder_id,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ANY(:file_ids)
-        AND created_by = :user_id
-        AND is_deleted = false
-        """
-
-        await db.execute(
-            move_query,
-            {
-                "file_ids": file_ids,
-                "folder_id": folder_id,
-                "user_id": current_user["uid"]
-            }
-        )
+        # Move files
+        update_data = {
+            "folder_id": folder_id,
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        db.table("mo_assets").update(update_data).in_("id", file_ids) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
 
         return {"success": True}
 
@@ -432,7 +345,7 @@ async def move_files(
 async def get_presigned_url(
     request: PresignedUrlRequest,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     try:
         # Generate unique key
@@ -456,19 +369,7 @@ async def get_presigned_url(
             logger.info(f"Generated presigned URL: {presigned_url}")
 
             # Insert record
-            query = """
-                INSERT INTO mo_assets (
-                    id, name, type, url, content_type, original_name,
-                    file_size, folder_id, created_by, processing_status,
-                    is_deleted, created_at, updated_at
-                ) VALUES (
-                    :id, :name, :type, :url, :content_type, :original_name,
-                    :file_size, :folder_id, :created_by, :processing_status,
-                    false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                )
-            """
-
-            values = {
+            asset_data = {
                 "id": asset_id,
                 "name": request.filename,
                 "type": request.content_type.split('/')[0],
@@ -478,10 +379,13 @@ async def get_presigned_url(
                 "file_size": 0,
                 "folder_id": request.folder_id,
                 "created_by": current_user["uid"],
-                "processing_status": 'pending'
+                "processing_status": 'pending',
+                "is_deleted": False,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat()
             }
 
-            await db.execute(query, values)
+            db.table("mo_assets").insert(asset_data).execute()
 
             return {
                 "url": presigned_url,
@@ -500,7 +404,7 @@ async def get_presigned_url(
         logger.error(f"Error in get_presigned_url: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_media_file(asset_id: str, key: str, content_type: str, db: Database = Depends(get_database)):
+async def process_media_file(asset_id: str, key: str, content_type: str, db = Depends(get_database)):
     try:
         # Download from R2
         local_path = f"/tmp/{os.path.basename(key)}"
@@ -519,72 +423,48 @@ async def process_media_file(asset_id: str, key: str, content_type: str, db: Dat
             thumbnail_key = generate_video_thumbnail(local_path, key)
 
         # Update asset with metadata
-        await db.execute("""
-            UPDATE mo_assets 
-            SET processing_status = 'completed',
-                metadata = $1,
-                thumbnail_url = $2
-            WHERE id = $3
-            """,
-                json.dumps(metadata),
-                f"https://{CDN_DOMAIN}/{thumbnail_key}" if thumbnail_key else None,
-                asset_id
-                )
+        update_data = {
+            "processing_status": "completed",
+            "metadata": metadata
+        }
+        
+        if thumbnail_key:
+            update_data["thumbnail_url"] = f"https://{CDN_DOMAIN}/{thumbnail_key}"
+            
+        await db.table("mo_assets").update(update_data).eq("id", asset_id).execute()
 
     except Exception as e:
         # Update asset with error
-        await db.execute("""
-            UPDATE mo_assets 
-            SET processing_status = 'failed',
-                processing_error = $1
-            WHERE id = $2
-            """,
-                str(e), asset_id
-                )
+        await db.table("mo_assets").update({
+            "processing_status": "failed",
+            "processing_error": str(e)
+        }).eq("id", asset_id).execute()
     finally:
         # Cleanup
         if os.path.exists(local_path):
             os.remove(local_path)
 
 
-@router.get("/test-r2-cors")
-async def test_r2_cors():
-    try:
-        # Get current CORS configuration
-        cors = s3_client.get_bucket_cors(Bucket=bucket_name)
-        return {"current_cors_config": cors}
-    except Exception as e:
-        return {"error": str(e), "type": type(e).__name__}
-
-
-
-
 @router.delete("/files/{file_id}")
 async def delete_file(
     file_id: str, 
     current_user: dict = Depends(get_current_user), 
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Delete a single file"""
     try:
         # Verify file exists and belongs to user
-        file = await db.fetch_one(
-            "SELECT id FROM mo_assets WHERE id = :file_id AND created_by = :user_id AND is_deleted = false",
-            {"file_id": file_id, "user_id": current_user["uid"]}
-        )
+        file = db.table("mo_assets").select("id").eq("id", file_id) \
+            .eq("created_by", current_user["uid"]).eq("is_deleted", False).execute()
 
-        if not file:
+        if not file.data:
             raise HTTPException(status_code=404, detail="File not found")
 
         # Soft delete
-        await db.execute(
-            """
-            UPDATE mo_assets 
-            SET is_deleted = true, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = :file_id AND created_by = :user_id
-            """,
-            {"file_id": file_id, "user_id": current_user["uid"]}
-        )
+        db.table("mo_assets").update({
+            "is_deleted": True,
+            "updated_at": datetime.now().isoformat()
+        }).eq("id", file_id).eq("created_by", current_user["uid"]).execute()
 
         return {"success": True}
     except HTTPException:
@@ -593,74 +473,64 @@ async def delete_file(
         logger.error(f"Delete error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def check_and_update_quota(db: Database, user_id: str) -> bool:
+def check_and_update_quota(db, user_id: str) -> bool:
     """Check if user has remaining quota and update usage."""
     # Check if user has a quota record
-    query = """
-    SELECT * FROM mo_image_quotas WHERE user_id = :user_id
-    """
-    quota = await db.fetch_one(query=query, values={"user_id": user_id})
+    quota_result = db.table("mo_image_quotas").select("*").eq("user_id", user_id).execute()
     
     today = date.today()
     
     # If no quota record exists, create one
-    if not quota:
-        insert_query = """
-        INSERT INTO mo_image_quotas 
-        (user_id, daily_limit, daily_used, monthly_limit, monthly_used, last_reset_date)
-        VALUES (:user_id, 10, 0, 100, 0, :today)
-        RETURNING *
-        """
-        quota = await db.fetch_one(
-            query=insert_query, 
-            values={"user_id": user_id, "today": today}
-        )
+    if not quota_result.data:
+        new_quota = {
+            "user_id": user_id,
+            "daily_limit": 10,
+            "daily_used": 0,
+            "monthly_limit": 100,
+            "monthly_used": 0,
+            "last_reset_date": today.isoformat()
+        }
+        
+        quota_result = db.table("mo_image_quotas").insert(new_quota).select().execute()
+        quota = quota_result.data[0] if quota_result.data else None
+    else:
+        quota = quota_result.data[0]
     
-    # Convert to dict for easier access
-    quota = dict(quota)
+    # Parse date string to date object if it's a string
+    last_reset_date = quota["last_reset_date"]
+    if isinstance(last_reset_date, str):
+        last_reset_date = date.fromisoformat(last_reset_date)
     
     # Check if we need to reset daily counter
-    if quota["last_reset_date"] < today:
-        update_query = """
-        UPDATE mo_image_quotas
-        SET daily_used = 0, last_reset_date = :today
-        WHERE user_id = :user_id
-        RETURNING *
-        """
-        quota = await db.fetch_one(
-            query=update_query,
-            values={"user_id": user_id, "today": today}
-        )
-        quota = dict(quota)
+    if last_reset_date < today:
+        db.table("mo_image_quotas").update({
+            "daily_used": 0,
+            "last_reset_date": today.isoformat()
+        }).eq("user_id", user_id).execute()
+        
+        # Refresh quota data
+        quota_result = db.table("mo_image_quotas").select("*").eq("user_id", user_id).execute()
+        quota = quota_result.data[0]
     
     # Check if we need to reset monthly counter (first day of month)
-    if today.day == 1 and quota["last_reset_date"].month != today.month:
-        update_query = """
-        UPDATE mo_image_quotas
-        SET monthly_used = 0
-        WHERE user_id = :user_id
-        RETURNING *
-        """
-        quota = await db.fetch_one(
-            query=update_query,
-            values={"user_id": user_id}
-        )
-        quota = dict(quota)
+    if today.day == 1 and last_reset_date.month != today.month:
+        db.table("mo_image_quotas").update({
+            "monthly_used": 0
+        }).eq("user_id", user_id).execute()
+        
+        # Refresh quota data
+        quota_result = db.table("mo_image_quotas").select("*").eq("user_id", user_id).execute()
+        quota = quota_result.data[0]
     
     # Check if user has exceeded quotas
-    if quota["daily_used"] >= quota["daily_limit"]:
-        return False
-    
-    if quota["monthly_used"] >= quota["monthly_limit"]:
+    if quota["daily_used"] >= quota["daily_limit"] or quota["monthly_used"] >= quota["monthly_limit"]:
         return False
     
     # Update usage counters
-    update_query = """
-    UPDATE mo_image_quotas
-    SET daily_used = daily_used + 1, monthly_used = monthly_used + 1
-    WHERE user_id = :user_id
-    """
-    await db.execute(query=update_query, values={"user_id": user_id})
+    db.table("mo_image_quotas").update({
+        "daily_used": quota["daily_used"] + 1,
+        "monthly_used": quota["monthly_used"] + 1
+    }).eq("user_id", user_id).execute()
     
     return True
 
@@ -669,13 +539,13 @@ async def generate_image(
     request: ImageGenerationRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Initiate image generation process with REST approach."""
     try:
         # Check user quota
         user_id = current_user["uid"]
-        has_quota = await check_and_update_quota(db, user_id)
+        has_quota = check_and_update_quota(db, user_id)
         
         if not has_quota:
             raise HTTPException(
@@ -705,18 +575,10 @@ async def generate_image(
             api_data["height"] = height
         
         # Store the task in the database
-        query = """
-        INSERT INTO mo_ai_tasks (
-            id, type, parameters, status, created_by, created_at, updated_at
-        ) VALUES (
-            :id, :type, :parameters, :status, :created_by, :created_at, :updated_at
-        )
-        """
-        
-        values = {
+        task_data = {
             "id": task_id,
             "type": "image_generation",
-            "parameters": json.dumps({
+            "parameters": {
                 "prompt": request.prompt,
                 "negative_prompt": request.negative_prompt,
                 "size": request.size,
@@ -724,27 +586,25 @@ async def generate_image(
                 "num_images": request.num_images,
                 "folder_id": request.folder_id,
                 "disable_safety_checker": request.disable_safety_checker
-            }),
+            },
             "status": "processing",
             "created_by": user_id,
-            "created_at": now,
-            "updated_at": now
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat()
         }
         
-        await db.execute(query=query, values=values)
+        db.table("mo_ai_tasks").insert(task_data).execute()
         
         # Create initial stage record at 0%
-        stage_query = """
-        INSERT INTO mo_image_stages
-        (task_id, stage_number, completion_percentage, image_path, image_url)
-        VALUES (:task_id, 1, 0, '', NULL)
-        """
-        await db.execute(
-            query=stage_query,
-            values={
-                "task_id": task_id
-            }
-        )
+        stage_data = {
+            "task_id": task_id,
+            "stage_number": 1,
+            "completion_percentage": 0,
+            "image_path": "",
+            "image_url": None
+        }
+        
+        db.table("mo_image_stages").insert(stage_data).execute()
         
         # Import the image generation task to avoid circular imports
         from app.routers.multivio.together_router import generate_image_task
@@ -772,49 +632,29 @@ async def generate_image(
 async def get_image_status(
     task_id: str,
     current_user: dict = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Get the status of an image generation task."""
     try:
         # Query the task table for the task
-        query = """
-        SELECT id, type, parameters, status, result, error, 
-               created_at AT TIME ZONE 'UTC' as created_at,
-               completed_at AT TIME ZONE 'UTC' as completed_at
-        FROM mo_ai_tasks 
-        WHERE id = :task_id
-        """
+        task_result = db.table("mo_ai_tasks").select(
+            "id, type, parameters, status, result, error, created_at, completed_at"
+        ).eq("id", task_id).execute()
         
-        task = await db.fetch_one(
-            query=query,
-            values={
-                "task_id": task_id
-            }
-        )
-        
-        if not task:
+        if not task_result.data:
             raise HTTPException(status_code=404, detail="Image generation task not found")
         
-        task_dict = dict(task)
+        task = task_result.data[0]
         
         # Get the latest stage information
-        stages_query = """
-        SELECT * FROM mo_image_stages
-        WHERE task_id = :task_id
-        ORDER BY completion_percentage DESC
-        LIMIT 1
-        """
+        stage_result = db.table("mo_image_stages").select("*").eq("task_id", task_id) \
+            .order("completion_percentage", desc=True).limit(1).execute()
         
-        stage = await db.fetch_one(
-            query=stages_query,
-            values={"task_id": task_id}
-        )
+        stage = stage_result.data[0] if stage_result.data else {}
         
-        stage_dict = dict(stage) if stage else {}
-        
-        if task_dict["status"] == "completed" and task_dict["result"]:
+        if task["status"] == "completed" and task["result"]:
             # Parse the result JSON
-            result_data = json.loads(task_dict["result"])
+            result_data = task["result"]
             
             # Get the first image from the result
             image = result_data.get("images", [])[0] if result_data.get("images") else None
@@ -826,8 +666,8 @@ async def get_image_status(
                     "image_id": image["id"],
                     "prompt": image["prompt"],
                     "model": image["model"],
-                    "created_at": task_dict["created_at"].isoformat() if task_dict["created_at"] else None,
-                    "completed_at": task_dict["completed_at"].isoformat() if task_dict["completed_at"] else None
+                    "created_at": task["created_at"],
+                    "completed_at": task["completed_at"]
                 }
             else:
                 # Result exists but no images found
@@ -836,17 +676,17 @@ async def get_image_status(
                     "error": "No images found in completed result"
                 }
                 
-        elif task_dict["status"] == "failed":
+        elif task["status"] == "failed":
             return {
                 "status": "failed",
-                "error": task_dict.get("error", "Unknown error occurred during image generation")
+                "error": task.get("error", "Unknown error occurred during image generation")
             }
         else:
             # Still processing - return stage information
             return {
                 "status": "processing",
-                "completion": stage_dict.get("completion_percentage", 0),
-                "image_url": stage_dict.get("image_url", None),
+                "completion": stage.get("completion_percentage", 0),
+                "image_url": stage.get("image_url"),
                 "message": "Image generation is still in progress"
             }
             
@@ -861,59 +701,38 @@ async def get_image_history(
     limit: int = 10,
     offset: int = 0,
     user = Depends(get_current_user),
-    db: Database = Depends(get_database)
+    db = Depends(get_database)
 ):
     """Get user's image generation history."""
     user_id = user.get("uid")
     
-    query = """
-    SELECT t.id, t.parameters, t.status, t.created_at, t.result
-    FROM mo_ai_tasks t
-    WHERE t.type = 'image_generation' AND t.created_by = :user_id
-    ORDER BY t.created_at DESC
-    LIMIT :limit OFFSET :offset
-    """
+    # Get history items with pagination
+    history_result = db.table("mo_ai_tasks").select("id, parameters, status, created_at, result") \
+        .eq("type", "image_generation").eq("created_by", user_id) \
+        .order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     
-    history_items = await db.fetch_all(
-        query=query,
-        values={"user_id": user_id, "limit": limit, "offset": offset}
-    )
+    # Get total count
+    count_result = db.table("mo_ai_tasks").select("id") \
+        .eq("type", "image_generation").eq("created_by", user_id).execute()
     
-    count_query = """
-    SELECT COUNT(*) as total
-    FROM mo_ai_tasks
-    WHERE type = 'image_generation' AND created_by = :user_id
-    """
-    count = await db.fetch_val(query=count_query, values={"user_id": user_id}, column="total")
+    total = len(count_result.data) if count_result.data else 0
     
     # Process history items
     processed_items = []
-    for item in history_items:
-        item_dict = dict(item)
-        
-        # Parse the parameters
-        try:
-            if isinstance(item_dict["parameters"], str):
-                item_dict["parameters"] = json.loads(item_dict["parameters"])
-        except:
-            pass
-            
+    for item in history_result.data:
         # Parse the result if completed
-        if item_dict["status"] == "completed" and item_dict.get("result"):
-            try:
-                if isinstance(item_dict["result"], str):
-                    result_data = json.loads(item_dict["result"])
-                    # Extract just the first image for the overview
-                    if "images" in result_data and len(result_data["images"]) > 0:
-                        item_dict["image"] = result_data["images"][0]
-            except:
-                pass
+        if item["status"] == "completed" and item.get("result"):
+            result_data = item["result"]
+            
+            # Extract just the first image for the overview
+            if "images" in result_data and len(result_data["images"]) > 0:
+                item["image"] = result_data["images"][0]
                 
-        processed_items.append(item_dict)
+        processed_items.append(item)
     
     return {
         "images": processed_items,
-        "total": count,
+        "total": total,
         "limit": limit,
         "offset": offset
     }

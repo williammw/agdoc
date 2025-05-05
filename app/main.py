@@ -15,6 +15,7 @@ from app.routers.multivio.youtube_router import router as youtube_router
 from app.routers.multivio.folders_router import router as folders_router
 from app.routers.multivio.recycle_router import router as recycle_router
 from app.routers.multivio.together_router import router as together_router
+from app.routers.multivio.supa_router import router as supa_router
 # from app.routers.multivio.smart_router import router as smart_router
 # from app.routers.multivio.general_router import router as general_router
 from app.routers.multivio.brave_search_router import router as brave_search_router
@@ -198,6 +199,7 @@ router_list = [
     (recycle_router, "/api/v1/recycle", ["recycle"]),
     (folders_router, "/api/v1/folders", ["folders"]),
     (media_router, "/api/v1/media", ["media"]),
+    (supa_router, "/api/v1/supabase", ["supabase"]),
     (threads_router, "/api/v1/threads", ["threads"]),
     (together_router, "/api/v1/together", ["together"]),
     # (smart_router, "/api/v1/smart", ["smart"]),
