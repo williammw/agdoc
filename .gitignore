@@ -1,142 +1,69 @@
-# Ignore Python cache directories
+# Backup folders
+backup_*/
+
+# Python specific
 __pycache__/
-
-# Ignore agdoc-env folder
-agdoc-env/
-
-prompt/
-*.pyc
-.env
-# Ignore Python cache directories
-__pycache__/
-
-# Ignore agdoc-env folder
-agdoc-env/
-
-# Ignore .DS_Store files
-.DS_Store
-
-*.pyc
-.env
-
-materials/
-win/
-
-# Ignore virtual environment
-venv/
-
-# Ignore IDE files
-.vscode/
-.idea/
-
-# Ignore compiled Python files
-*.pyc
-
-# Ignore environment variables file
-.env
-
-# Ignore cache directories
-__pycache__/
-
-# Ignore system-specific files
-.DS_Store
-
-# Ignore log files
-*.log
-
-# Ignore package build directories
-dist/
-build/
-config/
-
-# Ignore egg-info directories
-*.egg-info/
-
-# Ignore distribution files
-*.tar.gz
-*.whl
-
-# Ignore database files
-*.db
-
-# Ignore compiled binary files
-*.exe
-*.dll
+*.py[cod]
+*$py.class
 *.so
-*.dylib
+.Python
+venv/
+ENV/
+env/
+virtualenv/
 
-# Ignore backup files
-*.bak
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+
+# Environment files
+.env
+.venv
+env/
+
+# IDE files
+.idea/
+.vscode/
 *.swp
 *.swo
-mypp.txt
-received_audio.wav
-transcript_output.txt
-umami-423322-firebase-adminsdk-t27sm-40e0472f73.json
-files/A) 2024-06-14.pdf
-files/WilliamWong.2405.pdf
-files/wwcv.txt
 
-# Ignore Python cache directories
-__pycache__/
-# Ignore agdoc-env folder
-agdoc-env/
-*.pyc
-.env
-# Ignore Python cache directories
-__pycache__/
-# Ignore agdoc-env folder
-agdoc-env/
-# Ignore .DS_Store files
+# OS specific files
 .DS_Store
-*.pyc
-.env
-materials/
-win/
-# Ignore virtual environment
-venv/
-# Ignore IDE files
-.vscode/
-.idea/
-# Ignore compiled Python files
-*.pyc
-# Ignore environment variables file
-.env
-# Ignore cache directories
-__pycache__/
-# Ignore system-specific files
-.DS_Store
-# Ignore log files
-*.log
-# Ignore package build directories
-dist/
-build/
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Application specific
+uploads/
+files/
+uploaded_files/
 config/
-# Ignore egg-info directories
-*.egg-info/
-# Ignore distribution files
-*.tar.gz
-*.whl
-# Ignore database files
-*.db
-# Ignore compiled binary files
-*.exe
-*.dll
-*.so
-*.dylib
-# Ignore backup files
-*.bak
-*.swp
-*.swo
-mypp.txt
-received_audio.wav
-transcript_output.txt
-gpt-2-output-dataset
-app/ML/data
-app/services/fine_tuned_model
-client_secret_659920774949-l2m33ktn8sh4b6sbm3bspq9sk4t1vtg6.apps.googleusercontent.com.json
-app/routers/multivio/pipeline_router.md
-app/routers/multivio/image.json
-app/routers/multivio/newconversation.json
-app/routers/multivio/continue_conversation.json
-app/routers/multivio/new_conversation.json
+materials/
+fine-tune/ 

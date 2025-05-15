@@ -1,1 +1,0 @@
-you must follow Fast API rules

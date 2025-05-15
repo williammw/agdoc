@@ -1,32 +1,58 @@
-# API using FastAPI, 
-- this is my dev / uat for any API development and testing platform; hosted at DG, 
+# Multivio API
 
-### features
-* API integration with FAST API
-* 
+Backend API for Multivio application.
 
-### view docs using endpoint/docs
-```gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app```
-```gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app```
-#### local test run caommand
-```uvicorn app.main:app --reload```
-```uvicorn --host 0.0.0.0  app.main:app --reload```
-
-## 9Jul2024##
-`uvicorn app.main:app --host 0.0.0.0 --port 8080`
-
-## Oct14 2024 
-`uvicorn --host 0.0.0.0 app.main:app --workers 4`
-
-
-### ngrok for test
-```
-ngrok http port
-```
+## Project Structure
 
 ```
-pip freeze > requirements.txt
+.
+├── app                # Application code
+│   ├── models         # Pydantic models
+│   ├── routers        # API endpoints
+│   ├── services       # Business logic
+│   ├── static         # Static files
+│   ├── templates      # Template files
+│   └── utils          # Utility functions
+├── main.py            # FastAPI application entry point
+└── requirements.txt   # Project dependencies
 ```
-```
-4 dec 2024 test vercel
-```
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.9+
+- pip
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone <repository-url>
+   cd agdoc
+   ```
+
+2. Create a virtual environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Run the application:
+   ```bash
+   python main.py
+   ```
+
+The API will be available at http://localhost:8000.
+
+## API Documentation
+
+Once the application is running, you can access the API documentation at:
+
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
