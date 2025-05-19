@@ -181,7 +181,20 @@ async def initialize_database():
             test_response = supabase.table('users').select('id').limit(1).execute()
             print("Users table already exists")
             
-            # If we got here, the table exists, so we can return
+            # Check if social_connections table exists
+            try:
+                social_conn_test = supabase.table('social_connections').select('id').limit(1).execute()
+                print("Social connections table already exists")
+            except Exception:
+                # Social connections table doesn't exist, create it
+                print("Creating social connections table...")
+                social_connections_sql = read_sql_file('social_connections.sql')
+                if social_connections_sql:
+                    print("\n-- Social Connections Table SQL to execute manually:")
+                    print(social_connections_sql)
+                    print("\nPlease execute this SQL in the Supabase SQL Editor.")
+            
+            # If we got here, the main tables exist, so we can return
             return
         except Exception as e:
             # Table might not exist, or other error
@@ -192,6 +205,7 @@ async def initialize_database():
         initial_migration_sql = read_sql_file('migrations/001_initial_schema.sql')
         users_sql = read_sql_file('users.sql')
         user_info_sql = read_sql_file('user_info.sql')
+        social_connections_sql = read_sql_file('social_connections.sql')
         
         # Print the instructions for manual SQL execution
         print("\n===== DATABASE INITIALIZATION INSTRUCTIONS =====")
@@ -215,6 +229,10 @@ async def initialize_database():
             if user_info_sql:
                 print("\n-- User Info Table SQL:")
                 print(user_info_sql)
+            
+            if social_connections_sql:
+                print("\n-- Social Connections Table SQL:")
+                print(social_connections_sql)
                 
         print("\n===== END DATABASE INITIALIZATION INSTRUCTIONS =====")
         print("\nAfter executing these SQL statements, restart the application.")

@@ -56,3 +56,8 @@ Once the application is running, you can access the API documentation at:
 
 - Swagger UI: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
+
+
+ pip freeze > requirements.txt
+
+ uvicorn app.main:app --reload

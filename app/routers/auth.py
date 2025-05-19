@@ -57,6 +57,131 @@ async def get_me(
             detail=f"Failed to get user info: {str(e)}"
         )
 
+# Generic OAuth processing function to avoid code duplication
+async def process_oauth_authentication(
+    provider: str,
+    email: str,
+    name: Optional[str] = None,
+    picture: Optional[str] = None,
+    provider_account_id: Optional[str] = None,
+    supabase = None
+):
+    """
+    Process OAuth authentication for any provider
+    
+    This function handles the common parts of the OAuth flow for all providers.
+    """
+    try:
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Email is required for {provider} authentication"
+            )
+            
+        # Look up the user by email in Firebase Auth
+        try:
+            # Check if user already exists in Firebase by email
+            try:
+                user_record = auth.get_user_by_email(email)
+                firebase_uid = user_record.uid
+                
+                # Update user profile if needed
+                needs_update = False
+                update_args = {}
+                
+                if name and user_record.display_name != name:
+                    update_args["display_name"] = name
+                    needs_update = True
+                    
+                if picture and user_record.photo_url != picture:
+                    update_args["photo_url"] = picture
+                    needs_update = True
+                
+                if needs_update:
+                    auth.update_user(firebase_uid, **update_args)
+                    print(f"Updated Firebase user profile for {email}")
+                
+            except auth.UserNotFoundError:
+                # User doesn't exist yet, create them
+                user_record = auth.create_user(
+                    email=email,
+                    email_verified=True,  # OAuth emails are already verified
+                    display_name=name or "",
+                    photo_url=picture or "",
+                    provider_id=f"{provider}.com"
+                )
+                firebase_uid = user_record.uid
+                print(f"Created new Firebase user for {email}")
+            
+            # Get or create user in our database
+            db_user = await get_user_by_firebase_uid(supabase, firebase_uid)
+            
+            if not db_user:
+                # Create new user in our database
+                user_data = {
+                    "firebase_uid": firebase_uid,
+                    "email": email,
+                    "email_verified": True,
+                    "auth_provider": f"{provider}.com",
+                    "full_name": name or "",
+                    "avatar_url": picture or "",
+                }
+                
+                db_user = await create_user(supabase, user_data)
+                print(f"Created new user in database for {email}")
+            else:
+                # Update user profile in our database if needed
+                needs_update = False
+                update_data = {}
+                
+                if name and db_user.get("full_name") != name:
+                    update_data["full_name"] = name
+                    needs_update = True
+                    
+                if picture and db_user.get("avatar_url") != picture:
+                    update_data["avatar_url"] = picture
+                    needs_update = True
+                
+                if provider_account_id:
+                    update_data[f"{provider}_id"] = provider_account_id
+                    needs_update = True
+                
+                if needs_update:
+                    await update_user_by_firebase_uid(supabase, firebase_uid, update_data)
+                    print(f"Updated user profile in database for {email}")
+            
+            # Create a custom token for the client
+            custom_token = auth.create_custom_token(firebase_uid)
+            
+            # Return comprehensive data for the frontend
+            return {
+                "firebase_token": custom_token.decode('utf-8'),
+                "firebase_uid": firebase_uid,
+                "user_id": db_user["id"],
+                "email": db_user["email"],
+                "full_name": db_user.get("full_name", ""),
+                "avatar_url": db_user.get("avatar_url", ""),
+                "email_verified": True,
+                "auth_provider": f"{provider}.com"
+            }
+            
+        except Exception as firebase_error:
+            print(f"Firebase authentication error: {firebase_error}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Failed to authenticate with {provider}: {str(firebase_error)}"
+            )
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"OAuth error with {provider}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process {provider} authentication: {str(e)}"
+        )
+
 @router.post("/oauth/google")
 async def google_oauth(
     data: Dict[str, str] = Body(...),
@@ -98,112 +223,177 @@ async def google_oauth(
                 print(f"Error extracting info from token: {e}")
                 # Continue with the flow, we'll check if email is provided below
         
-        if not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email is required for Google authentication"
-            )
-            
-        # Instead of verifying the Google token directly with Firebase,
-        # look up the user by email in Firebase Auth
-        try:
-            # Check if user already exists in Firebase by email
-            try:
-                user_record = auth.get_user_by_email(email)
-                firebase_uid = user_record.uid
-                
-                # Update user profile if needed
-                needs_update = False
-                update_args = {}
-                
-                if name and user_record.display_name != name:
-                    update_args["display_name"] = name
-                    needs_update = True
-                    
-                if picture and user_record.photo_url != picture:
-                    update_args["photo_url"] = picture
-                    needs_update = True
-                
-                if needs_update:
-                    auth.update_user(firebase_uid, **update_args)
-                    print(f"Updated Firebase user profile for {email}")
-                
-            except auth.UserNotFoundError:
-                # User doesn't exist yet, create them
-                user_record = auth.create_user(
-                    email=email,
-                    email_verified=True,  # Google OAuth emails are already verified
-                    display_name=name or "",
-                    photo_url=picture or "",
-                    provider_id="google.com"
-                )
-                firebase_uid = user_record.uid
-                print(f"Created new Firebase user for {email}")
-            
-            # Get or create user in our database
-            db_user = await get_user_by_firebase_uid(supabase, firebase_uid)
-            
-            if not db_user:
-                # Create new user in our database
-                user_data = {
-                    "firebase_uid": firebase_uid,
-                    "email": email,
-                    "email_verified": True,
-                    "auth_provider": "google.com",
-                    "full_name": name or "",
-                    "avatar_url": picture or "",
-                }
-                
-                db_user = await create_user(supabase, user_data)
-                print(f"Created new user in database for {email}")
-            else:
-                # Update user profile in our database if needed
-                needs_update = False
-                update_data = {}
-                
-                if name and db_user.get("full_name") != name:
-                    update_data["full_name"] = name
-                    needs_update = True
-                    
-                if picture and db_user.get("avatar_url") != picture:
-                    update_data["avatar_url"] = picture
-                    needs_update = True
-                
-                if needs_update:
-                    await update_user_by_firebase_uid(supabase, firebase_uid, update_data)
-                    print(f"Updated user profile in database for {email}")
-            
-            # Create a custom token for the client
-            custom_token = auth.create_custom_token(firebase_uid)
-            
-            # Return comprehensive data for the frontend
-            return {
-                "firebase_token": custom_token.decode('utf-8'),
-                "firebase_uid": firebase_uid,
-                "user_id": db_user["id"],
-                "email": db_user["email"],
-                "full_name": db_user.get("full_name", ""),
-                "avatar_url": db_user.get("avatar_url", ""),
-                "email_verified": True,
-                "auth_provider": "google.com"
-            }
-            
-        except Exception as firebase_error:
-            print(f"Firebase authentication error: {firebase_error}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Failed to authenticate with Google: {str(firebase_error)}"
-            )
-            
+        return await process_oauth_authentication(
+            provider="google",
+            email=email,
+            name=name,
+            picture=picture,
+            provider_account_id=data.get("provider_account_id"),
+            supabase=supabase
+        )
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
-    except Exception as e:
-        print(f"Google OAuth error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing Google authentication: {str(e)}"
+
+@router.post("/oauth/facebook")
+async def facebook_oauth(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process Facebook OAuth authentication
+    
+    This endpoint receives the Facebook OAuth tokens from the frontend and
+    either finds an existing user or creates a new one, then returns a
+    Firebase custom token for continued authentication.
+    """
+    try:
+        # Extract tokens and user info from request body
+        access_token = data.get("access_token")
+        email = data.get("email")
+        name = data.get("name") 
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")
+        
+        if not email and access_token:
+            # Try to fetch user data from Facebook Graph API
+            try:
+                import requests
+                # Basic profile fields
+                fields = "id,name,email,picture"
+                graph_url = f"https://graph.facebook.com/me?fields={fields}&access_token={access_token}"
+                
+                response = requests.get(graph_url)
+                if response.status_code == 200:
+                    user_data = response.json()
+                    email = email or user_data.get("email")
+                    name = name or user_data.get("name")
+                    provider_account_id = provider_account_id or user_data.get("id")
+                    if "picture" in user_data and "data" in user_data["picture"]:
+                        picture = picture or user_data["picture"]["data"].get("url")
+                else:
+                    print(f"Failed to fetch Facebook user data: {response.text}")
+            except Exception as e:
+                print(f"Error fetching user data from Facebook: {e}")
+        
+        return await process_oauth_authentication(
+            provider="facebook",
+            email=email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
         )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+
+@router.post("/oauth/twitter")
+async def twitter_oauth(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process Twitter OAuth authentication
+    
+    This endpoint receives the Twitter OAuth tokens from the frontend and
+    either finds an existing user or creates a new one, then returns a
+    Firebase custom token for continued authentication.
+    """
+    try:
+        # Extract tokens and user info from request body
+        access_token = data.get("access_token")
+        oauth_token = data.get("oauth_token")
+        oauth_token_secret = data.get("oauth_token_secret")
+        email = data.get("email")
+        name = data.get("name") 
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")
+        
+        # Note: Twitter OAuth sometimes doesn't provide email directly
+        # For a production app, you would need to request email access
+        # and handle cases where email isn't provided
+        
+        if not email:
+            email = f"{provider_account_id}@twitter.placeholder.com"
+        
+        return await process_oauth_authentication(
+            provider="twitter",
+            email=email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+
+@router.post("/oauth/linkedin")
+async def linkedin_oauth(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process LinkedIn OAuth authentication
+    
+    This endpoint receives the LinkedIn OAuth tokens from the frontend and
+    either finds an existing user or creates a new one, then returns a
+    Firebase custom token for continued authentication.
+    """
+    try:
+        # Extract tokens and user info from request body
+        access_token = data.get("access_token")
+        email = data.get("email")
+        name = data.get("name") 
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")
+        
+        if not email and access_token:
+            # Try to fetch user data from LinkedIn API
+            try:
+                import requests
+                # LinkedIn API endpoints
+                profile_url = "https://api.linkedin.com/v2/me"
+                email_url = "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))"
+                
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
+                
+                # Get basic profile
+                profile_response = requests.get(profile_url, headers=headers)
+                if profile_response.status_code == 200:
+                    profile_data = profile_response.json()
+                    provider_account_id = provider_account_id or profile_data.get("id")
+                    name = name or f"{profile_data.get('localizedFirstName', '')} {profile_data.get('localizedLastName', '')}"
+                
+                # Get email if available
+                email_response = requests.get(email_url, headers=headers)
+                if email_response.status_code == 200:
+                    email_data = email_response.json()
+                    if "elements" in email_data and len(email_data["elements"]) > 0:
+                        email = email or email_data["elements"][0]["handle~"]["emailAddress"]
+                
+            except Exception as e:
+                print(f"Error fetching user data from LinkedIn: {e}")
+        
+        # LinkedIn doesn't always provide email through the API
+        if not email and provider_account_id:
+            email = f"{provider_account_id}@linkedin.placeholder.com"
+        
+        return await process_oauth_authentication(
+            provider="linkedin",
+            email=email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
 
 @router.post("/token-refresh")
 async def refresh_token(
