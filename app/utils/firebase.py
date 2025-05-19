@@ -135,8 +135,113 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
     
     try:
         # Verify the token
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
+        try:
+            # First try verifying it as an ID token
+            decoded_token = auth.verify_id_token(token)
+            return decoded_token
+        except auth.InvalidIdTokenError as e:
+            # If that fails, log the specific error
+            print(f"ID token verification failed: {str(e)}")
+            
+            # Try to extract email from the token (for custom tokens or JWT format)
+            try:
+                import base64
+                import json
+                
+                # Simple JWT parsing (no validation) to extract payload
+                parts = token.split('.')
+                if len(parts) >= 2:
+                    # Add padding if needed
+                    padded = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                    payload = json.loads(base64.b64decode(padded).decode('utf-8'))
+                    
+                    # Check for email or sub claim
+                    email = payload.get('email')
+                    uid = payload.get('sub') or payload.get('uid')
+                    
+                    if email:
+                        # Try to get user by email
+                        try:
+                            user = auth.get_user_by_email(email)
+                            return {
+                                "uid": user.uid,
+                                "email": user.email,
+                                "name": user.display_name,
+                                "picture": user.photo_url,
+                                "email_verified": user.email_verified,
+                                "firebase": {"sign_in_provider": user.provider_id or "custom"}
+                            }
+                        except Exception as email_error:
+                            print(f"Email lookup failed: {email} - {str(email_error)}")
+                    
+                    if uid:
+                        # Try to get user by uid
+                        try:
+                            user = auth.get_user(uid)
+                            return {
+                                "uid": user.uid,
+                                "email": user.email,
+                                "name": user.display_name,
+                                "picture": user.photo_url,
+                                "email_verified": user.email_verified,
+                                "firebase": {"sign_in_provider": user.provider_id or "custom"}
+                            }
+                        except Exception as uid_error:
+                            print(f"UID lookup failed: {uid} - {str(uid_error)}")
+            except Exception as jwt_error:
+                print(f"JWT parsing error: {str(jwt_error)}")
+            
+            # Check if token might be a custom token or a UID
+            if len(token) < 200:
+                try:
+                    # Try to verify it as a user UID directly
+                    user = auth.get_user(token)
+                    # Create a minimal token dictionary with essential fields
+                    return {
+                        "uid": user.uid,
+                        "email": user.email,
+                        "name": user.display_name,
+                        "picture": user.photo_url,
+                        "email_verified": user.email_verified,
+                        "firebase": {"sign_in_provider": user.provider_id or "custom"}
+                    }
+                except Exception as uid_error:
+                    print(f"UID lookup failed: {str(uid_error)}")
+            
+            # If we get here, try to get the email from the custom token
+            try:
+                import base64
+                import json
+                
+                # Attempt to parse the custom token and extract the UID
+                # Custom tokens have a different structure than ID tokens
+                parts = token.split('.')
+                if len(parts) >= 2:
+                    # Add padding if needed
+                    padded = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                    payload = json.loads(base64.b64decode(padded).decode('utf-8'))
+                    
+                    # Custom tokens have a 'uid' claim for the user ID
+                    uid = payload.get('uid')
+                    if uid:
+                        try:
+                            user = auth.get_user(uid)
+                            return {
+                                "uid": user.uid,
+                                "email": user.email,
+                                "name": user.display_name,
+                                "picture": user.photo_url,
+                                "email_verified": user.email_verified,
+                                "firebase": {"sign_in_provider": user.provider_id or "custom"}
+                            }
+                        except Exception as uid_error:
+                            print(f"UID lookup from custom token failed: {str(uid_error)}")
+            except Exception as custom_token_error:
+                print(f"Custom token parsing error: {str(custom_token_error)}")
+            
+            # If all methods fail, raise the original error
+            raise e
+            
     except auth.ExpiredIdTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

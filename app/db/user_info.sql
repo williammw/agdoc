@@ -1,35 +1,56 @@
 -- user_info.sql
 -- Schema definition for the user_info table, which stores app-specific user data
 
-CREATE TABLE IF NOT EXISTS user_info (
+-- Create user_info table for additional user information and subscription details
+CREATE TABLE IF NOT EXISTS public.user_info (
     id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    plan_type TEXT DEFAULT 'free',
+    user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    plan_type VARCHAR(50) DEFAULT 'free',
     monthly_post_quota INTEGER DEFAULT 10,
     remaining_posts INTEGER DEFAULT 10,
-    last_quota_reset TIMESTAMPTZ DEFAULT NOW(),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    subscription_id VARCHAR(255),
+    subscription_status VARCHAR(50),
+    subscription_end_date TIMESTAMP WITH TIME ZONE,
+    last_quota_reset TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    preferences JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT user_info_user_id_key UNIQUE (user_id)
 );
 
--- Create index on user_id for faster lookup
-CREATE INDEX IF NOT EXISTS idx_user_info_user_id ON user_info(user_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_info_unique_user ON user_info(user_id);
+-- Add indexes for performance
+CREATE INDEX IF NOT EXISTS idx_user_info_user_id ON public.user_info(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_info_plan_type ON public.user_info(plan_type);
+CREATE INDEX IF NOT EXISTS idx_user_info_subscription_status ON public.user_info(subscription_status);
 
--- Create trigger to update the updated_at timestamp automatically
-CREATE OR REPLACE FUNCTION update_user_info_timestamp()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+-- Add RLS (Row Level Security) policies
+ALTER TABLE public.user_info ENABLE ROW LEVEL SECURITY;
 
-DROP TRIGGER IF EXISTS user_info_update_timestamp ON user_info;
+-- Policy to allow users to read their own info
+CREATE POLICY user_info_read_own ON public.user_info 
+    FOR SELECT 
+    USING (user_id IN (SELECT id FROM public.users WHERE firebase_uid = auth.uid()::text));
+
+-- Policy to allow users to update their own preferences
+CREATE POLICY user_info_update_own ON public.user_info 
+    FOR UPDATE 
+    USING (user_id IN (SELECT id FROM public.users WHERE firebase_uid = auth.uid()::text));
+
+-- Policy to allow system/admin access for all operations
+CREATE POLICY user_info_admin_all ON public.user_info 
+    FOR ALL 
+    USING (auth.jwt() ? 'admin_access');
+
+-- Policy to allow insert for new user info
+CREATE POLICY user_info_insert ON public.user_info 
+    FOR INSERT 
+    WITH CHECK (true);
+
+-- Create a trigger to automatically update updated_at timestamp
 CREATE TRIGGER user_info_update_timestamp
-BEFORE UPDATE ON user_info
+BEFORE UPDATE ON public.user_info
 FOR EACH ROW
-EXECUTE FUNCTION update_user_info_timestamp();
+EXECUTE FUNCTION update_timestamp();
 
 -- Comments
 COMMENT ON TABLE user_info IS 'Stores app-specific user information such as subscription plans and quotas';

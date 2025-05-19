@@ -1,6 +1,6 @@
 import os
 import pathlib
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, HTTPException, status
@@ -10,27 +10,60 @@ from supabase import create_client, Client
 # Get Supabase configuration from environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Service role key for admin operations
 
 # Base directory for SQL files
 DB_DIR = pathlib.Path(__file__).parent.parent / "db"
 
-# Initialize Supabase client
+# Initialize Supabase client with standard key
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("Supabase client initialized successfully")
+    
+    # Initialize service role client for admin operations
+    if SUPABASE_SERVICE_KEY:
+        service_supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        print("Supabase service client initialized successfully")
+    else:
+        service_supabase = None
+        print("Warning: SUPABASE_SERVICE_KEY not set, admin operations may be limited")
 except Exception as e:
     print(f"Failed to initialize Supabase client: {e}")
     supabase = None
+    service_supabase = None
 
-# Database dependency for FastAPI
-async def get_database():
-    """Get a Supabase client instance"""
+# Basic database access function
+def get_database(admin_access: bool = False):
+    """
+    Get a Supabase client instance
+    
+    Args:
+        admin_access: If True, returns the service role client that bypasses RLS
+    """
+    if admin_access and service_supabase:
+        return service_supabase
+        
     if not supabase:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database connection error: Supabase client not initialized"
         )
     return supabase
+
+# Dependency factory function
+def get_db(admin_access: bool = False) -> Callable:
+    """
+    Creates a database dependency function that can be used with FastAPI's Depends
+    
+    Args:
+        admin_access: If True, returns the service role client that bypasses RLS
+        
+    Returns:
+        A dependency function that provides the appropriate Supabase client
+    """
+    def db_dependency():
+        return get_database(admin_access=admin_access)
+    return db_dependency
 
 # User database operations
 async def get_user_by_firebase_uid(client, firebase_uid: str) -> Optional[Dict[str, Any]]:
@@ -163,16 +196,24 @@ async def initialize_database():
         # Print the instructions for manual SQL execution
         print("\n===== DATABASE INITIALIZATION INSTRUCTIONS =====")
         print("Please execute the following SQL in the Supabase SQL Editor:")
-        print("\n1. Create the initial schema:")
+        print("\nINSTRUCTIONS:")
+        print("1. Login to your Supabase dashboard")
+        print("2. Navigate to the SQL Editor")
+        print("3. Create a New Query")
+        print("4. Copy and paste the following SQL")
+        print("5. Run the query by clicking 'Run' or pressing Ctrl+Enter")
+        print("\n----- SQL TO EXECUTE -----")
+        
         if initial_migration_sql:
             print(initial_migration_sql)
         else:
-            print("\n2. Create the users table:")
+            # If the migration file is missing, use the individual table files
             if users_sql:
+                print("\n-- Users Table SQL:")
                 print(users_sql)
             
-            print("\n3. Create the user_info table:")
             if user_info_sql:
+                print("\n-- User Info Table SQL:")
                 print(user_info_sql)
                 
         print("\n===== END DATABASE INITIALIZATION INSTRUCTIONS =====")

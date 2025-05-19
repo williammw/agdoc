@@ -4,10 +4,13 @@ from fastapi import Depends, HTTPException, status, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.utils.firebase import verify_firebase_token
-from app.utils.database import get_database, get_user_by_firebase_uid, create_user
+from app.utils.database import get_db, get_user_by_firebase_uid, create_user
 
 # Security scheme for Swagger UI
 security = HTTPBearer()
+
+# Create database dependency with admin access
+db_admin = get_db(admin_access=True)
 
 async def get_current_user_token(
     request: Request = None,
@@ -21,17 +24,29 @@ async def get_current_user_token(
     It can be used with either header-based or security scheme-based authorization.
     """
     # First try to get the token from the Authorization header
-    token = authorization
+    token = None
     
-    # If not found, try to get it from the security scheme
+    # 1. Try to get the token from the Authorization header
+    if authorization:
+        # Handle "Bearer" prefix if present
+        if authorization.startswith("Bearer "):
+            token = authorization[7:]
+        else:
+            token = authorization
+    
+    # 2. If not found, try to get it from the security scheme
     if not token and credentials:
         token = credentials.credentials
     
-    # If still not found, check if it's in request headers (for non-standard header cases)
+    # 3. If still not found, check if it's in request headers (for non-standard header cases)
     if not token and request:
         for header in ['authorization', 'Authorization']:
             if header in request.headers:
-                token = request.headers[header]
+                header_value = request.headers[header]
+                if header_value.startswith("Bearer "):
+                    token = header_value[7:]
+                else:
+                    token = header_value
                 break
     
     if not token:
@@ -47,6 +62,7 @@ async def get_current_user_token(
     except HTTPException as e:
         # Re-raise with more context if needed
         if e.status_code == status.HTTP_401_UNAUTHORIZED:
+            print(f"Token verification failed for token: {token[:10]}...")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Token verification failed: {e.detail}. Please login again to get a fresh token.",
@@ -56,7 +72,7 @@ async def get_current_user_token(
 
 async def get_current_user(
     token_data: Dict[str, Any] = Depends(get_current_user_token),
-    conn = Depends(get_database)
+    conn = Depends(db_admin)
 ) -> Dict[str, Any]:
     """
     Get the current authenticated user from the database
@@ -119,7 +135,7 @@ async def get_current_user(
 
 async def get_optional_user(
     token_data: Optional[Dict[str, Any]] = Depends(get_current_user_token),
-    conn = Depends(get_database)
+    conn = Depends(db_admin)
 ) -> Optional[Dict[str, Any]]:
     """
     Get the current user if authenticated, otherwise return None
