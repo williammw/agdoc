@@ -122,6 +122,7 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
     Raises:
         HTTPException: If the token is invalid or expired
     """
+    # Add custom token handling wrapper to handle specific errors better
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -239,7 +240,36 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
             except Exception as custom_token_error:
                 print(f"Custom token parsing error: {str(custom_token_error)}")
             
-            # If all methods fail, raise the original error
+            # Handle the custom token error case specially
+            if "verify_id_token() expects an ID token" in str(e):
+                # This is likely a custom token - try to get the user data directly from the token
+                try:
+                    import base64
+                    import json
+                    
+                    # Parse the JWT to extract the user ID
+                    parts = token.split('.')
+                    if len(parts) >= 2:
+                        padded = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                        payload = json.loads(base64.b64decode(padded).decode('utf-8'))
+                        
+                        # Custom tokens should have a uid claim
+                        uid = payload.get('uid')
+                        if uid:
+                            # Use the UID to get user info
+                            user = auth.get_user(uid)
+                            return {
+                                "uid": user.uid,
+                                "email": user.email,
+                                "name": user.display_name,
+                                "picture": user.photo_url,
+                                "email_verified": user.email_verified,
+                                "firebase": {"sign_in_provider": user.provider_id or "custom"}
+                            }
+                except Exception as token_error:
+                    print(f"Failed to parse custom token: {token_error}")
+                    
+            # If we get here and all methods fail, raise the original error
             raise e
             
     except auth.ExpiredIdTokenError:

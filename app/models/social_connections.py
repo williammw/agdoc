@@ -1,9 +1,9 @@
 from sqlalchemy import Column, String, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
-from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional
+from pydantic import BaseModel, validator
+from datetime import datetime, timezone
+from typing import Optional, Union
 from uuid import UUID as PyUUID
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -28,4 +28,18 @@ class SocialConnectionCreate(BaseModel):
     provider_account_id: str
     access_token: str
     refresh_token: Optional[str] = None
-    expires_at: Optional[datetime] = None 
+    expires_at: Optional[Union[datetime, str]] = None
+    profile_metadata: Optional[str] = None  # Field to store complete profile data as JSON string
+    
+    @validator('expires_at')
+    def validate_expires_at(cls, v):
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace('Z', '+00:00'))
+            except ValueError:
+                try:
+                    # Try parsing as Unix timestamp (integer string)
+                    return datetime.fromtimestamp(int(v), tz=timezone.utc)
+                except (ValueError, TypeError):
+                    pass
+        return v 

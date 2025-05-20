@@ -107,8 +107,8 @@ async def process_oauth_authentication(
                     email=email,
                     email_verified=True,  # OAuth emails are already verified
                     display_name=name or "",
-                    photo_url=picture or "",
-                    provider_id=f"{provider}.com"
+                    photo_url=picture or ""
+                    # Removed provider_id as it's not supported by Firebase auth.create_user()
                 )
                 firebase_uid = user_record.uid
                 print(f"Created new Firebase user for {email}")
@@ -142,9 +142,18 @@ async def process_oauth_authentication(
                     update_data["avatar_url"] = picture
                     needs_update = True
                 
+                # Store provider-specific IDs in a safer way
+                # Only store provider IDs if the column exists in the database
                 if provider_account_id:
-                    update_data[f"{provider}_id"] = provider_account_id
-                    needs_update = True
+                    # Use a more generic approach that doesn't rely on specific columns
+                    if provider == "linkedin":
+                        # Don't try to update linkedin_id directly as the column doesn't exist
+                        # Instead, we'll store this in the social_connections table
+                        print(f"Storing LinkedIn ID {provider_account_id} in social_connections table")
+                    else:
+                        # Only attempt to update for other providers that might have columns
+                        update_data[f"{provider}_id"] = provider_account_id
+                        needs_update = True
                 
                 if needs_update:
                     await update_user_by_firebase_uid(supabase, firebase_uid, update_data)
@@ -342,6 +351,9 @@ async def linkedin_oauth(
     Firebase custom token for continued authentication.
     """
     try:
+        # Log the data received for debugging
+        print(f"LinkedIn OAuth data received: {data}")
+        
         # Extract tokens and user info from request body
         access_token = data.get("access_token")
         email = data.get("email")
@@ -366,13 +378,24 @@ async def linkedin_oauth(
                 profile_response = requests.get(profile_url, headers=headers)
                 if profile_response.status_code == 200:
                     profile_data = profile_response.json()
+                    print(f"LinkedIn profile data: {profile_data}")
                     provider_account_id = provider_account_id or profile_data.get("id")
-                    name = name or f"{profile_data.get('localizedFirstName', '')} {profile_data.get('localizedLastName', '')}"
+                    
+                    # Extract name from localized fields
+                    first_name = ""
+                    last_name = ""
+                    if "localizedFirstName" in profile_data:
+                        first_name = profile_data.get("localizedFirstName", "")
+                    if "localizedLastName" in profile_data:
+                        last_name = profile_data.get("localizedLastName", "")
+                    
+                    name = name or f"{first_name} {last_name}".strip()
                 
                 # Get email if available
                 email_response = requests.get(email_url, headers=headers)
                 if email_response.status_code == 200:
                     email_data = email_response.json()
+                    print(f"LinkedIn email data: {email_data}")
                     if "elements" in email_data and len(email_data["elements"]) > 0:
                         email = email or email_data["elements"][0]["handle~"]["emailAddress"]
                 
@@ -382,7 +405,9 @@ async def linkedin_oauth(
         # LinkedIn doesn't always provide email through the API
         if not email and provider_account_id:
             email = f"{provider_account_id}@linkedin.placeholder.com"
+            print(f"Using placeholder email: {email}")
         
+        # Use our generic OAuth processing function
         return await process_oauth_authentication(
             provider="linkedin",
             email=email,
@@ -394,6 +419,13 @@ async def linkedin_oauth(
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
+    except Exception as e:
+        print(f"LinkedIn OAuth error: {e}")
+        # Return a more descriptive error
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"LinkedIn OAuth error: {str(e)}"
+        )
 
 @router.post("/token-refresh")
 async def refresh_token(
