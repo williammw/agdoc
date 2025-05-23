@@ -131,11 +131,17 @@ async def store_token(
                     # For LinkedIn and Threads, store profile in metadata
                     if data.provider in ['linkedin', 'threads']:
                         existing_metadata['profile'] = profile_data
+                    else:
+                        # For other providers (Twitter, Facebook, etc.), store directly
+                        existing_metadata = profile_data
                     update_data['metadata'] = existing_metadata
                 else:
                     # Create new metadata object
                     if data.provider in ['linkedin', 'threads']:
                         update_data['metadata'] = {'profile': profile_data}
+                    else:
+                        # For other providers, store directly
+                        update_data['metadata'] = profile_data
             
             db.table('social_connections').update(update_data).eq('id', existing_connection['id']).execute()
         else:
@@ -162,6 +168,9 @@ async def store_token(
                 
                 if data.provider in ['linkedin', 'threads']:
                     insert_data['metadata'] = {'profile': profile_data}
+                else:
+                    # For other providers (Twitter, Facebook, etc.), store directly
+                    insert_data['metadata'] = profile_data
             
             db.table('social_connections').insert(insert_data).execute()
         
