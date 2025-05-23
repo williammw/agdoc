@@ -49,6 +49,18 @@ class LinkedInPostRequest(BaseModel):
     imageUrl: Optional[str] = None
     articleUrl: Optional[str] = None
 
+class ThreadsProfile(BaseModel):
+    id: str
+    username: str
+    name: Optional[str] = None
+    bio: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+
+class ThreadsProfileRequest(BaseModel):
+    profile: ThreadsProfile
+
 # Helper function to decrypt data (for backward compatibility)
 def decrypt_data(encrypted_data):
     if not encrypted_data:
@@ -104,17 +116,26 @@ async def store_token(
             
             # Add metadata if provided
             if data.profile_metadata:
+                # Parse JSON string if needed
+                try:
+                    if isinstance(data.profile_metadata, str):
+                        profile_data = json.loads(data.profile_metadata)
+                    else:
+                        profile_data = data.profile_metadata
+                except (json.JSONDecodeError, TypeError):
+                    profile_data = data.profile_metadata
+                
                 # If there's existing metadata, update it; otherwise create new
                 if existing_connection.get('metadata'):
                     existing_metadata = existing_connection.get('metadata', {}) or {}
-                    # For LinkedIn, store profile in metadata
-                    if data.provider == 'linkedin':
-                        existing_metadata['profile'] = data.profile_metadata
+                    # For LinkedIn and Threads, store profile in metadata
+                    if data.provider in ['linkedin', 'threads']:
+                        existing_metadata['profile'] = profile_data
                     update_data['metadata'] = existing_metadata
                 else:
                     # Create new metadata object
-                    if data.provider == 'linkedin':
-                        update_data['metadata'] = {'profile': data.profile_metadata}
+                    if data.provider in ['linkedin', 'threads']:
+                        update_data['metadata'] = {'profile': profile_data}
             
             db.table('social_connections').update(update_data).eq('id', existing_connection['id']).execute()
         else:
@@ -130,8 +151,17 @@ async def store_token(
             
             # Add metadata if provided
             if data.profile_metadata:
-                if data.provider == 'linkedin':
-                    insert_data['metadata'] = {'profile': data.profile_metadata}
+                # Parse JSON string if needed
+                try:
+                    if isinstance(data.profile_metadata, str):
+                        profile_data = json.loads(data.profile_metadata)
+                    else:
+                        profile_data = data.profile_metadata
+                except (json.JSONDecodeError, TypeError):
+                    profile_data = data.profile_metadata
+                
+                if data.provider in ['linkedin', 'threads']:
+                    insert_data['metadata'] = {'profile': profile_data}
             
             db.table('social_connections').insert(insert_data).execute()
         
@@ -148,25 +178,46 @@ async def get_connections(
 ):
     """Get all social connections for the current user"""
     try:
+        logger.info(f"Fetching connections for user {current_user.get('id')} with include_tokens={include_tokens}")
+        
         if include_tokens:
             # Include sensitive data but decrypt it first
             response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).execute()
             
             if response.data:
-                # Decrypt tokens before returning
+                # Decrypt tokens before returning with proper error handling
                 for conn in response.data:
+                    logger.info(f"Processing connection: {conn.get('provider')} for user {current_user.get('id')}")
+                    
+                    # Safely decrypt access_token
                     if conn.get('access_token'):
-                        conn['access_token'] = decrypt_token(conn['access_token'])
+                        try:
+                            conn['access_token'] = decrypt_token(conn['access_token'])
+                            logger.info(f"Successfully decrypted access_token for {conn.get('provider')}")
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt access_token for {conn.get('provider')}: {str(e)}")
+                            conn['access_token'] = None  # Set to None instead of failing
+                    
+                    # Safely decrypt refresh_token
                     if conn.get('refresh_token'):
-                        conn['refresh_token'] = decrypt_token(conn['refresh_token'])
+                        try:
+                            conn['refresh_token'] = decrypt_token(conn['refresh_token'])
+                            logger.info(f"Successfully decrypted refresh_token for {conn.get('provider')}")
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt refresh_token for {conn.get('provider')}: {str(e)}")
+                            conn['refresh_token'] = None  # Set to None instead of failing
             
             return response.data if response.data else []
         else:
             # Regular behavior without tokens for security
-            response = db.table('social_connections').select('provider, provider_account_id, created_at, expires_at').eq('user_id', current_user["id"]).execute()
+            response = db.table('social_connections').select('provider, provider_account_id, created_at, expires_at, metadata').eq('user_id', current_user["id"]).execute()
             return response.data if response.data else []
+            
     except Exception as e:
-        print(f"Error fetching connections: {e}")
+        logger.error(f"Error fetching connections for user {current_user.get('id')}: {str(e)}")
+        logger.error(f"Exception type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve social connections: {str(e)}")
 
 @router.get("/token/{provider}")
@@ -177,6 +228,8 @@ async def get_token(
 ):
     """Get decrypted access token for a specific provider"""
     try:
+        logger.info(f"Retrieving token for provider {provider} and user {current_user.get('id')}")
+        
         # Get the token for the specified provider
         response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).execute()
         
@@ -185,9 +238,25 @@ async def get_token(
         
         connection = response.data[0]
         
-        # Decrypt tokens
-        access_token = decrypt_token(connection['access_token']) if connection.get('access_token') else None
-        refresh_token = decrypt_token(connection['refresh_token']) if connection.get('refresh_token') else None
+        # Safely decrypt tokens with error handling
+        access_token = None
+        refresh_token = None
+        
+        if connection.get('access_token'):
+            try:
+                access_token = decrypt_token(connection['access_token'])
+                logger.info(f"Successfully decrypted access_token for {provider}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt access_token for {provider}: {str(e)}")
+                access_token = None
+        
+        if connection.get('refresh_token'):
+            try:
+                refresh_token = decrypt_token(connection['refresh_token'])
+                logger.info(f"Successfully decrypted refresh_token for {provider}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt refresh_token for {provider}: {str(e)}")
+                refresh_token = None
         
         return {
             "access_token": access_token,
@@ -197,7 +266,9 @@ async def get_token(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error retrieving token: {e}")
+        logger.error(f"Error retrieving token for {provider}: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve token: {str(e)}")
 
 @router.delete("/{provider}")
@@ -952,3 +1023,118 @@ async def test_linkedin_connection(
             "connected": False,
             "message": f"Error: {str(e)}"
         }
+
+@router.get("/threads/profile")
+async def get_threads_profile(
+    force: bool = False,
+    current_user: dict = Depends(get_current_user), 
+    db: SupabaseClient = Depends(get_database)
+):
+    """Get Threads profile for the current user"""
+    try:
+        # Get the Threads connection
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'threads').execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="No Threads connection found")
+        
+        connection = response.data[0]
+        
+        # Check if we have profile data in metadata
+        if not force and connection.get('metadata') and connection.get('metadata').get('profile'):
+            logger.info("Returning cached Threads profile")
+            return connection['metadata']['profile']
+        
+        # Decrypt access token
+        access_token = decrypt_token(connection['access_token']) if connection.get('access_token') else None
+        
+        if not access_token:
+            raise HTTPException(status_code=400, detail="No access token available for Threads")
+        
+        # Fetch profile from Threads API
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Threads API URL - Using the Meta Graph API
+            # Note: We use the Instagram API since Threads is built on Instagram's infrastructure
+            api_url = f"https://graph.instagram.com/v18.0/me?fields=id,username,name,biography,profile_picture_url,followers_count,follows_count"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(api_url, headers=headers, timeout=15.0)
+                
+                if response.status_code == 200:
+                    profile_data = response.json()
+                    
+                    # Transform the data to match our ThreadsProfile model
+                    threads_profile = {
+                        "id": profile_data.get("id"),
+                        "username": profile_data.get("username"),
+                        "name": profile_data.get("name"),
+                        "bio": profile_data.get("biography"),
+                        "profile_picture_url": profile_data.get("profile_picture_url"),
+                        "follower_count": profile_data.get("followers_count"),
+                        "following_count": profile_data.get("follows_count")
+                    }
+                    
+                    # Update the metadata in the database
+                    metadata = connection.get('metadata', {}) or {}
+                    metadata['profile'] = threads_profile
+                    
+                    db.table('social_connections').update({
+                        'metadata': metadata,
+                        'updated_at': 'now()'
+                    }).eq('id', connection['id']).execute()
+                    
+                    logger.info(f"Updated Threads profile for user {current_user['id']}")
+                    return threads_profile
+                else:
+                    error_data = response.json() if response.headers.get("content-type") == "application/json" else {"message": response.text}
+                    logger.error(f"Error fetching Threads profile: {error_data}")
+                    raise HTTPException(status_code=response.status_code, detail=f"Error fetching Threads profile: {error_data}")
+        
+        except httpx.RequestError as e:
+            logger.error(f"Error making request to Threads API: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error connecting to Threads API: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving Threads profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve Threads profile: {str(e)}")
+
+@router.post("/store-threads-profile")
+async def store_threads_profile(
+    data: ThreadsProfileRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Store Threads profile data"""
+    try:
+        # Get the Threads connection
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'threads').execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="No Threads connection found")
+        
+        connection = response.data[0]
+        
+        # Update the metadata with the new profile
+        metadata = connection.get('metadata', {}) or {}
+        metadata['profile'] = data.profile.dict()
+        
+        # Update the database
+        db.table('social_connections').update({
+            'metadata': metadata,
+            'updated_at': 'now()'
+        }).eq('id', connection['id']).execute()
+        
+        return {"status": "success", "message": "Threads profile stored successfully"}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error storing Threads profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to store Threads profile: {str(e)}")

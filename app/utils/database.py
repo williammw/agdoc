@@ -40,15 +40,23 @@ def get_database(admin_access: bool = False):
     Args:
         admin_access: If True, returns the service role client that bypasses RLS
     """
-    if admin_access and service_supabase:
-        return service_supabase
-        
-    if not supabase:
+    try:
+        if admin_access and service_supabase:
+            return service_supabase
+            
+        if not supabase:
+            print("Error: Supabase client not initialized")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database connection error: Supabase client not initialized"
+            )
+        return supabase
+    except Exception as e:
+        print(f"Error getting database connection: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database connection error: Supabase client not initialized"
+            detail=f"Database connection error: {str(e)}"
         )
-    return supabase
 
 # Dependency factory function
 def get_db(admin_access: bool = False) -> Callable:

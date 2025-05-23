@@ -16,10 +16,19 @@ def encrypt_token(token: str) -> str:
     """Encrypt a token string"""
     if not token:
         return None
-    return fernet.encrypt(token.encode()).decode()
+    try:
+        return fernet.encrypt(token.encode()).decode()
+    except Exception as e:
+        print(f"Error encrypting token: {e}")
+        raise
 
 def decrypt_token(encrypted_token: str) -> str:
     """Decrypt an encrypted token string"""
     if not encrypted_token:
         return None
-    return fernet.decrypt(encrypted_token.encode()).decode() 
+    try:
+        return fernet.decrypt(encrypted_token.encode()).decode()
+    except Exception as e:
+        print(f"Error decrypting token: {e}")
+        # Return None instead of raising to prevent 500 errors
+        return None 

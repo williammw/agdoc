@@ -299,34 +299,41 @@ async def facebook_oauth(
 
 @router.post("/oauth/twitter")
 async def twitter_oauth(
-    data: Dict[str, str] = Body(...),
+    data: Dict[str, Any] = Body(...),
     supabase = Depends(db_admin)
 ):
     """
     Process Twitter OAuth authentication
     
-    This endpoint receives the Twitter OAuth tokens from the frontend and
+    This endpoint receives the Twitter OAuth2 tokens from the frontend and
     either finds an existing user or creates a new one, then returns a
     Firebase custom token for continued authentication.
     """
     try:
         # Extract tokens and user info from request body
         access_token = data.get("access_token")
-        oauth_token = data.get("oauth_token")
-        oauth_token_secret = data.get("oauth_token_secret")
-        email = data.get("email")
-        name = data.get("name") 
-        picture = data.get("picture")
-        provider_account_id = data.get("provider_account_id")
+        refresh_token = data.get("refresh_token")
+        token_type = data.get("token_type", "Bearer")
+        expires_in = data.get("expires_in")
+        scope = data.get("scope")
         
-        # Note: Twitter OAuth sometimes doesn't provide email directly
+        # Extract profile information
+        profile = data.get("profile", {})
+        provider_account_id = profile.get("id")
+        name = profile.get("name")
+        username = profile.get("username")
+        picture = profile.get("profile_image_url")
+        
+        # Twitter OAuth2 doesn't always provide email directly
         # For a production app, you would need to request email access
-        # and handle cases where email isn't provided
-        
+        # Handle cases where email isn't provided by creating a placeholder
+        email = profile.get("email")
         if not email:
             email = f"{provider_account_id}@twitter.placeholder.com"
         
-        return await process_oauth_authentication(
+        # Store the social connection with token and profile data
+        # This will be used for posting to Twitter later
+        user_result = await process_oauth_authentication(
             provider="twitter",
             email=email,
             name=name,
@@ -334,9 +341,52 @@ async def twitter_oauth(
             provider_account_id=provider_account_id,
             supabase=supabase
         )
+        
+        # Store the Twitter connection data for social media management
+        if user_result and "user_id" in user_result:
+            try:
+                # Check if we already have a social connection for this user and provider
+                connection_response = supabase.table('social_connections').select('*').eq('user_id', user_result["user_id"]).eq('provider', 'twitter').execute()
+                
+                connection_data = {
+                    'user_id': user_result["user_id"],
+                    'provider': 'twitter',
+                    'provider_account_id': provider_account_id,
+                    'access_token': access_token,
+                    'refresh_token': refresh_token,
+                    'token_type': token_type,
+                    'expires_in': expires_in,
+                    'scope': scope,
+                    'metadata': {
+                        'profile': profile,
+                        'connected_at': 'now()'
+                    }
+                }
+                
+                if connection_response.data and len(connection_response.data) > 0:
+                    # Update existing connection
+                    supabase.table('social_connections').update(connection_data).eq('id', connection_response.data[0]['id']).execute()
+                    print(f"Updated existing Twitter connection for user {user_result['user_id']}")
+                else:
+                    # Create new connection
+                    supabase.table('social_connections').insert(connection_data).execute()
+                    print(f"Created new Twitter connection for user {user_result['user_id']}")
+                    
+            except Exception as e:
+                print(f"Error storing Twitter connection data: {e}")
+                # Don't fail the authentication if connection storage fails
+        
+        return user_result
+        
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
+    except Exception as e:
+        print(f"Twitter OAuth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process Twitter authentication"
+        )
 
 @router.post("/oauth/linkedin")
 async def linkedin_oauth(
@@ -346,86 +396,84 @@ async def linkedin_oauth(
     """
     Process LinkedIn OAuth authentication
     
-    This endpoint receives the LinkedIn OAuth tokens from the frontend and
-    either finds an existing user or creates a new one, then returns a
-    Firebase custom token for continued authentication.
+    This endpoint receives data from the frontend and processes LinkedIn authentication.
     """
-    try:
-        # Log the data received for debugging
-        print(f"LinkedIn OAuth data received: {data}")
-        
-        # Extract tokens and user info from request body
-        access_token = data.get("access_token")
-        email = data.get("email")
-        name = data.get("name") 
-        picture = data.get("picture")
-        provider_account_id = data.get("provider_account_id")
-        
-        if not email and access_token:
-            # Try to fetch user data from LinkedIn API
-            try:
-                import requests
-                # LinkedIn API endpoints
-                profile_url = "https://api.linkedin.com/v2/me"
-                email_url = "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))"
-                
-                headers = {
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
+    # Extract data from the request
+    email = data.get("email")
+    name = data.get("name")
+    picture = data.get("picture")
+    linkedin_id = data.get("id")  # LinkedIn user ID
+    
+    # Process authentication and return response
+    return await process_oauth_authentication(
+        provider="linkedin",
+        email=email,
+        name=name,
+        picture=picture,
+        provider_account_id=linkedin_id,
+        supabase=supabase
+    )
+
+@router.post("/oauth/threads")
+async def threads_oauth(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process Threads OAuth authentication
+    
+    This endpoint receives data from the frontend and processes Threads authentication.
+    """
+    # Extract data from the request
+    email = data.get("email")
+    name = data.get("name")
+    picture = data.get("picture")
+    threads_id = data.get("id")  # Threads user ID
+    username = data.get("username")  # Threads username
+    
+    # Log the authentication attempt
+    print(f"Processing Threads OAuth for {email} (ID: {threads_id}, Username: {username})")
+    
+    # Process authentication and return response
+    result = await process_oauth_authentication(
+        provider="threads",
+        email=email,
+        name=name or username,  # Use username as fallback if name not provided
+        picture=picture,
+        provider_account_id=threads_id,
+        supabase=supabase
+    )
+    
+    # Store additional Threads-specific information if needed
+    if username and threads_id and result and "user_id" in result:
+        try:
+            # Check if we already have a social connection for this user and provider
+            connection_response = supabase.table('social_connections').select('*').eq('user_id', result["user_id"]).eq('provider', 'threads').execute()
+            
+            # If not found, store the basic profile in metadata
+            if not connection_response.data or len(connection_response.data) == 0:
+                # Create minimal profile metadata
+                threads_profile = {
+                    "id": threads_id,
+                    "username": username,
+                    "name": name,
+                    "profile_picture_url": picture
                 }
                 
-                # Get basic profile
-                profile_response = requests.get(profile_url, headers=headers)
-                if profile_response.status_code == 200:
-                    profile_data = profile_response.json()
-                    print(f"LinkedIn profile data: {profile_data}")
-                    provider_account_id = provider_account_id or profile_data.get("id")
-                    
-                    # Extract name from localized fields
-                    first_name = ""
-                    last_name = ""
-                    if "localizedFirstName" in profile_data:
-                        first_name = profile_data.get("localizedFirstName", "")
-                    if "localizedLastName" in profile_data:
-                        last_name = profile_data.get("localizedLastName", "")
-                    
-                    name = name or f"{first_name} {last_name}".strip()
+                # Create a placeholder social connection to store metadata
+                # Note: This will be properly updated when the actual OAuth token is received
+                supabase.table('social_connections').insert({
+                    'user_id': result["user_id"],
+                    'provider': 'threads',
+                    'provider_account_id': threads_id,
+                    'metadata': {'profile': threads_profile}
+                }).execute()
                 
-                # Get email if available
-                email_response = requests.get(email_url, headers=headers)
-                if email_response.status_code == 200:
-                    email_data = email_response.json()
-                    print(f"LinkedIn email data: {email_data}")
-                    if "elements" in email_data and len(email_data["elements"]) > 0:
-                        email = email or email_data["elements"][0]["handle~"]["emailAddress"]
-                
-            except Exception as e:
-                print(f"Error fetching user data from LinkedIn: {e}")
-        
-        # LinkedIn doesn't always provide email through the API
-        if not email and provider_account_id:
-            email = f"{provider_account_id}@linkedin.placeholder.com"
-            print(f"Using placeholder email: {email}")
-        
-        # Use our generic OAuth processing function
-        return await process_oauth_authentication(
-            provider="linkedin",
-            email=email,
-            name=name,
-            picture=picture,
-            provider_account_id=provider_account_id,
-            supabase=supabase
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        print(f"LinkedIn OAuth error: {e}")
-        # Return a more descriptive error
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LinkedIn OAuth error: {str(e)}"
-        )
+                print(f"Created placeholder Threads connection for user {result['user_id']}")
+        except Exception as e:
+            print(f"Error storing Threads metadata: {e}")
+    
+    return result
 
 @router.post("/token-refresh")
 async def refresh_token(
