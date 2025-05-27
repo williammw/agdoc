@@ -154,13 +154,14 @@ async def process_oauth_authentication(
                     await update_user_by_firebase_uid(supabase, firebase_uid, update_data)
                     print(f"Updated user profile in database for {email}")
             
-            # Get the user's actual ID token instead of creating a custom token
-            # This fixes the "verify_id_token() expects an ID token, but was given a custom token" error
+            # Create a custom token for the user for frontend authentication
             try:
-                # Get a fresh ID token for the user
-                user_record = auth.get_user(firebase_uid)
+                print(f"Creating custom token for Firebase UID: {firebase_uid}")
+                custom_token = auth.create_custom_token(firebase_uid)
+                token_str = custom_token.decode('utf-8') if isinstance(custom_token, bytes) else custom_token
+                print(f"Custom token created successfully: {token_str[:50]}...")
                 
-                # Return comprehensive data for the frontend
+                # Return comprehensive data for the frontend including firebase_token
                 return {
                     "firebase_uid": firebase_uid,
                     "user_id": db_user["id"],
@@ -168,10 +169,18 @@ async def process_oauth_authentication(
                     "full_name": db_user.get("full_name", ""),
                     "avatar_url": db_user.get("avatar_url", ""),
                     "email_verified": True,
-                    "auth_provider": f"{provider}.com"
+                    "auth_provider": f"{provider}.com",
+                    "firebase_token": token_str
                 }
             except Exception as token_error:
-                print(f"Error getting user record for token: {token_error}")
+                print(f"Error creating custom token for UID {firebase_uid}: {token_error}")
+                # Check if the user exists
+                try:
+                    user_check = auth.get_user(firebase_uid)
+                    print(f"User exists in Firebase: {user_check.email}")
+                except Exception as user_error:
+                    print(f"User doesn't exist in Firebase: {user_error}")
+                
                 # Fallback: return user data without firebase_token
                 return {
                     "firebase_uid": firebase_uid,
@@ -483,6 +492,68 @@ async def threads_oauth(
             print(f"Error storing Threads metadata: {e}")
     
     return result
+
+@router.post("/oauth/youtube")
+async def youtube_oauth(
+    data: Dict[str, Any] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process YouTube OAuth authentication
+    
+    This endpoint receives the YouTube OAuth data from the frontend and
+    either finds an existing user or creates a new one, then stores the
+    YouTube connection with tokens and channel data.
+    """
+    try:
+        # Extract data from the request
+        email = data.get("email")
+        name = data.get("name")
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_in = data.get("expires_in")
+        channel_data = data.get("channel_data")
+        user_session_email = data.get("user_session_email")  # Email from NextAuth session
+        
+        print(f"Processing YouTube OAuth for {email} (Channel ID: {provider_account_id})")
+        print(f"Session email: {user_session_email}")
+        
+        # Use session email as primary identifier if provided
+        auth_email = user_session_email or email
+        
+        if not auth_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required for YouTube authentication"
+            )
+        
+        # Process authentication and get user data
+        user_result = await process_oauth_authentication(
+            provider="youtube",  # Use 'youtube' as provider instead of 'google'
+            email=auth_email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
+        )
+        
+        # Note: YouTube tokens will be stored by the frontend using the standard store-token endpoint
+        # We just handle authentication and return the firebase_token here
+        print(f"YouTube OAuth authentication successful for user {user_result.get('user_id')} - tokens will be stored by frontend")
+        
+        return user_result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"YouTube OAuth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process YouTube authentication"
+        )
 
 @router.post("/token-refresh")
 async def refresh_token(
