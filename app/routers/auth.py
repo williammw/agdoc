@@ -555,6 +555,43 @@ async def youtube_oauth(
             detail="Failed to process YouTube authentication"
         )
 
+@router.get("/token")
+async def get_auth_token(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    supabase = Depends(db_admin)
+):
+    """
+    Get a Firebase token for the current authenticated user
+    
+    This endpoint returns a Firebase custom token that can be used for
+    authenticating with other backend services.
+    """
+    try:
+        firebase_uid = current_user.get("firebase_uid")
+        if not firebase_uid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing Firebase UID in user data"
+            )
+        
+        # Create a custom token for the user
+        custom_token = auth.create_custom_token(firebase_uid)
+        token_str = custom_token.decode('utf-8') if isinstance(custom_token, bytes) else custom_token
+        
+        return {
+            "firebase_token": token_str,
+            "user_id": current_user.get("id"),
+            "firebase_uid": firebase_uid,
+            "email": current_user.get("email")
+        }
+        
+    except Exception as e:
+        print(f"Error creating auth token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create authentication token"
+        )
+
 @router.post("/token-refresh")
 async def refresh_token(
     token_data: Dict[str, Any] = Depends(get_current_user_token)
