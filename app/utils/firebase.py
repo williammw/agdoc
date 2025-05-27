@@ -161,6 +161,15 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
                     uid = payload.get('sub') or payload.get('uid')
                     
                     if email:
+                        # Check if this is a service account email (skip lookup for these)
+                        if email.endswith('.gserviceaccount.com'):
+                            print(f"Skipping lookup for service account email: {email}")
+                            raise HTTPException(
+                                status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Service account emails cannot be used for user authentication",
+                                headers={"WWW-Authenticate": "Bearer"},
+                            )
+                        
                         # Try to get user by email
                         try:
                             user = auth.get_user_by_email(email)

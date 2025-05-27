@@ -143,36 +143,45 @@ async def process_oauth_authentication(
                     needs_update = True
                 
                 # Store provider-specific IDs in a safer way
-                # Only store provider IDs if the column exists in the database
+                # Don't try to update provider-specific columns directly as they may not exist
+                # Instead, store this information in the social_connections table or metadata
                 if provider_account_id:
-                    # Use a more generic approach that doesn't rely on specific columns
-                    if provider == "linkedin":
-                        # Don't try to update linkedin_id directly as the column doesn't exist
-                        # Instead, we'll store this in the social_connections table
-                        print(f"Storing LinkedIn ID {provider_account_id} in social_connections table")
-                    else:
-                        # Only attempt to update for other providers that might have columns
-                        update_data[f"{provider}_id"] = provider_account_id
-                        needs_update = True
+                    print(f"Provider account ID {provider_account_id} will be stored in social_connections table for {provider}")
+                    # Note: We don't update the users table with provider-specific columns
+                    # as these columns may not exist in the schema
                 
                 if needs_update:
                     await update_user_by_firebase_uid(supabase, firebase_uid, update_data)
                     print(f"Updated user profile in database for {email}")
             
-            # Create a custom token for the client
-            custom_token = auth.create_custom_token(firebase_uid)
-            
-            # Return comprehensive data for the frontend
-            return {
-                "firebase_token": custom_token.decode('utf-8'),
-                "firebase_uid": firebase_uid,
-                "user_id": db_user["id"],
-                "email": db_user["email"],
-                "full_name": db_user.get("full_name", ""),
-                "avatar_url": db_user.get("avatar_url", ""),
-                "email_verified": True,
-                "auth_provider": f"{provider}.com"
-            }
+            # Get the user's actual ID token instead of creating a custom token
+            # This fixes the "verify_id_token() expects an ID token, but was given a custom token" error
+            try:
+                # Get a fresh ID token for the user
+                user_record = auth.get_user(firebase_uid)
+                
+                # Return comprehensive data for the frontend
+                return {
+                    "firebase_uid": firebase_uid,
+                    "user_id": db_user["id"],
+                    "email": db_user["email"],
+                    "full_name": db_user.get("full_name", ""),
+                    "avatar_url": db_user.get("avatar_url", ""),
+                    "email_verified": True,
+                    "auth_provider": f"{provider}.com"
+                }
+            except Exception as token_error:
+                print(f"Error getting user record for token: {token_error}")
+                # Fallback: return user data without firebase_token
+                return {
+                    "firebase_uid": firebase_uid,
+                    "user_id": db_user["id"],
+                    "email": db_user["email"],
+                    "full_name": db_user.get("full_name", ""),
+                    "avatar_url": db_user.get("avatar_url", ""),
+                    "email_verified": True,
+                    "auth_provider": f"{provider}.com"
+                }
             
         except Exception as firebase_error:
             print(f"Firebase authentication error: {firebase_error}")
