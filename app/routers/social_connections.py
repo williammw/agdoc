@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from typing import Dict, Any, List, Optional, Union
 from app.dependencies.auth import get_current_user
-from app.models.social_connections import SocialConnection, SocialConnectionCreate
+from app.models.social_connections import SocialConnection, SocialConnectionCreate, SocialConnectionUpdate, SocialConnectionResponse, SocialConnectionWithTokens
 from app.utils.database import get_database
 from app.utils.encryption import encrypt_token, decrypt_token
 from pydantic import BaseModel
@@ -100,8 +100,16 @@ async def store_token(
             expires_at = str(data.expires_at)
     
     try:
-        # Check if connection already exists
-        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', data.provider).execute()
+        # Check if connection already exists for this specific account
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', data.provider).eq('provider_account_id', data.provider_account_id).execute()
+        
+        # Determine if this should be primary (first account for this provider)
+        is_primary = data.is_primary if data.is_primary is not None else False
+        if not response.data or len(response.data) == 0:
+            # Check if this is the first account for this provider
+            other_accounts = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', data.provider).execute()
+            if not other_accounts.data or len(other_accounts.data) == 0:
+                is_primary = True  # First account for this provider should be primary
         
         if response.data and len(response.data) > 0:
             # Update existing connection
@@ -113,6 +121,14 @@ async def store_token(
                 'provider_account_id': data.provider_account_id,
                 'updated_at': 'now()'
             }
+            
+            # Update new fields if provided
+            if data.account_label is not None:
+                update_data['account_label'] = data.account_label
+            if data.is_primary is not None:
+                update_data['is_primary'] = data.is_primary
+            if data.account_type is not None:
+                update_data['account_type'] = data.account_type
             
             # Add metadata if provided
             if data.profile_metadata:
@@ -152,7 +168,10 @@ async def store_token(
                 'provider_account_id': data.provider_account_id,
                 'access_token': encrypted_access_token,
                 'refresh_token': encrypted_refresh_token,
-                'expires_at': expires_at
+                'expires_at': expires_at,
+                'account_label': data.account_label,
+                'is_primary': is_primary,  # Use the calculated is_primary value
+                'account_type': data.account_type or 'personal'  # Default to personal if not specified
             }
             
             # Add metadata if provided
@@ -218,8 +237,8 @@ async def get_connections(
             
             return response.data if response.data else []
         else:
-            # Regular behavior without tokens for security
-            response = db.table('social_connections').select('provider, provider_account_id, created_at, expires_at, metadata').eq('user_id', current_user["id"]).execute()
+            # Regular behavior without tokens for security - include id for frontend operations
+            response = db.table('social_connections').select('id, provider, provider_account_id, created_at, expires_at, metadata, account_label, is_primary, account_type').eq('user_id', current_user["id"]).execute()
             return response.data if response.data else []
             
     except Exception as e:
@@ -232,18 +251,26 @@ async def get_connections(
 @router.get("/token/{provider}")
 async def get_token(
     provider: str,
+    provider_account_id: Optional[str] = Query(None, description="Specific account ID. If not provided, returns primary account or first account"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db = Depends(get_database)
 ):
-    """Get decrypted access token for a specific provider"""
+    """Get decrypted access token for a specific provider and account"""
     try:
         logger.info(f"Retrieving token for provider {provider} and user {current_user.get('id')}")
         
-        # Get the token for the specified provider
-        response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).execute()
+        if provider_account_id:
+            # Get token for specific account
+            response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        else:
+            # Get primary account first, then fallback to first account
+            response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
         
         if not response.data or len(response.data) == 0:
-            raise HTTPException(status_code=404, detail=f"No {provider} connection found")
+            if provider_account_id:
+                raise HTTPException(status_code=404, detail=f"No {provider} account found with ID {provider_account_id}")
+            else:
+                raise HTTPException(status_code=404, detail=f"No {provider} connection found")
         
         connection = response.data[0]
         
@@ -283,26 +310,197 @@ async def get_token(
 @router.delete("/{provider}")
 async def remove_connection(
     provider: str,
+    provider_account_id: Optional[str] = Query(None, description="Specific account ID to remove. If not provided, removes all accounts for the provider"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db = Depends(get_database)
 ):
-    """Remove a social connection"""
+    """Remove a social connection or specific account"""
     try:
-        # Check if connection exists
-        response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', provider).execute()
-        
-        if not response.data or len(response.data) == 0:
-            raise HTTPException(status_code=404, detail=f"No {provider} connection found")
-        
-        # Delete the connection
-        db.table('social_connections').delete().eq('user_id', current_user["id"]).eq('provider', provider).execute()
-        
-        return {"status": "success", "message": f"{provider} connection removed successfully"}
+        if provider_account_id:
+            # Delete specific account
+            response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+            
+            if not response.data or len(response.data) == 0:
+                raise HTTPException(status_code=404, detail=f"No {provider} account found with ID {provider_account_id}")
+            
+            # Delete the specific connection
+            db.table('social_connections').delete().eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+            
+            return {"status": "success", "message": f"{provider} account {provider_account_id} removed successfully"}
+        else:
+            # Delete all connections for provider (backward compatibility)
+            response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', provider).execute()
+            
+            if not response.data or len(response.data) == 0:
+                raise HTTPException(status_code=404, detail=f"No {provider} connections found")
+            
+            # Delete all connections for the provider
+            db.table('social_connections').delete().eq('user_id', current_user["id"]).eq('provider', provider).execute()
+            
+            return {"status": "success", "message": f"All {provider} connections removed successfully"}
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error removing connection: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to remove social connection: {str(e)}")
+
+@router.put("/set-primary/{provider}/{provider_account_id}")
+async def set_primary_account(
+    provider: str,
+    provider_account_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Set a specific account as primary for a provider"""
+    try:
+        # First, unset all primary flags for this provider and user
+        db.table('social_connections').update({
+            'is_primary': False
+        }).eq('user_id', current_user["id"]).eq('provider', provider).execute()
+        
+        # Then set the specific account as primary
+        response = db.table('social_connections').update({
+            'is_primary': True
+        }).eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {provider} account found with ID {provider_account_id}")
+        
+        return {"status": "success", "message": f"{provider} account {provider_account_id} set as primary"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error setting primary account: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to set primary account: {str(e)}")
+
+@router.put("/update-label/{provider}/{provider_account_id}")
+async def update_account_label(
+    provider: str,
+    provider_account_id: str,
+    label: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Update the label for a specific account"""
+    try:
+        response = db.table('social_connections').update({
+            'account_label': label
+        }).eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {provider} account found with ID {provider_account_id}")
+        
+        return {"status": "success", "message": f"Account label updated to '{label}'"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating account label: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update account label: {str(e)}")
+
+@router.delete("/account/{connection_id}")
+async def disconnect_specific_account(
+    connection_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    NEW ENDPOINT: Disconnect a specific social media account by connection ID.
+    Supports multi-account scenarios by removing only the specified connection.
+    """
+    try:
+        # First get the connection to check if it's primary
+        response = db.table('social_connections').select('*').eq('id', connection_id).eq('user_id', current_user["id"]).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        
+        connection = response.data[0]
+        
+        # If this is the primary account and there are other accounts for this provider,
+        # promote another account to primary
+        if connection.get('is_primary'):
+            other_response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', connection['provider']).neq('id', connection_id).limit(1).execute()
+            
+            if other_response.data and len(other_response.data) > 0:
+                # Set another account as primary
+                db.table('social_connections').update({
+                    'is_primary': True
+                }).eq('id', other_response.data[0]['id']).execute()
+        
+        # Delete the specific connection
+        db.table('social_connections').delete().eq('id', connection_id).eq('user_id', current_user["id"]).execute()
+        
+        return {"status": "success", "message": "Account disconnected successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error removing specific connection: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to remove connection: {str(e)}")
+
+@router.put("/account/{connection_id}/primary")
+async def set_primary_account_by_id(
+    connection_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    NEW ENDPOINT: Set a specific account as primary by its connection ID.
+    This is an alternative to the existing provider/account_id endpoint.
+    """
+    try:
+        # First verify the connection belongs to the user
+        response = db.table('social_connections').select('provider').eq('id', connection_id).eq('user_id', current_user["id"]).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        
+        provider = response.data[0]['provider']
+        
+        # Unset all primary flags for this provider and user
+        db.table('social_connections').update({
+            'is_primary': False
+        }).eq('user_id', current_user["id"]).eq('provider', provider).execute()
+        
+        # Set the specific account as primary
+        db.table('social_connections').update({
+            'is_primary': True
+        }).eq('id', connection_id).execute()
+        
+        return {"status": "success", "message": "Account set as primary"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error setting primary account: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to set primary account: {str(e)}")
+
+@router.put("/account/{connection_id}/label")
+async def update_account_label_by_id(
+    connection_id: str,
+    data: Dict[str, str],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    NEW ENDPOINT: Update the custom label for a social media account by connection ID.
+    """
+    try:
+        new_label = data.get("label", "").strip()
+        if not new_label:
+            raise HTTPException(status_code=400, detail="Label cannot be empty")
+        
+        response = db.table('social_connections').update({
+            'account_label': new_label
+        }).eq('id', connection_id).eq('user_id', current_user["id"]).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        
+        return {"status": "success", "message": f"Account label updated to '{new_label}'"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating account label: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update account label: {str(e)}")
 
 @router.post("/store-facebook-pages")
 async def store_facebook_pages(
@@ -1032,6 +1230,160 @@ async def test_linkedin_connection(
             "connected": False,
             "message": f"Error: {str(e)}"
         }
+
+@router.post("/sync-facebook-pages")
+async def sync_facebook_pages(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Sync Facebook pages as separate connection entries for multi-account support.
+    This creates individual connection entries for each Facebook page.
+    """
+    try:
+        # Get the main Facebook connection
+        fb_response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'facebook').execute()
+        
+        if not fb_response.data or len(fb_response.data) == 0:
+            raise HTTPException(status_code=404, detail="No Facebook connection found")
+        
+        # Find the personal account (not a page)
+        main_connection = None
+        for conn in fb_response.data:
+            if conn.get('account_type') != 'page':
+                main_connection = conn
+                break
+        
+        if not main_connection:
+            main_connection = fb_response.data[0]  # Fallback to first connection
+        
+        fb_metadata = main_connection.get('metadata', {}) or {}
+        pages = fb_metadata.get('pages', [])
+        
+        if not pages:
+            return {"status": "success", "message": "No Facebook pages to sync", "synced_count": 0}
+        
+        synced_count = 0
+        
+        # Get the decrypted access token from main connection
+        main_access_token = decrypt_token(main_connection['access_token']) if main_connection.get('access_token') else None
+        
+        if not main_access_token:
+            raise HTTPException(status_code=400, detail="No access token available for Facebook connection")
+        
+        for page in pages:
+            try:
+                # Check if this page already exists as a connection
+                existing_page = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', 'facebook').eq('provider_account_id', page.get('id')).execute()
+                
+                if not existing_page.data:
+                    # Create new connection for this page
+                    page_data = {
+                        'user_id': int(current_user["id"]),
+                        'provider': 'facebook',
+                        'provider_account_id': page.get('id'),
+                        'access_token': encrypt_token(page.get('access_token', main_access_token)),  # Use page token if available
+                        'account_label': page.get('name', 'Facebook Page'),
+                        'account_type': 'page',  # Mark as page type
+                        'is_primary': False,  # Pages are not primary by default
+                        'metadata': {
+                            'page_id': page.get('id'),
+                            'name': page.get('name'),
+                            'category': page.get('category'),
+                            'picture': page.get('picture', {}).get('data', {}).get('url') if isinstance(page.get('picture'), dict) else None,
+                            'fan_count': page.get('fan_count', 0),
+                            'tasks': page.get('tasks', [])
+                        }
+                    }
+                    
+                    db.table('social_connections').insert(page_data).execute()
+                    synced_count += 1
+                    logger.info(f"Created Facebook page connection for: {page.get('name')}")
+                else:
+                    # Update existing page connection
+                    update_data = {
+                        'account_label': page.get('name', 'Facebook Page'),
+                        'metadata': {
+                            'page_id': page.get('id'),
+                            'name': page.get('name'),
+                            'category': page.get('category'),
+                            'picture': page.get('picture', {}).get('data', {}).get('url') if isinstance(page.get('picture'), dict) else None,
+                            'fan_count': page.get('fan_count', 0),
+                            'tasks': page.get('tasks', [])
+                        },
+                        'updated_at': datetime.utcnow().isoformat()
+                    }
+                    
+                    # Update access token if page has its own token
+                    if page.get('access_token'):
+                        update_data['access_token'] = encrypt_token(page['access_token'])
+                    
+                    db.table('social_connections').update(update_data).eq('id', existing_page.data[0]['id']).execute()
+                    logger.info(f"Updated Facebook page connection for: {page.get('name')}")
+                    
+            except Exception as e:
+                logger.error(f"Error syncing Facebook page {page.get('name', 'Unknown')}: {str(e)}")
+                continue
+        
+        return {
+            "status": "success", 
+            "message": f"Synced {synced_count} Facebook pages as separate connections",
+            "synced_count": synced_count,
+            "total_pages": len(pages)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing Facebook pages: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync Facebook pages: {str(e)}")
+
+@router.get("/sync-status/{provider}")
+async def get_sync_status(
+    provider: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Check if additional accounts (pages, channels, etc.) need to be synced for a provider.
+    """
+    try:
+        if provider == 'facebook':
+            # Check if there are pages in metadata that aren't synced as connections
+            fb_response = db.table('social_connections').select('metadata').eq('user_id', current_user["id"]).eq('provider', 'facebook').execute()
+            
+            if not fb_response.data:
+                return {"needs_sync": False, "reason": "No Facebook connection found"}
+            
+            # Find the main account with pages
+            pages = []
+            for conn in fb_response.data:
+                if conn.get('metadata', {}).get('pages'):
+                    pages = conn['metadata']['pages']
+                    break
+            
+            if not pages:
+                return {"needs_sync": False, "reason": "No pages found"}
+            
+            # Check how many pages are already synced
+            page_connections = db.table('social_connections').select('provider_account_id').eq('user_id', current_user["id"]).eq('provider', 'facebook').eq('account_type', 'page').execute()
+            
+            synced_page_ids = [conn['provider_account_id'] for conn in (page_connections.data or [])]
+            unsynced_pages = [page for page in pages if page.get('id') not in synced_page_ids]
+            
+            return {
+                "needs_sync": len(unsynced_pages) > 0,
+                "total_pages": len(pages),
+                "synced_pages": len(synced_page_ids),
+                "unsynced_pages": len(unsynced_pages),
+                "unsynced_page_names": [page.get('name', 'Unknown') for page in unsynced_pages]
+            }
+        
+        return {"needs_sync": False, "reason": f"Sync status not implemented for {provider}"}
+        
+    except Exception as e:
+        logger.error(f"Error checking sync status for {provider}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to check sync status: {str(e)}")
 
 @router.get("/threads/profile")
 async def get_threads_profile(

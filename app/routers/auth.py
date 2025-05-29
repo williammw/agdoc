@@ -1,4 +1,5 @@
 from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.security import HTTPBearer
@@ -7,6 +8,7 @@ from firebase_admin import auth
 from app.dependencies.auth import get_current_user, get_current_user_token
 from app.utils.database import get_db, update_user_by_firebase_uid, get_user_by_firebase_uid, create_user
 from app.models.users import UserUpdate, UserResponse, UserWithInfo
+from app.utils.encryption import encrypt_token
 
 router = APIRouter(
     prefix="/api/v1/auth",
@@ -56,6 +58,82 @@ async def get_me(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get user info: {str(e)}"
         )
+
+# Helper function to store social connections with multi-account support
+async def store_social_connection_multi_account(
+    user_id: int,
+    provider: str,
+    provider_account_id: str,
+    access_token: str,
+    refresh_token: str = None,
+    expires_in: int = None,
+    metadata: dict = None,
+    account_label: str = None,
+    account_type: str = "personal",
+    supabase = None
+):
+    """
+    Store social connection with support for multiple accounts per platform.
+    """
+    # Calculate expiration time
+    expires_at = None
+    if expires_in:
+        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    
+    # Check if this specific account already exists
+    existing_result = supabase.table("social_connections").select("*").filter(
+        "user_id", "eq", user_id
+    ).filter(
+        "provider", "eq", provider
+    ).filter(
+        "provider_account_id", "eq", provider_account_id
+    ).execute()
+    
+    # Check if this is the first account for this provider (should be primary)
+    is_primary = False
+    if not existing_result.data:
+        other_accounts_result = supabase.table("social_connections").select("*").filter(
+            "user_id", "eq", user_id
+        ).filter(
+            "provider", "eq", provider
+        ).execute()
+        
+        is_primary = len(other_accounts_result.data) == 0
+    
+    # Extract account label from metadata if not provided
+    if not account_label and metadata:
+        account_label = (
+            metadata.get("name") or 
+            metadata.get("username") or 
+            metadata.get("profile", {}).get("name") or
+            f"{provider.capitalize()} Account"
+        )
+    
+    connection_data = {
+        "user_id": user_id,
+        "provider": provider,
+        "provider_account_id": provider_account_id,
+        "access_token": encrypt_token(access_token),
+        "refresh_token": encrypt_token(refresh_token) if refresh_token else None,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "metadata": metadata,
+        "account_label": account_label,
+        "is_primary": is_primary,
+        "account_type": account_type,
+        "updated_at": datetime.utcnow().isoformat()
+    }
+    
+    if existing_result.data:
+        # Update existing connection
+        supabase.table("social_connections").update(connection_data).filter(
+            "id", "eq", existing_result.data[0]["id"]
+        ).execute()
+        print(f"Updated existing {provider} connection for user {user_id}")
+    else:
+        # Insert new connection
+        connection_data["created_at"] = datetime.utcnow().isoformat()
+        supabase.table("social_connections").insert(connection_data).execute()
+        print(f"Created new {provider} connection for user {user_id}")
 
 # Generic OAuth processing function to avoid code duplication
 async def process_oauth_authentication(
@@ -360,36 +438,25 @@ async def twitter_oauth(
             supabase=supabase
         )
         
-        # Store the Twitter connection data for social media management
-        if user_result and "user_id" in user_result:
+        # Store the Twitter connection data for social media management with multi-account support
+        if user_result and "user_id" in user_result and access_token:
             try:
-                # Check if we already have a social connection for this user and provider
-                connection_response = supabase.table('social_connections').select('*').eq('user_id', user_result["user_id"]).eq('provider', 'twitter').execute()
-                
-                connection_data = {
-                    'user_id': user_result["user_id"],
-                    'provider': 'twitter',
-                    'provider_account_id': provider_account_id,
-                    'access_token': access_token,
-                    'refresh_token': refresh_token,
-                    'token_type': token_type,
-                    'expires_in': expires_in,
-                    'scope': scope,
-                    'metadata': {
+                await store_social_connection_multi_account(
+                    user_id=user_result["user_id"],
+                    provider="twitter",
+                    provider_account_id=provider_account_id,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    expires_in=expires_in,
+                    metadata={
                         'profile': profile,
-                        'connected_at': 'now()'
-                    }
-                }
-                
-                if connection_response.data and len(connection_response.data) > 0:
-                    # Update existing connection
-                    supabase.table('social_connections').update(connection_data).eq('id', connection_response.data[0]['id']).execute()
-                    print(f"Updated existing Twitter connection for user {user_result['user_id']}")
-                else:
-                    # Create new connection
-                    supabase.table('social_connections').insert(connection_data).execute()
-                    print(f"Created new Twitter connection for user {user_result['user_id']}")
-                    
+                        'token_type': token_type,
+                        'scope': scope
+                    },
+                    account_label=name or username,
+                    account_type="personal",
+                    supabase=supabase
+                )
             except Exception as e:
                 print(f"Error storing Twitter connection data: {e}")
                 # Don't fail the authentication if connection storage fails
