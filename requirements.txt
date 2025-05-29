@@ -192,6 +192,7 @@ stack-data==0.6.3
 starlette==0.37.2
 storage3==0.11.3
 StrEnum==0.4.15
+stripe==12.2.0
 supabase==2.15.1
 supafunc==0.9.4
 sympy==1.13.1
