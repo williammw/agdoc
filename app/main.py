@@ -23,6 +23,7 @@ app.add_middleware(
         "http://localhost:5173",  # Vite dev server
         "https://dev.multivio.com",  # Development frontend
         "https://multivio.com",  # Production frontend
+        "https://www.multivio.com",  # Production frontend with www
     ],
     allow_credentials=True,
     allow_methods=["*"],
