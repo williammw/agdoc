@@ -379,3 +379,4 @@ logging.basicConfig(level=logging.DEBUG)
 **Version**: 2.2.0  
 **Last Updated**: January 2025  
 **Key Changes**: User profile management, multi-account support, Facebook pages sync, metadata handling fixes
+

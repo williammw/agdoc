@@ -36,7 +36,7 @@ app.include_router(subscriptions.router)
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to Multivio API"}
+    return {"message": "Welcome to Multivio API v2.2.0 "}
 
 @app.on_event("startup")
 async def on_startup():
