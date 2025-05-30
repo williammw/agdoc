@@ -7,7 +7,7 @@ from firebase_admin import auth
 
 from app.dependencies.auth import get_current_user, get_current_user_token
 from app.utils.database import get_db, update_user_by_firebase_uid, get_user_by_firebase_uid, create_user
-from app.models.users import UserUpdate, UserResponse, UserWithInfo
+from app.models.users import UserResponse, UserWithInfo
 from app.utils.encryption import encrypt_token
 
 router = APIRouter(
@@ -16,6 +16,7 @@ router = APIRouter(
     # Remove the global dependency to avoid double validation
     # dependencies=[Depends(HTTPBearer())],
 )
+
 
 # Create database dependencies
 db_admin = get_db(admin_access=True)
@@ -35,8 +36,13 @@ async def get_me(
         # Get user info from the database
         response = supabase.table('user_info').select('*').eq('user_id', current_user["id"]).execute()
         
-        # Combine user and user_info
-        result = dict(current_user)
+        # Ensure we have the latest user data with all profile fields
+        fresh_user = supabase.table('users').select('*').eq('id', current_user["id"]).execute()
+        
+        if fresh_user.data and len(fresh_user.data) > 0:
+            result = dict(fresh_user.data[0])
+        else:
+            result = dict(current_user)
         
         if response.data and len(response.data) > 0:
             result["user_info"] = response.data[0]
@@ -677,56 +683,6 @@ async def refresh_token(
         "auth_provider": token_data.get("firebase", {}).get("sign_in_provider", "email"),
     }
 
-@router.put("/profile", response_model=UserResponse)
-async def update_profile(
-    updates: UserUpdate,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase = Depends(db_admin)
-):
-    """
-    Update the current user's profile information
-    
-    Enhanced profile update endpoint with validation and conflict detection.
-    """
-    try:
-        # Filter out None values
-        update_data = {k: v for k, v in updates.dict().items() if v is not None}
-        
-        if not update_data:
-            return current_user
-        
-        # Check for username conflicts if updating username
-        if "username" in update_data:
-            username_check = supabase.table('users').select('id').eq('username', update_data["username"]).neq('id', current_user["id"]).execute()
-            
-            if username_check.data and len(username_check.data) > 0:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Username already taken"
-                )
-        
-        # Update user
-        updated_user = await update_user_by_firebase_uid(
-            supabase, 
-            current_user["firebase_uid"], 
-            update_data
-        )
-        
-        if not updated_user:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update user profile"
-            )
-        
-        return updated_user
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error updating profile: {str(e)}"
-        )
 
 @router.get("/sync")
 async def sync_profile(
@@ -779,4 +735,54 @@ async def sync_profile(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error syncing profile: {str(e)}"
+        )
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    profile_data: dict = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    supabase = Depends(db_admin)
+):
+    """
+    Update user profile information
+    
+    Allows users to update their display name, work description, and bio.
+    """
+    try:
+        # Validate allowed fields
+        allowed_fields = {'full_name', 'display_name', 'work_description', 'bio'}
+        update_data = {k: v for k, v in profile_data.items() if k in allowed_fields and v is not None}
+        
+        if not update_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid fields provided for update"
+            )
+        
+        # Add updated_at timestamp
+        update_data['updated_at'] = datetime.now().isoformat()
+        
+        # Update user profile using firebase_uid since that's what we authenticate with
+        try:
+            response = supabase.table('users').update(update_data).eq('firebase_uid', current_user["firebase_uid"]).execute()
+            
+            if not response.data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            
+            return response.data[0]
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database update failed: {str(e)}"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update profile: {str(e)}"
         ) 

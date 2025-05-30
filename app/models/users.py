@@ -9,6 +9,9 @@ class UserBase(BaseModel):
     username: Optional[str] = None
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    display_name: Optional[str] = None
+    work_description: Optional[str] = None
+    bio: Optional[str] = None
 
 
 class UserCreate(UserBase):
@@ -24,6 +27,9 @@ class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     email_verified: Optional[bool] = None
+    display_name: Optional[str] = None
+    work_description: Optional[str] = None
+    bio: Optional[str] = None
 
 
 class UserInDB(UserBase):

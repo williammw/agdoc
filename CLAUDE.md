@@ -74,7 +74,32 @@ app/
 - **Token Management**: Encrypted storage of access/refresh tokens
 - **Custom Firebase Tokens**: Generated for frontend authentication
 
-### 3. Database Schema
+### 3. User Profile Management
+- **Extended profile fields**: display_name, work_description, bio
+- **Profile update endpoint**: PUT /api/v1/auth/profile
+- **Frontend integration**: General settings tab with form validation
+- **Character limits**: display_name (100), work_description (255), bio (unlimited)
+- **Real-time updates**: Changes immediately reflected in UI
+
+### 4. Database Schema
+
+**users table**:
+```sql
+- id: INTEGER primary key
+- firebase_uid: VARCHAR(255) unique
+- email: VARCHAR(255) unique
+- username: VARCHAR(100) unique
+- full_name: VARCHAR(255)
+- avatar_url: TEXT
+- email_verified: BOOLEAN
+- auth_provider: VARCHAR(50)
+- is_active: BOOLEAN default true
+- display_name: VARCHAR(100) - How users prefer to be called
+- work_description: VARCHAR(255) - What best describes their work
+- bio: TEXT - User biography
+- created_at: TIMESTAMP
+- updated_at: TIMESTAMP
+```
 
 **social_connections table**:
 ```sql
@@ -112,7 +137,8 @@ FIREBASE_PRIVATE_KEY=service-account-private-key
 ## API Endpoints
 
 ### Authentication (`/api/v1/auth`)
-- `GET /me` - Get current user profile
+- `GET /me` - Get current user profile with user info
+- `PUT /profile` - Update user profile (display_name, work_description, bio)
 - `POST /oauth/google` - Google OAuth handler
 - `POST /oauth/facebook` - Facebook OAuth handler
 - `POST /oauth/twitter` - Twitter OAuth handler
@@ -137,6 +163,51 @@ FIREBASE_PRIVATE_KEY=service-account-private-key
 - `POST /cancel` - Cancel subscription
 
 ## Common Development Tasks
+
+### User Profile Updates
+
+To handle user profile updates in the backend:
+
+1. **Pydantic Models** (in `app/models/users.py`):
+```python
+class UserBase(BaseModel):
+    email: EmailStr
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    display_name: Optional[str] = None
+    work_description: Optional[str] = None
+    bio: Optional[str] = None
+```
+
+2. **Profile Update Endpoint** (in `app/routers/auth.py`):
+```python
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    profile_data: dict = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    supabase = Depends(db_admin)
+):
+    # Validates and updates only allowed fields
+    allowed_fields = {'full_name', 'display_name', 'work_description', 'bio'}
+```
+
+3. **Frontend Request Example**:
+```javascript
+await fetch('/api/v1/auth/profile', {
+    method: 'PUT',
+    headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+        full_name: "John Doe",
+        display_name: "John",
+        work_description: "Software Developer",
+        bio: "Passionate about building great products"
+    })
+});
+```
 
 ### Adding a New OAuth Provider
 
@@ -198,6 +269,25 @@ curl -X DELETE "http://localhost:8000/api/v1/social-connections/account/{connect
 6. Connect Facebook account with pages and sync them
 7. Verify Facebook pages appear as separate connections
 
+## Database Migrations
+
+### Adding New User Profile Fields
+
+When adding new fields to the users table:
+
+1. **Create SQL migration file** (e.g., `003_user_profile_fields.sql`):
+```sql
+-- Add user profile fields
+ALTER TABLE users 
+ADD COLUMN IF NOT EXISTS display_name VARCHAR(100),
+ADD COLUMN IF NOT EXISTS work_description VARCHAR(255),
+ADD COLUMN IF NOT EXISTS bio TEXT;
+```
+
+2. **Update Pydantic models** in `app/models/users.py`
+3. **Update API endpoints** to handle new fields
+4. **Run migration** via Supabase SQL editor
+
 ## Deployment
 
 ### Production Deployment
@@ -232,6 +322,16 @@ curl -X DELETE "http://localhost:8000/api/v1/social-connections/account/{connect
    - Add frontend URL to allowed origins
    - Check request includes credentials
 
+5. **Profile update 403 errors**
+   - Ensure RLS policies allow updates for authenticated users
+   - Check Firebase token is valid and included in request
+   - Verify user has permission to update their own profile
+
+6. **Missing profile fields in API response**
+   - Update all Pydantic models (UserBase, UserResponse) to include new fields
+   - Ensure database query selects all columns
+   - Check that GET /me endpoint fetches fresh user data
+
 ### Debug Mode
 ```python
 # Enable detailed logging
@@ -248,6 +348,12 @@ logging.basicConfig(level=logging.DEBUG)
 5. **Environment**: Never commit secrets, use .env files
 
 ## Recent Updates
+π
+### User Profile Management (January 2025)
+- Added extended user profile fields (display_name, work_description, bio)
+- New `PUT /api/v1/auth/profile` endpoint for profile updates
+- Updated Pydantic models to include profile fields in API responses
+- Frontend General settings tab with profile form and validation
 
 ### Multi-Account Support (December 2024)
 - Added support for multiple accounts per platform
@@ -270,6 +376,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 ---
 
-**Version**: 2.1.0  
-**Last Updated**: December 2024  
-**Key Changes**: Multi-account support, Facebook pages sync, metadata handling fixes
+**Version**: 2.2.0  
+**Last Updated**: January 2025  
+**Key Changes**: User profile management, multi-account support, Facebook pages sync, metadata handling fixes

@@ -7,7 +7,7 @@ from app.utils.firebase import verify_firebase_token
 from app.utils.database import get_db, get_user_by_firebase_uid, create_user
 
 # Security scheme for Swagger UI
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # Create database dependency with admin access
 db_admin = get_db(admin_access=True)
@@ -58,7 +58,8 @@ async def get_current_user_token(
     
     # Verify the token with Firebase
     try:
-        return await verify_firebase_token(token)
+        token_data = await verify_firebase_token(token)
+        return token_data
     except HTTPException as e:
         # Re-raise with more context if needed
         if e.status_code == status.HTTP_401_UNAUTHORIZED:
@@ -114,7 +115,8 @@ async def get_current_user(
                 )
         
         # Check if the user is active
-        if not user.get("is_active", True):
+        is_active = user.get("is_active", True)
+        if not is_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="User account is disabled",
