@@ -156,7 +156,6 @@ PyJWT==2.10.1
 pylibsrtp==0.10.0
 pyOpenSSL==24.2.1
 pyparsing==3.1.2
-pyppeteer==2.0.0
 PySocks==1.7.1
 pytest==8.3.5
 pytest-mock==3.14.0
@@ -168,7 +167,6 @@ python-multipart==0.0.9
 pytz==2024.2
 PyYAML==6.0.1
 pyzmq==26.0.3
-realtime==2.4.3
 redis==5.1.0b7
 regex==2024.11.6
 replicate==1.0.4
@@ -230,7 +228,7 @@ wcwidth==0.2.13
 webdriver-manager==4.0.2
 webencodings==0.5.1
 websocket-client==1.8.0
-websockets==10.4
+websockets==14.2
 Werkzeug==3.0.3
 wikipedia==1.4.0
 wrapt==1.16.0
