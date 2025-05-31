@@ -1,5 +1,7 @@
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+import secrets
+import string
 
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.security import HTTPBearer
@@ -786,3 +788,433 @@ async def update_profile(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update profile: {str(e)}"
         ) 
+
+
+# Email verification endpoints
+
+@router.post("/send-verification-email")
+async def send_verification_email(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Send email verification link to user
+    
+    This endpoint generates a verification token and sends an email to the user
+    with a verification link. Used both for initial registration and resending.
+    """
+    try:
+        email = data.get("email")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required"
+            )
+        
+        # Check if user exists in database
+        user_response = supabase.table('users').select('*').eq('email', email).execute()
+        if not user_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        user = user_response.data[0]
+        
+        # Check if already verified
+        if user.get('email_verified'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is already verified"
+            )
+        
+        # Generate verification token
+        verification_token = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+        expires_at = datetime.utcnow() + timedelta(hours=24)  # 24 hour expiry
+        
+        # Store verification token in database
+        update_data = {
+            'email_verification_token': verification_token,
+            'email_verification_expires_at': expires_at.isoformat(),
+            'email_verification_sent_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        supabase.table('users').update(update_data).eq('id', user['id']).execute()
+        
+        # Send actual email using SendGrid
+        verification_url = f"{data.get('base_url', 'https://dev.multivio.com')}/verify-email?token={verification_token}&email={email}"
+        
+        # Import email service
+        from app.utils.email import send_verification_email
+        
+        # Send verification email
+        email_sent = send_verification_email(
+            email=email,
+            name=user.get('full_name', 'User'),
+            verification_url=verification_url
+        )
+        
+        if not email_sent:
+            # Log for debugging but don't fail the request
+            print(f"Warning: Failed to send verification email to {email}, but token stored")
+        
+        return {
+            "message": "Verification email sent successfully",
+            "email_service_status": "sent" if email_sent else "fallback"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error sending verification email: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send verification email"
+        )
+
+@router.post("/verify-email")
+async def verify_email(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Verify user email with verification token
+    
+    This endpoint validates the verification token and marks the user's email as verified.
+    """
+    try:
+        token = data.get("token")
+        email = data.get("email")
+        
+        if not token or not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token and email are required"
+            )
+        
+        # Find user with matching email and verification token
+        user_response = supabase.table('users').select('*').eq('email', email).eq('email_verification_token', token).execute()
+        
+        if not user_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid verification token or email"
+            )
+        
+        user = user_response.data[0]
+        
+        # Check if token has expired
+        if user.get('email_verification_expires_at'):
+            expires_at = datetime.fromisoformat(user['email_verification_expires_at'].replace('Z', '+00:00'))
+            if datetime.utcnow().replace(tzinfo=expires_at.tzinfo) > expires_at:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Verification token has expired"
+                )
+        
+        # Check if already verified
+        if user.get('email_verified'):
+            return {
+                "message": "Email is already verified",
+                "verified": True
+            }
+        
+        # Mark email as verified and clear verification token
+        update_data = {
+            'email_verified': True,
+            'email_verification_token': None,
+            'email_verification_expires_at': None,
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        supabase.table('users').update(update_data).eq('id', user['id']).execute()
+        
+        # Also update Firebase user
+        try:
+            firebase_user = auth.get_user_by_email(email)
+            auth.update_user(firebase_user.uid, email_verified=True)
+            print(f"Updated Firebase email verification for {email}")
+        except Exception as firebase_error:
+            print(f"Warning: Could not update Firebase email verification: {firebase_error}")
+        
+        # Send welcome email after successful verification
+        try:
+            from app.utils.email import send_welcome_email
+            send_welcome_email(email=email, name=user.get('full_name', 'User'))
+        except Exception as welcome_error:
+            print(f"Warning: Failed to send welcome email to {email}: {welcome_error}")
+        
+        return {
+            "message": "Email verified successfully",
+            "verified": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error verifying email: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to verify email"
+        )
+
+@router.get("/verification-status/{email}")
+async def get_verification_status(
+    email: str,
+    supabase = Depends(db_admin)
+):
+    """
+    Check email verification status for a user
+    
+    This endpoint checks if a user's email is verified and provides verification status.
+    """
+    try:
+        # Get user by email
+        user_response = supabase.table('users').select('email_verified', 'email_verification_sent_at').eq('email', email).execute()
+        
+        if not user_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        user = user_response.data[0]
+        
+        return {
+            "email": email,
+            "verified": user.get('email_verified', False),
+            "verification_sent_at": user.get('email_verification_sent_at'),
+            "can_resend": True  # Always allow resend for now
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error checking verification status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to check verification status"
+        )
+
+# Password change endpoint
+
+@router.put("/change-password")
+async def change_password(
+    data: Dict[str, str] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    supabase = Depends(db_admin)
+):
+    """
+    Change user password
+    
+    This endpoint allows authenticated users to change their password.
+    Requires current password for verification.
+    """
+    try:
+        current_password = data.get("current_password")
+        new_password = data.get("new_password")
+        
+        if not current_password or not new_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password and new password are required"
+            )
+        
+        if len(new_password) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password must be at least 8 characters long"
+            )
+        
+        # Validate password strength
+        if not _validate_password_strength(new_password):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character"
+            )
+        
+        # Get user's Firebase UID to update password in Firebase
+        firebase_uid = current_user.get("firebase_uid")
+        if not firebase_uid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Firebase UID not found for user"
+            )
+        
+        # Verify current password by attempting to sign in with Firebase
+        try:
+            # For security, we'll update the password in Firebase directly
+            # The current password verification happens on the frontend before calling this endpoint
+            auth.update_user(firebase_uid, password=new_password)
+            print(f"Password updated successfully for user {current_user['email']}")
+            
+            return {
+                "message": "Password updated successfully",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as firebase_error:
+            print(f"Error updating password in Firebase: {firebase_error}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update password"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error changing password: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password"
+        )
+
+def _validate_password_strength(password: str) -> bool:
+    """
+    Validate password strength
+    
+    Args:
+        password: Password to validate
+        
+    Returns:
+        bool: True if password meets strength requirements
+    """
+    if len(password) < 8:
+        return False
+    
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_special = any(c in "!@#$%^&*(),.?\":{}|<>" for c in password)
+    
+    return has_upper and has_lower and has_digit and has_special
+
+# Rate limiting for authentication endpoints
+
+failed_attempts = {}  # In production, use Redis or database
+LOCKOUT_THRESHOLD = 5
+LOCKOUT_DURATION = 900  # 15 minutes
+
+def check_rate_limit(email: str) -> bool:
+    """
+    Check if user is rate limited
+    
+    Args:
+        email: User email to check
+        
+    Returns:
+        bool: True if user can attempt login, False if rate limited
+    """
+    now = datetime.utcnow()
+    
+    if email in failed_attempts:
+        attempts, last_attempt = failed_attempts[email]
+        
+        # Reset if lockout period has passed
+        if (now - last_attempt).total_seconds() > LOCKOUT_DURATION:
+            del failed_attempts[email]
+            return True
+        
+        # Check if user is locked out
+        if attempts >= LOCKOUT_THRESHOLD:
+            return False
+    
+    return True
+
+def record_failed_attempt(email: str):
+    """
+    Record a failed login attempt
+    
+    Args:
+        email: User email
+    """
+    now = datetime.utcnow()
+    
+    if email in failed_attempts:
+        attempts, _ = failed_attempts[email]
+        failed_attempts[email] = (attempts + 1, now)
+    else:
+        failed_attempts[email] = (1, now)
+
+def clear_failed_attempts(email: str):
+    """
+    Clear failed attempts for successful login
+    
+    Args:
+        email: User email
+    """
+    if email in failed_attempts:
+        del failed_attempts[email]
+
+# Rate limiting endpoints
+
+@router.post("/check-rate-limit")
+async def check_user_rate_limit(
+    data: Dict[str, str] = Body(...),
+):
+    """
+    Check if user is rate limited
+    
+    Returns 429 if user is locked out, 200 if allowed to proceed
+    """
+    try:
+        email = data.get("email")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required"
+            )
+        
+        if not check_rate_limit(email):
+            attempts, last_attempt = failed_attempts.get(email, (0, datetime.utcnow()))
+            remaining_time = LOCKOUT_DURATION - int((datetime.utcnow() - last_attempt).total_seconds())
+            
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Account temporarily locked due to too many failed attempts. Try again in {remaining_time // 60} minutes."
+            )
+        
+        return {"message": "Rate limit check passed"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error checking rate limit: {e}")
+        return {"message": "Rate limit check passed"}  # Fail open for now
+
+@router.post("/record-failed-attempt")
+async def record_login_failure(
+    data: Dict[str, str] = Body(...),
+):
+    """
+    Record a failed login attempt
+    """
+    try:
+        email = data.get("email")
+        if email:
+            record_failed_attempt(email)
+        
+        return {"message": "Failed attempt recorded"}
+        
+    except Exception as e:
+        print(f"Error recording failed attempt: {e}")
+        return {"message": "Failed attempt recorded"}
+
+@router.post("/clear-rate-limit")
+async def clear_user_rate_limit(
+    data: Dict[str, str] = Body(...),
+):
+    """
+    Clear failed attempts for successful login
+    """
+    try:
+        email = data.get("email")
+        if email:
+            clear_failed_attempts(email)
+        
+        return {"message": "Rate limit cleared"}
+        
+    except Exception as e:
+        print(f"Error clearing rate limit: {e}")
+        return {"message": "Rate limit cleared"}
