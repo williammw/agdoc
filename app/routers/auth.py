@@ -630,19 +630,36 @@ async def youtube_oauth(
             detail="Failed to process YouTube authentication"
         )
 
-@router.get("/token")
+@router.post("/token")
 async def get_auth_token(
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    data: Dict[str, str] = Body(...),
     supabase = Depends(db_admin)
 ):
     """
-    Get a Firebase token for the current authenticated user
+    Get a Firebase token by email lookup
     
-    This endpoint returns a Firebase custom token that can be used for
-    authenticating with other backend services.
+    This endpoint looks up a user by email and returns a Firebase custom token
+    that can be used for authenticating with other backend services.
     """
     try:
-        firebase_uid = current_user.get("firebase_uid")
+        email = data.get("email")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required"
+            )
+        
+        # Get user from database by email
+        from app.utils.database import get_user_by_email
+        user = await get_user_by_email(supabase, email)
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        firebase_uid = user.get("firebase_uid")
         if not firebase_uid:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -655,11 +672,13 @@ async def get_auth_token(
         
         return {
             "firebase_token": token_str,
-            "user_id": current_user.get("id"),
+            "user_id": user.get("id"),
             "firebase_uid": firebase_uid,
-            "email": current_user.get("email")
+            "email": user.get("email")
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error creating auth token: {e}")
         raise HTTPException(
