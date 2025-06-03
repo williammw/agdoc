@@ -1506,3 +1506,205 @@ async def store_threads_profile(
     except Exception as e:
         logger.error(f"Error storing Threads profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to store Threads profile: {str(e)}")
+
+@router.post("/sync-linkedin-organizations")
+async def sync_linkedin_organizations(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Sync LinkedIn organizations as separate connection entries for multi-account support.
+    Creates individual connection entries for each LinkedIn organization/business page.
+    """
+    try:
+        # Get the main LinkedIn connection
+        linkedin_response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'linkedin').execute()
+        
+        if not linkedin_response.data or len(linkedin_response.data) == 0:
+            raise HTTPException(status_code=404, detail="No LinkedIn connection found")
+        
+        # Find the personal account (not a business page)
+        main_connection = None
+        for conn in linkedin_response.data:
+            if conn.get('account_type') != 'business':
+                main_connection = conn
+                break
+        
+        if not main_connection:
+            main_connection = linkedin_response.data[0]  # Fallback to first connection
+        
+        # Get the decrypted access token from main connection
+        main_access_token = decrypt_token(main_connection['access_token']) if main_connection.get('access_token') else None
+        
+        if not main_access_token:
+            raise HTTPException(status_code=400, detail="No access token available for LinkedIn connection")
+        
+        logger.info(f"Syncing LinkedIn organizations for user {current_user['id']}")
+        
+        # Fetch organizations from LinkedIn API
+        organizations = []
+        try:
+            # Try to get organizations the user administers
+            admin_response = httpx.get(
+                'https://api.linkedin.com/v2/organizationAcls?q=roleAssignee&role=ADMINISTRATOR',
+                headers={
+                    'Authorization': f'Bearer {main_access_token}',
+                    'X-Restli-Protocol-Version': '2.0.0'
+                },
+                timeout=15.0
+            )
+            
+            if admin_response.status_code == 200:
+                admin_data = admin_response.json()
+                logger.info(f"LinkedIn admin organizations response: {admin_data}")
+                
+                if admin_data.get('elements') and len(admin_data['elements']) > 0:
+                    # Extract organization IDs and fetch details
+                    org_ids = []
+                    for element in admin_data['elements']:
+                        if element.get('organization'):
+                            # Extract ID from URN format
+                            org_urn = element['organization']
+                            if ':' in org_urn:
+                                org_id = org_urn.split(':')[-1]
+                            else:
+                                org_id = org_urn
+                            org_ids.append(org_id)
+                    
+                    # Add specific organization ID if not already present
+                    if '105348666' not in org_ids:
+                        org_ids.append('105348666')
+                        logger.info("Adding organization ID 105348666 explicitly")
+                    
+                    # Fetch details for each organization
+                    for org_id in org_ids:
+                        try:
+                            org_detail_response = httpx.get(
+                                f'https://api.linkedin.com/v2/organizations/{org_id}',
+                                headers={
+                                    'Authorization': f'Bearer {main_access_token}',
+                                    'X-Restli-Protocol-Version': '2.0.0'
+                                },
+                                timeout=10.0
+                            )
+                            
+                            if org_detail_response.status_code == 200:
+                                org_detail = org_detail_response.json()
+                                logger.info(f"Organization {org_id} details: {org_detail}")
+                                
+                                organization = {
+                                    'id': org_detail.get('id'),
+                                    'name': org_detail.get('localizedName', f'LinkedIn Organization {org_id}'),
+                                    'vanityName': org_detail.get('vanityName'),
+                                    'organizationType': org_detail.get('organizationType', {}).get('localizedName'),
+                                    'role': 'ADMINISTRATOR'
+                                }
+                                
+                                # Try to get logo
+                                try:
+                                    logo_response = httpx.get(
+                                        f'https://api.linkedin.com/v2/organizations/{org_id}/logoImage',
+                                        headers={
+                                            'Authorization': f'Bearer {main_access_token}',
+                                            'X-Restli-Protocol-Version': '2.0.0'
+                                        },
+                                        timeout=5.0
+                                    )
+                                    
+                                    if logo_response.status_code == 200:
+                                        logo_data = logo_response.json()
+                                        if (logo_data and logo_data.get('displayImage') and 
+                                            logo_data['displayImage'].get('elements') and 
+                                            len(logo_data['displayImage']['elements']) > 0):
+                                            organization['logoUrl'] = logo_data['displayImage']['elements'][0]['identifiers'][0]['identifier']
+                                            logger.info(f"Found logo for organization {org_id}")
+                                except Exception as logo_err:
+                                    logger.error(f"Error fetching logo for organization {org_id}: {str(logo_err)}")
+                                
+                                organizations.append(organization)
+                            else:
+                                logger.error(f"Failed to fetch organization {org_id}: {org_detail_response.text}")
+                        except Exception as org_err:
+                            logger.error(f"Error processing organization {org_id}: {str(org_err)}")
+                            continue
+            else:
+                logger.error(f"Failed to fetch LinkedIn organizations: {admin_response.text}")
+        
+        except Exception as linkedin_err:
+            logger.error(f"Error fetching LinkedIn organizations: {str(linkedin_err)}")
+        
+        if not organizations:
+            return {"status": "success", "message": "No LinkedIn organizations to sync", "synced_count": 0}
+        
+        synced_count = 0
+        
+        # Create separate connections for each organization
+        for org in organizations:
+            try:
+                # Check if this organization already exists as a connection
+                existing_org = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', 'linkedin').eq('provider_account_id', org.get('id')).execute()
+                
+                if not existing_org.data:
+                    # Create new connection for this organization
+                    org_data = {
+                        'user_id': int(current_user["id"]),
+                        'provider': 'linkedin',
+                        'provider_account_id': org.get('id'),
+                        'access_token': encrypt_token(main_access_token),  # Use main account token
+                        'account_label': org.get('name', 'LinkedIn Organization'),
+                        'account_type': 'business',  # Mark as business type
+                        'is_primary': False,  # Organizations are not primary by default
+                        'metadata': {
+                            'organization_id': org.get('id'),
+                            'organization_name': org.get('name'),
+                            'vanity_name': org.get('vanityName'),
+                            'organization_type': org.get('organizationType'),
+                            'role': org.get('role'),
+                            'logo_url': org.get('logoUrl'),
+                            'account_type': 'business',
+                            'parent_profile_id': main_connection.get('provider_account_id')
+                        }
+                    }
+                    
+                    db.table('social_connections').insert(org_data).execute()
+                    synced_count += 1
+                    logger.info(f"Created LinkedIn organization connection for: {org.get('name')}")
+                else:
+                    # Update existing organization connection
+                    update_data = {
+                        'account_label': org.get('name', 'LinkedIn Organization'),
+                        'metadata': {
+                            'organization_id': org.get('id'),
+                            'organization_name': org.get('name'),
+                            'vanity_name': org.get('vanityName'),
+                            'organization_type': org.get('organizationType'),
+                            'role': org.get('role'),
+                            'logo_url': org.get('logoUrl'),
+                            'account_type': 'business',
+                            'parent_profile_id': main_connection.get('provider_account_id')
+                        },
+                        'updated_at': datetime.utcnow().isoformat()
+                    }
+                    
+                    # Update access token if needed
+                    update_data['access_token'] = encrypt_token(main_access_token)
+                    
+                    db.table('social_connections').update(update_data).eq('id', existing_org.data[0]['id']).execute()
+                    logger.info(f"Updated LinkedIn organization connection for: {org.get('name')}")
+                    
+            except Exception as e:
+                logger.error(f"Error syncing LinkedIn organization {org.get('name', 'Unknown')}: {str(e)}")
+                continue
+        
+        return {
+            "status": "success", 
+            "message": f"Synced {synced_count} LinkedIn organizations as separate connections",
+            "synced_count": synced_count,
+            "total_organizations": len(organizations)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing LinkedIn organizations: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync LinkedIn organizations: {str(e)}")
