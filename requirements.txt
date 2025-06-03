@@ -157,7 +157,7 @@ PyJWT==2.10.1
 pylibsrtp==0.10.0
 pyOpenSSL==24.2.1
 pyparsing==3.1.2
-pyppeteer==2.0.0
+playwright==1.49.1
 PySocks==1.7.1
 pytest==8.3.5
 pytest-mock==3.14.0
@@ -234,7 +234,7 @@ wcwidth==0.2.13
 webdriver-manager==4.0.2
 webencodings==0.5.1
 websocket-client==1.8.0
-websockets==10.4
+websockets==11.0.3
 Werkzeug==3.0.3
 wikipedia==1.4.0
 wrapt==1.16.0
