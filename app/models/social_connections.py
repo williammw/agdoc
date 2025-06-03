@@ -42,7 +42,14 @@ class SocialConnectionCreate(BaseModel):
     def validate_expires_at(cls, v):
         if isinstance(v, str):
             try:
-                return datetime.fromisoformat(v.replace('Z', '+00:00'))
+                expires_at_str = v.replace('Z', '+00:00')
+                try:
+                    return datetime.fromisoformat(expires_at_str)
+                except ValueError:
+                    # Handle microseconds format issues by normalizing to 6 digits
+                    import re
+                    expires_at_str = re.sub(r'\.(\d{1,6})', lambda m: f'.{m.group(1).ljust(6, "0")}', expires_at_str)
+                    return datetime.fromisoformat(expires_at_str)
             except ValueError:
                 try:
                     # Try parsing as Unix timestamp (integer string)
@@ -66,7 +73,14 @@ class SocialConnectionUpdate(BaseModel):
     def validate_expires_at(cls, v):
         if isinstance(v, str):
             try:
-                return datetime.fromisoformat(v.replace('Z', '+00:00'))
+                expires_at_str = v.replace('Z', '+00:00')
+                try:
+                    return datetime.fromisoformat(expires_at_str)
+                except ValueError:
+                    # Handle microseconds format issues by normalizing to 6 digits
+                    import re
+                    expires_at_str = re.sub(r'\.(\d{1,6})', lambda m: f'.{m.group(1).ljust(6, "0")}', expires_at_str)
+                    return datetime.fromisoformat(expires_at_str)
             except ValueError:
                 try:
                     # Try parsing as Unix timestamp (integer string)

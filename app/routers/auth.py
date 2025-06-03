@@ -925,7 +925,17 @@ async def verify_email(
         
         # Check if token has expired
         if user.get('email_verification_expires_at'):
-            expires_at = datetime.fromisoformat(user['email_verification_expires_at'].replace('Z', '+00:00'))
+            # Handle different datetime formats and microseconds
+            expires_at_str = user['email_verification_expires_at'].replace('Z', '+00:00')
+            try:
+                expires_at = datetime.fromisoformat(expires_at_str)
+            except ValueError:
+                # Handle microseconds format issues by normalizing to 6 digits
+                import re
+                # Find microseconds pattern and normalize it
+                expires_at_str = re.sub(r'\.(\d{1,6})', lambda m: f'.{m.group(1).ljust(6, "0")}', expires_at_str)
+                expires_at = datetime.fromisoformat(expires_at_str)
+            
             if datetime.utcnow().replace(tzinfo=expires_at.tzinfo) > expires_at:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,

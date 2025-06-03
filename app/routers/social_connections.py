@@ -84,7 +84,14 @@ async def store_token(
         if isinstance(data.expires_at, str):
             try:
                 # Try to parse as ISO format
-                expires_at = datetime.fromisoformat(data.expires_at.replace('Z', '+00:00'))
+                expires_at_str = data.expires_at.replace('Z', '+00:00')
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_str)
+                except ValueError:
+                    # Handle microseconds format issues by normalizing to 6 digits
+                    import re
+                    expires_at_str = re.sub(r'\.(\d{1,6})', lambda m: f'.{m.group(1).ljust(6, "0")}', expires_at_str)
+                    expires_at = datetime.fromisoformat(expires_at_str)
             except ValueError:
                 try:
                     # Try to parse as timestamp
