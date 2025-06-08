@@ -132,6 +132,7 @@ pandas==2.2.3
 parso==0.8.4
 pexpect==4.9.0
 pillow==11.1.0
+pipdeptree==2.26.1
 platformdirs==4.2.2
 pluggy==1.5.0
 postgrest==1.0.1
@@ -151,13 +152,13 @@ pydantic==2.8.2
 pydantic-settings==2.7.1
 pydantic_core==2.20.1
 pydub==0.25.1
-pyee==12.0.0
+pyee==11.1.1
 Pygments==2.18.0
 PyJWT==2.10.1
 pylibsrtp==0.10.0
 pyOpenSSL==24.2.1
 pyparsing==3.1.2
-playwright==1.49.1
+# pyppeteer==2.0.0
 PySocks==1.7.1
 pytest==8.3.5
 pytest-mock==3.14.0
@@ -234,7 +235,7 @@ wcwidth==0.2.13
 webdriver-manager==4.0.2
 webencodings==0.5.1
 websocket-client==1.8.0
-# websockets==11.0.3  # Removed - not used in project
+# websockets==14.2
 Werkzeug==3.0.3
 wikipedia==1.4.0
 wrapt==1.16.0

@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Import our routers
 from app.routers import auth, social_connections, subscriptions
+from app.routers import content_simple as content
 
 # Import database initialization function
 from app.utils.database import initialize_database
@@ -34,6 +35,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(social_connections.router)
 app.include_router(subscriptions.router)
+app.include_router(content.router)
 
 @app.get("/")
 async def root():

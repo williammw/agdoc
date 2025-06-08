@@ -214,6 +214,7 @@ async def initialize_database():
         users_sql = read_sql_file('users.sql')
         user_info_sql = read_sql_file('user_info.sql')
         social_connections_sql = read_sql_file('social_connections.sql')
+        content_management_sql = read_sql_file('migrations/003_content_management.sql')
         
         # Print the instructions for manual SQL execution
         print("\n===== DATABASE INITIALIZATION INSTRUCTIONS =====")
@@ -241,6 +242,10 @@ async def initialize_database():
             if social_connections_sql:
                 print("\n-- Social Connections Table SQL:")
                 print(social_connections_sql)
+            
+            if content_management_sql:
+                print("\n-- Content Management Tables SQL:")
+                print(content_management_sql)
                 
         print("\n===== END DATABASE INITIALIZATION INSTRUCTIONS =====")
         print("\nAfter executing these SQL statements, restart the application.")
