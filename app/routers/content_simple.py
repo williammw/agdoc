@@ -24,11 +24,18 @@ class PostGroupBase(BaseModel):
     content_mode: str = Field(default="universal")
 
 class PostGroupCreate(PostGroupBase):
-    pass
+    universal_content: Optional[str] = ""
+    universal_metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    platform_content: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    media_files: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    platforms: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
 
 class PostGroupUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     content_mode: Optional[str] = None
+    universal_content: Optional[str] = None
+    universal_metadata: Optional[Dict[str, Any]] = None
+    media_files: Optional[List[Dict[str, Any]]] = None
 
 class PostGroup(PostGroupBase):
     id: UUID
@@ -84,7 +91,11 @@ async def create_post_group(
         insert_data = {
             "user_id": current_user["id"],
             "name": group_data.name,
-            "content_mode": group_data.content_mode
+            "content_mode": group_data.content_mode,
+            "universal_content": getattr(group_data, 'universal_content', ''),
+            "universal_metadata": getattr(group_data, 'universal_metadata', {}),
+            "platform_content": getattr(group_data, 'platform_content', {}),
+            "media_files": getattr(group_data, 'media_files', [])
         }
         
         response = db.table('post_groups').insert(insert_data).execute()
@@ -116,6 +127,12 @@ async def update_post_group(
             update_data["name"] = group_data.name
         if group_data.content_mode is not None:
             update_data["content_mode"] = group_data.content_mode
+        if group_data.universal_content is not None:
+            update_data["universal_content"] = group_data.universal_content
+        if group_data.universal_metadata is not None:
+            update_data["universal_metadata"] = group_data.universal_metadata
+        if group_data.media_files is not None:
+            update_data["media_files"] = group_data.media_files
         
         if not update_data:
             # No updates provided

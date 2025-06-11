@@ -295,6 +295,84 @@ async def process_oauth_authentication(
             detail=f"Failed to process {provider} authentication: {str(e)}"
         )
 
+@router.post("/token")
+async def get_auth_token(
+    data: Dict[str, str] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Get a Firebase token for an existing authenticated user
+    
+    This endpoint is used to get a Firebase token for users who are already
+    authenticated through NextAuth but need a Firebase token for backend API calls.
+    """
+    try:
+        email = data.get("email")
+        name = data.get("name")
+        picture = data.get("picture")
+        
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required for token generation"
+            )
+        
+        # Look up the user by email in our database
+        result = supabase.table("users").select("*").eq("email", email).execute()
+        
+        if not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found. Please complete registration first."
+            )
+        
+        user = result.data[0]
+        
+        # Get or verify Firebase user
+        firebase_user = None
+        try:
+            firebase_user = auth.get_user_by_email(email)
+        except auth.UserNotFoundError:
+            # User doesn't exist in Firebase, create them
+            try:
+                firebase_user = auth.create_user(
+                    email=email,
+                    display_name=name or user.get("full_name"),
+                    photo_url=picture or user.get("avatar_url")
+                )
+                
+                # Update our database with the new Firebase UID
+                supabase.table("users").update({
+                    "firebase_uid": firebase_user.uid
+                }).eq("id", user["id"]).execute()
+                
+            except Exception as e:
+                print(f"Error creating Firebase user: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to create Firebase user"
+                )
+        
+        # Generate a custom token for this user (for backend use)
+        firebase_token = auth.create_custom_token(firebase_user.uid).decode('utf-8')
+        print(f"Generated custom token for user {firebase_user.uid} (email: {email})")
+        
+        return {
+            "firebase_token": firebase_token,
+            "user_id": user["id"],
+            "firebase_uid": firebase_user.uid,
+            "message": "Token generated successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in token generation: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate token: {str(e)}"
+        )
+
 @router.post("/oauth/google")
 async def google_oauth(
     data: Dict[str, str] = Body(...),

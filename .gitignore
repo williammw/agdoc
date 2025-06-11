@@ -67,3 +67,5 @@ uploaded_files/
 config/
 materials/
 fine-tune/ 
+test_r2_public_url.py
+test_r2_upload.py

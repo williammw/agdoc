@@ -139,10 +139,18 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
         try:
             # First try verifying it as an ID token
             decoded_token = auth.verify_id_token(token)
+            print(f"Successfully verified ID token for user: {decoded_token.get('uid')}")
             return decoded_token
         except auth.InvalidIdTokenError as e:
             # If that fails, log the specific error
             print(f"ID token verification failed: {str(e)}")
+            
+            # Check if this might be a custom token scenario
+            if "expects an ID token, but was given a custom token" in str(e):
+                print("Detected custom token - this is expected for backend authentication")
+                # Continue with custom token handling below
+            else:
+                print(f"Other ID token error: {str(e)}")
             
             # Try to extract email from the token (for custom tokens or JWT format)
             try:
@@ -173,6 +181,7 @@ async def verify_firebase_token(token: str) -> Dict[str, Any]:
                         # Try to get user by email
                         try:
                             user = auth.get_user_by_email(email)
+                            print(f"Found Firebase user for email {email}: {user.uid}")
                             return {
                                 "uid": user.uid,
                                 "email": user.email,
