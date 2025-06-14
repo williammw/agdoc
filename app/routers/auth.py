@@ -708,6 +708,106 @@ async def youtube_oauth(
             detail="Failed to process YouTube authentication"
         )
 
+@router.post("/oauth/tiktok")
+async def tiktok_oauth(
+    data: Dict[str, Any] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process TikTok OAuth authentication
+    
+    This endpoint receives the TikTok OAuth data from the frontend and
+    either finds an existing user or creates a new one, then stores the
+    TikTok connection with tokens and user data.
+    """
+    try:
+        # Extract data from the request
+        email = data.get("email")
+        name = data.get("name")
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")  # TikTok open_id
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_in = data.get("expires_in")
+        metadata = data.get("metadata", {})
+        user_session_email = data.get("user_session_email")  # Email from NextAuth session
+        
+        print(f"Processing TikTok OAuth for {email} (TikTok ID: {provider_account_id})")
+        print(f"Session email: {user_session_email}")
+        
+        # Use session email as primary identifier if provided
+        auth_email = user_session_email or email
+        
+        if not auth_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required for TikTok authentication"
+            )
+        
+        if not provider_account_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="TikTok open_id is required"
+            )
+        
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Access token is required for TikTok authentication"
+            )
+        
+        # Process authentication and get user data
+        user_result = await process_oauth_authentication(
+            provider="tiktok",
+            email=auth_email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
+        )
+        
+        # Store the TikTok connection data for social media management with multi-account support
+        if user_result and "user_id" in user_result and access_token:
+            try:
+                # Prepare TikTok metadata with user info
+                tiktok_metadata = {
+                    'profile': {
+                        'open_id': provider_account_id,
+                        'display_name': name,
+                        'avatar_url': picture,
+                        **metadata  # Include any additional metadata passed from frontend
+                    }
+                }
+                
+                await store_social_connection_multi_account(
+                    user_id=user_result["user_id"],
+                    provider="tiktok",
+                    provider_account_id=provider_account_id,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    expires_in=expires_in,
+                    metadata=tiktok_metadata,
+                    account_label=name or f"TikTok Account",
+                    account_type="personal",
+                    supabase=supabase
+                )
+                print(f"Successfully stored TikTok connection for user {user_result['user_id']}")
+            except Exception as e:
+                print(f"Error storing TikTok connection data: {e}")
+                # Don't fail the authentication if connection storage fails
+        
+        return user_result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"TikTok OAuth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process TikTok authentication"
+        )
+
 @router.post("/token")
 async def get_auth_token(
     data: Dict[str, str] = Body(...),

@@ -1708,3 +1708,195 @@ async def sync_linkedin_organizations(
     except Exception as e:
         logger.error(f"Error syncing LinkedIn organizations: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to sync LinkedIn organizations: {str(e)}")
+
+class TikTokProfile(BaseModel):
+    open_id: str
+    display_name: Optional[str] = None
+    username: Optional[str] = None
+    avatar_url: Optional[str] = None
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+    likes_count: Optional[int] = None
+    video_count: Optional[int] = None
+    bio_description: Optional[str] = None
+    is_verified: Optional[bool] = None
+
+class TikTokProfileRequest(BaseModel):
+    profile: TikTokProfile
+
+@router.get("/tiktok/profile")
+async def get_tiktok_profile(
+    force: bool = False,
+    current_user: dict = Depends(get_current_user), 
+    db: SupabaseClient = Depends(get_database)
+):
+    """Get TikTok profile for the current user"""
+    try:
+        # Get the TikTok connection
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'tiktok').execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="No TikTok connection found")
+        
+        connection = response.data[0]
+        
+        # Check if we have profile data in metadata
+        if not force and connection.get('metadata') and connection.get('metadata').get('profile'):
+            logger.info("Returning cached TikTok profile")
+            return connection['metadata']['profile']
+        
+        # Decrypt access token
+        access_token = decrypt_token(connection['access_token']) if connection.get('access_token') else None
+        
+        if not access_token:
+            raise HTTPException(status_code=400, detail="No access token available for TikTok")
+        
+        # Fetch profile from TikTok API
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # TikTok API URL for user info
+            api_url = f"https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name,bio_description,profile_deep_link,is_verified,follower_count,following_count,likes_count,video_count"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(api_url, headers=headers, timeout=15.0)
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    user_data = response_data.get("data", {}).get("user", {})
+                    
+                    # Transform the data to match our TikTokProfile model
+                    tiktok_profile = {
+                        "open_id": user_data.get("open_id"),
+                        "display_name": user_data.get("display_name"),
+                        "username": user_data.get("username"),  # May not be available in TikTok API
+                        "avatar_url": user_data.get("avatar_url"),
+                        "follower_count": user_data.get("follower_count"),
+                        "following_count": user_data.get("following_count"),
+                        "likes_count": user_data.get("likes_count"),
+                        "video_count": user_data.get("video_count"),
+                        "bio_description": user_data.get("bio_description"),
+                        "is_verified": user_data.get("is_verified")
+                    }
+                    
+                    # Update the metadata in the database
+                    metadata = connection.get('metadata', {}) or {}
+                    metadata['profile'] = tiktok_profile
+                    
+                    db.table('social_connections').update({
+                        'metadata': metadata,
+                        'updated_at': 'now()'
+                    }).eq('id', connection['id']).execute()
+                    
+                    logger.info(f"Updated TikTok profile for user {current_user['id']}")
+                    return tiktok_profile
+                else:
+                    error_data = response.json() if response.headers.get("content-type") == "application/json" else {"message": response.text}
+                    logger.error(f"Error fetching TikTok profile: {error_data}")
+                    raise HTTPException(status_code=response.status_code, detail=f"Error fetching TikTok profile: {error_data}")
+        
+        except httpx.RequestError as e:
+            logger.error(f"Error making request to TikTok API: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error connecting to TikTok API: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving TikTok profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve TikTok profile: {str(e)}")
+
+@router.post("/store-tiktok-profile")
+async def store_tiktok_profile(
+    data: TikTokProfileRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Store TikTok profile data"""
+    try:
+        # Get the TikTok connection
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'tiktok').execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail="No TikTok connection found")
+        
+        connection = response.data[0]
+        
+        # Update the metadata with the new profile
+        metadata = connection.get('metadata', {}) or {}
+        metadata['profile'] = data.profile.dict()
+        
+        # Update the database
+        db.table('social_connections').update({
+            'metadata': metadata,
+            'updated_at': 'now()'
+        }).eq('id', connection['id']).execute()
+        
+        return {"status": "success", "message": "TikTok profile stored successfully"}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error storing TikTok profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to store TikTok profile: {str(e)}")
+
+@router.get("/tiktok/test")
+async def test_tiktok_connection(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Test TikTok connection and API access"""
+    try:
+        # Get TikTok access token
+        token_response = db.table('social_connections').select('access_token').eq('user_id', current_user["id"]).eq('provider', 'tiktok').execute()
+        
+        if not token_response.data or len(token_response.data) == 0:
+            return {
+                "connected": False,
+                "message": "No TikTok connection found"
+            }
+        
+        # Decrypt token
+        access_token = decrypt_token(token_response.data[0]['access_token'])
+        
+        if not access_token:
+            return {
+                "connected": False,
+                "message": "Invalid TikTok access token"
+            }
+        
+        # Test TikTok API access
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Simple API test - get basic user info
+        api_url = "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, headers=headers, timeout=10.0)
+            
+            if response.status_code != 200:
+                return {
+                    "connected": False,
+                    "status_code": response.status_code,
+                    "message": f"TikTok API error: {response.text}"
+                }
+            
+            response_data = response.json()
+            user_data = response_data.get("data", {}).get("user", {})
+            
+            return {
+                "connected": True,
+                "message": "TikTok connection verified",
+                "profile": user_data
+            }
+    except Exception as e:
+        logger.error(f"Error testing TikTok connection: {str(e)}")
+        return {
+            "connected": False,
+            "message": f"Error: {str(e)}"
+        }
