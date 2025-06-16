@@ -10,6 +10,8 @@ import aiofiles
 import tempfile
 from PIL import Image
 import io
+import subprocess
+import asyncio
 
 from app.dependencies.auth import get_current_user
 from app.utils.database import get_db
@@ -19,6 +21,12 @@ router = APIRouter(
     prefix="/api/v1/media",
     tags=["media"],
     dependencies=[Depends(get_current_user)]
+)
+
+# Create a separate router for public endpoints
+public_router = APIRouter(
+    prefix="/api/v1/media",
+    tags=["media"]
 )
 
 # Create database dependency with admin access
@@ -147,6 +155,97 @@ async def generate_thumbnail(file_content: bytes, file_type: str) -> Optional[by
         print(f"Error generating thumbnail: {e}")
         return None
 
+async def generate_video_thumbnail(video_content: bytes) -> tuple[Optional[bytes], Optional[int]]:
+    """Generate thumbnail from video using ffmpeg and extract duration"""
+    
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_thumb:
+            
+            try:
+                # Write video content to temp file
+                temp_video.write(video_content)
+                temp_video.flush()
+                temp_video.close()
+                temp_thumb.close()
+                
+                # First, get video duration using ffprobe
+                duration = None
+                try:
+                    probe_cmd = [
+                        "ffprobe", 
+                        "-v", "quiet",
+                        "-print_format", "json", 
+                        "-show_format",
+                        temp_video.name
+                    ]
+                    
+                    result = await asyncio.create_subprocess_exec(
+                        *probe_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    stdout, stderr = await result.communicate()
+                    
+                    if result.returncode == 0:
+                        import json
+                        probe_data = json.loads(stdout.decode())
+                        duration_str = probe_data.get("format", {}).get("duration")
+                        if duration_str:
+                            duration = int(float(duration_str))
+                    else:
+                        print(f"FFprobe error: {stderr.decode()}")
+                        
+                except Exception as e:
+                    print(f"Error getting video duration: {e}")
+                
+                # Generate thumbnail at 1 second mark (or 10% of duration if known)
+                timestamp = 1.0
+                if duration and duration > 10:
+                    timestamp = min(3.0, duration * 0.1)  # 10% of video or 3 seconds max
+                
+                # Create thumbnail using ffmpeg
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-i", temp_video.name,
+                    "-ss", str(timestamp),
+                    "-vframes", "1",
+                    "-vf", "scale=320:-1",  # Width 320px, maintain aspect ratio
+                    "-q:v", "2",  # High quality
+                    "-y",  # Overwrite output file
+                    temp_thumb.name
+                ]
+                
+                result = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                stdout, stderr = await result.communicate()
+                
+                if result.returncode == 0:
+                    # Read thumbnail content
+                    with open(temp_thumb.name, 'rb') as f:
+                        thumbnail_content = f.read()
+                    
+                    return thumbnail_content, duration
+                else:
+                    print(f"FFmpeg thumbnail generation error: {stderr.decode()}")
+                    return None, duration
+                    
+            except Exception as e:
+                print(f"Video thumbnail generation failed: {e}")
+                return None, None
+                
+            finally:
+                # Clean up temp files
+                try:
+                    os.unlink(temp_video.name)
+                    os.unlink(temp_thumb.name)
+                except:
+                    pass
+
 @router.post("/upload")
 async def upload_media(
     file: UploadFile = File(...),
@@ -194,7 +293,7 @@ async def upload_media(
             except Exception as e:
                 print(f"Error getting image metadata: {e}")
         
-        # Create database record
+        # Create database record (without duration to avoid schema cache issues)
         media_record = {
             "user_id": current_user["id"],
             "original_filename": file.filename or f"upload{file_extension}",
@@ -217,14 +316,63 @@ async def upload_media(
         
         media_id = result.data[0]["id"]
         
-        # For videos, queue processing job (placeholder for now)
+        # For videos, generate thumbnail and get duration
+        video_duration = None
         if file.content_type.startswith('video/'):
-            processing_job = {
-                "media_file_id": media_id,
-                "job_type": "thumbnail",
-                "status": "pending"
-            }
-            supabase.table("media_processing_jobs").insert(processing_job).execute()
+            try:
+                # Update status to processing
+                supabase.table("media_files").update({
+                    "processing_status": "processing"
+                }).eq("id", media_id).execute()
+                
+                # Generate thumbnail and get duration
+                thumbnail_content, video_duration = await generate_video_thumbnail(file_content)
+                
+                if thumbnail_content:
+                    # Upload thumbnail to R2
+                    thumb_key = f"social-media/uploads/{current_user['id']}/thumbnails/{file_id}_thumb.jpg"
+                    thumbnail_url = await upload_to_r2(thumbnail_content, thumb_key, "image/jpeg")
+                    
+                    # Update media record with thumbnail (without duration to avoid cache issues)
+                    supabase.table("media_files").update({
+                        "thumbnail_url": thumbnail_url,
+                        "processing_status": "completed"
+                    }).eq("id", media_id).execute()
+                    
+                    # Store duration in metadata for now until schema cache refreshes
+                    if video_duration:
+                        metadata["duration"] = video_duration
+                        # Update metadata with duration
+                        supabase.table("media_files").update({
+                            "metadata": metadata
+                        }).eq("id", media_id).execute()
+                    
+                    # Update return data
+                    media_record["thumbnail_url"] = thumbnail_url
+                    media_record["processing_status"] = "completed"
+                else:
+                    # Thumbnail generation failed, but duration might be available
+                    supabase.table("media_files").update({
+                        "processing_status": "failed"
+                    }).eq("id", media_id).execute()
+                    
+                    # Store duration in metadata if available
+                    if video_duration:
+                        metadata["duration"] = video_duration
+                        supabase.table("media_files").update({
+                            "metadata": metadata
+                        }).eq("id", media_id).execute()
+                    
+                    media_record["processing_status"] = "failed"
+                    
+            except Exception as e:
+                print(f"Video processing failed: {e}")
+                # Mark as failed
+                supabase.table("media_files").update({
+                    "processing_status": "failed"
+                }).eq("id", media_id).execute()
+                
+                media_record["processing_status"] = "failed"
         
         return {
             "id": media_id,
@@ -410,3 +558,103 @@ async def get_media_variants(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get media variants: {str(e)}"
         )
+
+@public_router.get("/ffmpeg-info")
+async def get_ffmpeg_info():
+    """Get ffmpeg installation and system information"""
+    import subprocess
+    import platform
+    import sys
+    import shutil
+    
+    try:
+        info = {
+            "system": {
+                "platform": platform.platform(),
+                "python_version": sys.version,
+                "architecture": platform.architecture(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+            },
+            "ffmpeg": {
+                "installed": False,
+                "path": None,
+                "version": None,
+                "error": None
+            },
+            "ffprobe": {
+                "installed": False,
+                "path": None,
+                "version": None,
+                "error": None
+            }
+        }
+        
+        # Check ffmpeg
+        try:
+            ffmpeg_path = shutil.which("ffmpeg")
+            if ffmpeg_path:
+                info["ffmpeg"]["installed"] = True
+                info["ffmpeg"]["path"] = ffmpeg_path
+                
+                # Get version
+                result = subprocess.run(
+                    ["ffmpeg", "-version"], 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    # Extract first line which contains version info
+                    version_line = result.stdout.split('\n')[0]
+                    info["ffmpeg"]["version"] = version_line
+                else:
+                    info["ffmpeg"]["error"] = result.stderr
+            else:
+                info["ffmpeg"]["error"] = "ffmpeg not found in PATH"
+        except Exception as e:
+            info["ffmpeg"]["error"] = str(e)
+        
+        # Check ffprobe
+        try:
+            ffprobe_path = shutil.which("ffprobe")
+            if ffprobe_path:
+                info["ffprobe"]["installed"] = True
+                info["ffprobe"]["path"] = ffprobe_path
+                
+                # Get version
+                result = subprocess.run(
+                    ["ffprobe", "-version"], 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    # Extract first line which contains version info
+                    version_line = result.stdout.split('\n')[0]
+                    info["ffprobe"]["version"] = version_line
+                else:
+                    info["ffprobe"]["error"] = result.stderr
+            else:
+                info["ffprobe"]["error"] = "ffprobe not found in PATH"
+        except Exception as e:
+            info["ffprobe"]["error"] = str(e)
+        
+        # Additional environment info
+        try:
+            info["environment"] = {
+                "PATH": os.environ.get("PATH", ""),
+                "working_directory": os.getcwd(),
+                "temp_directory": tempfile.gettempdir()
+            }
+        except Exception as e:
+            info["environment"] = {"error": str(e)}
+        
+        return info
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get system info: {str(e)}"
+        )
+

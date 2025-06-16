@@ -39,6 +39,7 @@ app.include_router(subscriptions.router)
 app.include_router(content.router)  # Keep old router for backward compatibility
 app.include_router(posts_unified.router)  # New unified posts API
 app.include_router(media.router)
+app.include_router(media.public_router)
 
 @app.get("/")
 async def root():
