@@ -6,11 +6,18 @@ from app.models.social_connections import SocialConnection, SocialConnectionCrea
 from app.utils.database import get_database
 from app.utils.encryption import encrypt_token, decrypt_token
 from pydantic import BaseModel
-from datetime import datetime, timezone
-from fastapi.responses import JSONResponse
+from datetime import datetime, timezone, timedelta
+from fastapi.responses import JSONResponse, RedirectResponse
 import httpx
 import json
 import logging
+import os
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+import urllib.parse
 from supabase import Client as SupabaseClient
 
 # Configure logger for this module
@@ -241,11 +248,41 @@ async def get_connections(
                         except Exception as e:
                             logger.error(f"Failed to decrypt refresh_token for {conn.get('provider')}: {str(e)}")
                             conn['refresh_token'] = None  # Set to None instead of failing
+                    
+                    # Safely decrypt OAuth 1.0a tokens if they exist
+                    if conn.get('oauth1_access_token'):
+                        try:
+                            conn['oauth1_access_token'] = decrypt_token(conn['oauth1_access_token'])
+                            logger.info(f"Successfully decrypted oauth1_access_token for {conn.get('provider')}")
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt oauth1_access_token for {conn.get('provider')}: {str(e)}")
+                            conn['oauth1_access_token'] = None
+                    
+                    if conn.get('oauth1_access_token_secret'):
+                        try:
+                            conn['oauth1_access_token_secret'] = decrypt_token(conn['oauth1_access_token_secret'])
+                            logger.info(f"Successfully decrypted oauth1_access_token_secret for {conn.get('provider')}")
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt oauth1_access_token_secret for {conn.get('provider')}: {str(e)}")
+                            conn['oauth1_access_token_secret'] = None
+                    
+                    # Add OAuth 1.0a status flag
+                    conn['has_oauth1_tokens'] = bool(conn.get('oauth1_access_token') and conn.get('oauth1_access_token_secret'))
             
             return response.data if response.data else []
         else:
-            # Regular behavior without tokens for security - include id for frontend operations
-            response = db.table('social_connections').select('id, provider, provider_account_id, created_at, expires_at, metadata, account_label, is_primary, account_type').eq('user_id', current_user["id"]).execute()
+            # Regular behavior without tokens for security - include id for frontend operations and OAuth 1.0a status
+            response = db.table('social_connections').select('id, provider, provider_account_id, created_at, expires_at, metadata, account_label, is_primary, account_type, oauth1_user_id, oauth1_screen_name, oauth1_created_at, oauth1_access_token, oauth1_access_token_secret').eq('user_id', current_user["id"]).execute()
+            
+            # Process response to add OAuth 1.0a status flags without exposing actual tokens
+            if response.data:
+                for conn in response.data:
+                    # Add boolean flag indicating if OAuth 1.0a tokens exist
+                    conn['has_oauth1_tokens'] = bool(conn.get('oauth1_access_token') and conn.get('oauth1_access_token_secret'))
+                    # Remove the actual encrypted tokens from response for security
+                    conn.pop('oauth1_access_token', None)
+                    conn.pop('oauth1_access_token_secret', None)
+            
             return response.data if response.data else []
             
     except Exception as e:
@@ -268,10 +305,10 @@ async def get_token(
         
         if provider_account_id:
             # Get token for specific account
-            response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+            response = db.table('social_connections').select('access_token, refresh_token, expires_at, oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
         else:
             # Get primary account first, then fallback to first account
-            response = db.table('social_connections').select('access_token, refresh_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
+            response = db.table('social_connections').select('access_token, refresh_token, expires_at, oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
         
         if not response.data or len(response.data) == 0:
             if provider_account_id:
@@ -284,6 +321,8 @@ async def get_token(
         # Safely decrypt tokens with error handling
         access_token = None
         refresh_token = None
+        oauth1_access_token = None
+        oauth1_access_token_secret = None
         
         if connection.get('access_token'):
             try:
@@ -301,10 +340,33 @@ async def get_token(
                 logger.error(f"Failed to decrypt refresh_token for {provider}: {str(e)}")
                 refresh_token = None
         
+        # Decrypt OAuth 1.0a tokens if they exist
+        if connection.get('oauth1_access_token'):
+            try:
+                oauth1_access_token = decrypt_token(connection['oauth1_access_token'])
+                logger.info(f"Successfully decrypted oauth1_access_token for {provider}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt oauth1_access_token for {provider}: {str(e)}")
+                oauth1_access_token = None
+        
+        if connection.get('oauth1_access_token_secret'):
+            try:
+                oauth1_access_token_secret = decrypt_token(connection['oauth1_access_token_secret'])
+                logger.info(f"Successfully decrypted oauth1_access_token_secret for {provider}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt oauth1_access_token_secret for {provider}: {str(e)}")
+                oauth1_access_token_secret = None
+        
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "expires_at": connection.get('expires_at')
+            "expires_at": connection.get('expires_at'),
+            # OAuth 1.0a tokens and metadata
+            "oauth1_access_token": oauth1_access_token,
+            "oauth1_access_token_secret": oauth1_access_token_secret,
+            "oauth1_user_id": connection.get('oauth1_user_id'),
+            "oauth1_screen_name": connection.get('oauth1_screen_name'),
+            "has_oauth1_tokens": bool(oauth1_access_token and oauth1_access_token_secret)
         }
     except HTTPException:
         raise
@@ -1900,3 +1962,602 @@ async def test_tiktok_connection(
             "connected": False,
             "message": f"Error: {str(e)}"
         }
+
+class OAuth1TokensRequest(BaseModel):
+    provider: str
+    provider_account_id: str
+    oauth1_tokens: Dict[str, Any]
+
+@router.post("/update-oauth1-tokens")
+async def update_oauth1_tokens(
+    data: OAuth1TokensRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Update existing social connection with OAuth 1.0a tokens for dual authentication.
+    Used specifically for X (Twitter) media upload capabilities.
+    """
+    try:
+        logger.info(f"Updating OAuth 1.0a tokens for {data.provider} user {current_user['id']}")
+        
+        # Find the existing OAuth 2.0 connection
+        response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', data.provider).eq('provider_account_id', data.provider_account_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {data.provider} connection found for account {data.provider_account_id}")
+        
+        connection = response.data[0]
+        
+        # Encrypt OAuth 1.0a tokens for dedicated columns
+        encrypted_oauth1_access_token = encrypt_token(data.oauth1_tokens.get('access_token', ''))
+        encrypted_oauth1_access_token_secret = encrypt_token(data.oauth1_tokens.get('access_token_secret', ''))
+        
+        # Update the connection with dedicated OAuth 1.0a columns
+        update_data = {
+            'oauth1_access_token': encrypted_oauth1_access_token,
+            'oauth1_access_token_secret': encrypted_oauth1_access_token_secret,
+            'oauth1_user_id': data.oauth1_tokens.get('user_id'),
+            'oauth1_screen_name': data.oauth1_tokens.get('screen_name'),
+            'oauth1_created_at': data.oauth1_tokens.get('created_at', datetime.utcnow().isoformat()),
+            'updated_at': 'now()'
+        }
+        
+        db.table('social_connections').update(update_data).eq('id', connection['id']).execute()
+        
+        logger.info(f"Successfully updated OAuth 1.0a tokens for {data.provider} account {data.provider_account_id}")
+        
+        return {
+            "status": "success", 
+            "message": f"{data.provider} OAuth 1.0a tokens stored successfully",
+            "oauth_version": "1.0a",
+            "flow_type": data.oauth1_tokens.get('flow_type', 'oauth1_media')
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating OAuth 1.0a tokens: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update OAuth 1.0a tokens: {str(e)}")
+
+@router.get("/oauth1-tokens/{provider}")
+async def get_oauth1_tokens(
+    provider: str,
+    provider_account_id: Optional[str] = Query(None, description="Specific account ID. If not provided, returns primary account"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Get decrypted OAuth 1.0a tokens for a specific provider and account.
+    Used for X (Twitter) media upload authentication.
+    """
+    try:
+        logger.info(f"Retrieving OAuth 1.0a tokens for {provider} user {current_user['id']}")
+        
+        if provider_account_id:
+            # Get tokens for specific account using dedicated columns
+            response = db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        else:
+            # Get primary account first, then fallback to first account
+            response = db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection found")
+        
+        connection = response.data[0]
+        
+        # Check if OAuth 1.0a tokens exist in dedicated columns
+        if not connection.get('oauth1_access_token') or not connection.get('oauth1_access_token_secret'):
+            raise HTTPException(status_code=404, detail=f"No OAuth 1.0a tokens found for {provider}")
+        
+        # Decrypt OAuth 1.0a tokens from dedicated columns
+        decrypted_tokens = {}
+        
+        try:
+            decrypted_tokens['access_token'] = decrypt_token(connection['oauth1_access_token'])
+        except Exception as e:
+            logger.error(f"Failed to decrypt OAuth 1.0a access_token: {str(e)}")
+            decrypted_tokens['access_token'] = None
+        
+        try:
+            decrypted_tokens['access_token_secret'] = decrypt_token(connection['oauth1_access_token_secret'])
+        except Exception as e:
+            logger.error(f"Failed to decrypt OAuth 1.0a access_token_secret: {str(e)}")
+            decrypted_tokens['access_token_secret'] = None
+        
+        # Include other metadata from dedicated columns
+        decrypted_tokens.update({
+            'user_id': connection.get('oauth1_user_id'),
+            'screen_name': connection.get('oauth1_screen_name'),
+            'flow_type': 'oauth1_media',
+            'created_at': connection.get('oauth1_created_at'),
+            'oauth_version': '1.0a'
+        })
+        
+        return decrypted_tokens
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving OAuth 1.0a tokens: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve OAuth 1.0a tokens: {str(e)}")
+
+# Twitter OAuth 1.0a Flow Implementation
+# =====================================
+
+def _generate_oauth1_signature(
+    method: str,
+    url: str,
+    params: Dict[str, str],
+    consumer_secret: str,
+    token_secret: str = ""
+) -> str:
+    """
+    Generate OAuth 1.0a signature for Twitter API requests.
+    
+    Args:
+        method: HTTP method (GET, POST)
+        url: Request URL
+        params: Parameters to include in signature
+        consumer_secret: Twitter consumer secret
+        token_secret: OAuth token secret (empty for request token)
+    
+    Returns:
+        Base64-encoded HMAC-SHA1 signature
+    """
+    # Sort parameters
+    sorted_params = sorted(params.items())
+    
+    # Create parameter string
+    param_string = urllib.parse.urlencode(sorted_params)
+    
+    # Create signature base string
+    signature_base = f"{method.upper()}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_string, safe='')}"
+    
+    # Create signing key
+    signing_key = f"{urllib.parse.quote(consumer_secret, safe='')}&{urllib.parse.quote(token_secret, safe='')}"
+    
+    # Generate signature
+    signature = base64.b64encode(
+        hmac.new(
+            signing_key.encode('utf-8'),
+            signature_base.encode('utf-8'),
+            hashlib.sha1
+        ).digest()
+    ).decode('utf-8')
+    
+    return signature
+
+def _generate_oauth1_header(
+    method: str,
+    url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    oauth_token: str = None,
+    oauth_token_secret: str = "",
+    oauth_verifier: str = None,
+    additional_params: Dict[str, str] = None
+) -> str:
+    """
+    Generate OAuth 1.0a Authorization header for Twitter API.
+    
+    Args:
+        method: HTTP method
+        url: Request URL
+        consumer_key: Twitter consumer key
+        consumer_secret: Twitter consumer secret
+        oauth_token: OAuth token (None for request token)
+        oauth_token_secret: OAuth token secret
+        oauth_verifier: OAuth verifier (for access token exchange)
+        additional_params: Additional parameters for signature
+    
+    Returns:
+        OAuth Authorization header value
+    """
+    # Generate OAuth parameters
+    oauth_params = {
+        'oauth_consumer_key': consumer_key,
+        'oauth_nonce': secrets.token_hex(16),
+        'oauth_signature_method': 'HMAC-SHA1',
+        'oauth_timestamp': str(int(time.time())),
+        'oauth_version': '1.0'
+    }
+    
+    if oauth_token:
+        oauth_params['oauth_token'] = oauth_token
+    
+    if oauth_verifier:
+        oauth_params['oauth_verifier'] = oauth_verifier
+    
+    # Include additional parameters in signature
+    all_params = oauth_params.copy()
+    if additional_params:
+        all_params.update(additional_params)
+    
+    # Generate signature
+    signature = _generate_oauth1_signature(
+        method, url, all_params, consumer_secret, oauth_token_secret
+    )
+    oauth_params['oauth_signature'] = signature
+    
+    # Create Authorization header
+    header_params = []
+    for key, value in sorted(oauth_params.items()):
+        header_params.append(f'{key}="{urllib.parse.quote(str(value), safe="")}"')
+    
+    return f"OAuth {', '.join(header_params)}"
+
+@router.post("/twitter-oauth1-initiate")
+async def twitter_oauth1_initiate(
+    redirect_uri: str = Query(..., description="Frontend callback URI"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Initiate Twitter OAuth 1.0a flow by getting request token.
+    
+    This endpoint starts the OAuth 1.0a flow for Twitter media upload capabilities.
+    It gets a request token from Twitter and redirects to Twitter's authorization page.
+    """
+    try:
+        logger.info(f"🐦 Starting Twitter OAuth 1.0a flow for user {current_user['id']}")
+        logger.info(f"🐦 Redirect URI: {redirect_uri}")
+        
+        # Get Twitter credentials from environment
+        consumer_key = os.getenv('TWITTER_CONSUMER_API_KEY')
+        consumer_secret = os.getenv('TWITTER_CONSUMER_API_SECRET')
+        
+        if not consumer_key or not consumer_secret:
+            logger.error("🚨 Twitter OAuth 1.0a credentials not found in environment")
+            raise HTTPException(
+                status_code=500, 
+                detail="Twitter OAuth 1.0a credentials not configured"
+            )
+        
+        logger.info(f"🔑 Using consumer key: {consumer_key[:10]}...")
+        
+        # Step 1: Get request token from Twitter
+        request_token_url = "https://api.twitter.com/oauth/request_token"
+        
+        # Generate OAuth 1.0a header for request token
+        oauth_header = _generate_oauth1_header(
+            method="POST",
+            url=request_token_url,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            additional_params={'oauth_callback': redirect_uri}
+        )
+        
+        logger.info(f"🔐 Generated OAuth header for request token")
+        
+        # Make request to Twitter for request token
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                request_token_url,
+                headers={
+                    "Authorization": oauth_header,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={"oauth_callback": redirect_uri}
+            )
+        
+        if response.status_code != 200:
+            logger.error(f"🚨 Twitter request token failed: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to get Twitter request token: {response.text}"
+            )
+        
+        # Parse response
+        response_data = dict(urllib.parse.parse_qsl(response.text))
+        oauth_token = response_data.get('oauth_token')
+        oauth_token_secret = response_data.get('oauth_token_secret')
+        oauth_callback_confirmed = response_data.get('oauth_callback_confirmed')
+        
+        if not oauth_token or not oauth_token_secret or oauth_callback_confirmed != 'true':
+            logger.error(f"🚨 Invalid request token response: {response_data}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid response from Twitter request token endpoint"
+            )
+        
+        logger.info(f"✅ Got request token: {oauth_token[:10]}...")
+        logger.info(f"✅ Callback confirmed: {oauth_callback_confirmed}")
+        
+        # Store request token temporarily (we'll use it in the callback)
+        # For simplicity, we'll store it in the database with a temporary record
+        temp_data = {
+            'user_id': int(current_user["id"]),
+            'provider': 'twitter_oauth1_temp',
+            'provider_account_id': f"temp_{oauth_token}",
+            'access_token': encrypt_token(oauth_token_secret),  # Store token secret
+            'metadata': {
+                'oauth_token': oauth_token,
+                'oauth_token_secret': oauth_token_secret,  # Also store in metadata for easy access
+                'flow_type': 'oauth1_request_token',
+                'created_at': datetime.utcnow().isoformat()
+            },
+            'account_type': 'temporary',
+            'expires_at': (datetime.utcnow().replace(tzinfo=timezone.utc) + 
+                          timedelta(minutes=15)).isoformat()  # 15 min expiry
+        }
+        
+        # Clean up any existing temporary records for this user
+        db.table('social_connections').delete().eq('user_id', current_user["id"]).eq('provider', 'twitter_oauth1_temp').execute()
+        
+        # Insert temporary record
+        db.table('social_connections').insert(temp_data).execute()
+        
+        # Step 2: Redirect to Twitter authorization URL
+        authorize_url = f"https://api.twitter.com/oauth/authorize?oauth_token={oauth_token}"
+        
+        logger.info(f"🔗 Redirecting to Twitter authorization: {authorize_url}")
+        
+        return {
+            "status": "success",
+            "authorization_url": authorize_url,
+            "oauth_token": oauth_token,
+            "message": "Redirect user to authorization_url to complete OAuth flow"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating Twitter OAuth 1.0a: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate Twitter OAuth 1.0a: {str(e)}")
+
+@router.post("/twitter-oauth1-callback")
+async def twitter_oauth1_callback(
+    oauth_token: str = Query(..., description="OAuth token from Twitter callback"),
+    oauth_verifier: str = Query(..., description="OAuth verifier from Twitter callback"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Handle Twitter OAuth 1.0a callback and exchange for access token.
+    
+    This endpoint is called after the user authorizes the app on Twitter.
+    It exchanges the request token for an access token and stores it.
+    """
+    try:
+        logger.info(f"🐦 Processing Twitter OAuth 1.0a callback for user {current_user['id']}")
+        logger.info(f"🐦 OAuth token: {oauth_token[:10]}...")
+        logger.info(f"🐦 OAuth verifier: {oauth_verifier[:10]}...")
+        
+        # Get Twitter credentials from environment
+        consumer_key = os.getenv('TWITTER_CONSUMER_API_KEY')
+        consumer_secret = os.getenv('TWITTER_CONSUMER_API_SECRET')
+        
+        if not consumer_key or not consumer_secret:
+            raise HTTPException(
+                status_code=500,
+                detail="Twitter OAuth 1.0a credentials not configured"
+            )
+        
+        # Get the temporary request token data
+        temp_response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'twitter_oauth1_temp').eq('provider_account_id', f'temp_{oauth_token}').execute()
+        
+        if not temp_response.data:
+            logger.error(f"🚨 No temporary request token found for token: {oauth_token}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired request token"
+            )
+        
+        temp_record = temp_response.data[0]
+        
+        # Decrypt the token secret
+        oauth_token_secret = decrypt_token(temp_record['access_token'])
+        
+        if not oauth_token_secret:
+            logger.error("🚨 Failed to decrypt request token secret")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid request token data"
+            )
+        
+        logger.info(f"✅ Retrieved request token secret from temporary storage")
+        
+        # Step 1: Exchange request token for access token
+        access_token_url = "https://api.twitter.com/oauth/access_token"
+        
+        # Generate OAuth 1.0a header for access token exchange
+        oauth_header = _generate_oauth1_header(
+            method="POST",
+            url=access_token_url,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            oauth_token=oauth_token,
+            oauth_token_secret=oauth_token_secret,
+            oauth_verifier=oauth_verifier
+        )
+        
+        logger.info(f"🔐 Generated OAuth header for access token exchange")
+        
+        # Make request to Twitter for access token
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                access_token_url,
+                headers={
+                    "Authorization": oauth_header,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={
+                    "oauth_verifier": oauth_verifier
+                }
+            )
+        
+        if response.status_code != 200:
+            logger.error(f"🚨 Twitter access token exchange failed: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to exchange Twitter tokens: {response.text}"
+            )
+        
+        # Parse access token response
+        response_data = dict(urllib.parse.parse_qsl(response.text))
+        access_token = response_data.get('oauth_token')
+        access_token_secret = response_data.get('oauth_token_secret')
+        user_id = response_data.get('user_id')
+        screen_name = response_data.get('screen_name')
+        
+        if not access_token or not access_token_secret or not user_id or not screen_name:
+            logger.error(f"🚨 Invalid access token response: {response_data}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid response from Twitter access token endpoint"
+            )
+        
+        logger.info(f"✅ Got access tokens for Twitter user: {screen_name} (ID: {user_id})")
+        
+        # Step 2: Store OAuth 1.0a tokens in dedicated columns
+        # First, check if we have an existing OAuth 2.0 connection for this Twitter account
+        existing_response = db.table('social_connections').select('*').eq('user_id', current_user["id"]).eq('provider', 'twitter').eq('provider_account_id', user_id).execute()
+        
+        if existing_response.data and len(existing_response.data) > 0:
+            # Update existing connection with OAuth 1.0a tokens
+            connection = existing_response.data[0]
+            
+            update_data = {
+                'oauth1_access_token': encrypt_token(access_token),
+                'oauth1_access_token_secret': encrypt_token(access_token_secret),
+                'oauth1_user_id': user_id,
+                'oauth1_screen_name': screen_name,
+                'oauth1_created_at': datetime.utcnow().isoformat(),
+                'updated_at': 'now()'
+            }
+            
+            db.table('social_connections').update(update_data).eq('id', connection['id']).execute()
+            
+            logger.info(f"✅ Updated existing Twitter connection with OAuth 1.0a tokens")
+            
+        else:
+            # Create new connection with OAuth 1.0a tokens only
+            # Note: This creates a Twitter connection specifically for OAuth 1.0a operations
+            connection_data = {
+                'user_id': int(current_user["id"]),
+                'provider': 'twitter',
+                'provider_account_id': user_id,
+                'access_token': encrypt_token('oauth1_only'),  # Placeholder - real OAuth 2.0 token would come later
+                'oauth1_access_token': encrypt_token(access_token),
+                'oauth1_access_token_secret': encrypt_token(access_token_secret),
+                'oauth1_user_id': user_id,
+                'oauth1_screen_name': screen_name,
+                'oauth1_created_at': datetime.utcnow().isoformat(),
+                'account_label': f"@{screen_name}",
+                'account_type': 'personal',
+                'is_primary': True,  # Set as primary if it's the only Twitter account
+                'metadata': {
+                    'oauth1_flow_completed': True,
+                    'screen_name': screen_name,
+                    'user_id': user_id,
+                    'capabilities': ['media_upload', 'oauth1_auth']
+                }
+            }
+            
+            db.table('social_connections').insert(connection_data).execute()
+            
+            logger.info(f"✅ Created new Twitter connection with OAuth 1.0a tokens")
+        
+        # Step 3: Clean up temporary request token record
+        db.table('social_connections').delete().eq('id', temp_record['id']).execute()
+        logger.info(f"🧹 Cleaned up temporary request token record")
+        
+        # Step 4: Verify the OAuth 1.0a tokens work by making a test API call
+        try:
+            test_url = "https://api.twitter.com/1.1/account/verify_credentials.json"
+            test_header = _generate_oauth1_header(
+                method="GET",
+                url=test_url,
+                consumer_key=consumer_key,
+                consumer_secret=consumer_secret,
+                oauth_token=access_token,
+                oauth_token_secret=access_token_secret
+            )
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                test_response = await client.get(
+                    test_url,
+                    headers={"Authorization": test_header}
+                )
+            
+            if test_response.status_code == 200:
+                user_data = test_response.json()
+                logger.info(f"✅ OAuth 1.0a tokens verified for @{user_data.get('screen_name')}")
+            else:
+                logger.warning(f"⚠️ OAuth 1.0a token verification failed: {test_response.status_code}")
+        
+        except Exception as verify_error:
+            logger.warning(f"⚠️ Failed to verify OAuth 1.0a tokens: {str(verify_error)}")
+        
+        return {
+            "status": "success",
+            "message": "Twitter OAuth 1.0a flow completed successfully",
+            "twitter_user": {
+                "user_id": user_id,
+                "screen_name": screen_name
+            },
+            "oauth_version": "1.0a",
+            "capabilities": ["media_upload", "oauth1_auth"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing Twitter OAuth 1.0a callback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process Twitter OAuth 1.0a callback: {str(e)}")
+
+@router.get("/twitter-oauth1-status")
+async def twitter_oauth1_status(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Check the status of Twitter OAuth 1.0a authentication for the current user.
+    
+    Returns information about whether the user has completed OAuth 1.0a flow
+    and can upload media to Twitter.
+    """
+    try:
+        # Check for Twitter connections with OAuth 1.0a tokens
+        response = db.table('social_connections').select('oauth1_access_token, oauth1_user_id, oauth1_screen_name, oauth1_created_at, provider_account_id, account_label, is_primary').eq('user_id', current_user["id"]).eq('provider', 'twitter').execute()
+        
+        if not response.data:
+            return {
+                "oauth1_authenticated": False,
+                "message": "No Twitter connections found",
+                "accounts": []
+            }
+        
+        accounts = []
+        oauth1_count = 0
+        
+        for connection in response.data:
+            has_oauth1 = bool(connection.get('oauth1_access_token') and connection.get('oauth1_user_id'))
+            
+            if has_oauth1:
+                oauth1_count += 1
+            
+            account_info = {
+                "provider_account_id": connection.get('provider_account_id'),
+                "screen_name": connection.get('oauth1_screen_name'),
+                "account_label": connection.get('account_label'),
+                "is_primary": connection.get('is_primary', False),
+                "oauth1_authenticated": has_oauth1,
+                "oauth1_created_at": connection.get('oauth1_created_at'),
+                "capabilities": ["media_upload", "oauth1_auth"] if has_oauth1 else []
+            }
+            
+            accounts.append(account_info)
+        
+        return {
+            "oauth1_authenticated": oauth1_count > 0,
+            "oauth1_accounts_count": oauth1_count,
+            "total_twitter_accounts": len(accounts),
+            "accounts": accounts,
+            "message": f"Found {oauth1_count} Twitter accounts with OAuth 1.0a authentication"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking Twitter OAuth 1.0a status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to check Twitter OAuth 1.0a status: {str(e)}")

@@ -293,17 +293,33 @@ async def upload_media(
             except Exception as e:
                 print(f"Error getting image metadata: {e}")
         
+        # Ensure file_type is never null/empty (prevents Instagram publishing errors)
+        safe_file_type = file.content_type or "application/octet-stream"
+        if not safe_file_type.strip():
+            # Fallback based on file extension if content_type is missing
+            ext_lower = file_extension.lower()
+            if ext_lower in ['.mp4', '.mov', '.avi', '.mkv']:
+                safe_file_type = "video/mp4"
+            elif ext_lower in ['.jpg', '.jpeg']:
+                safe_file_type = "image/jpeg"
+            elif ext_lower in ['.png']:
+                safe_file_type = "image/png"
+            elif ext_lower in ['.gif']:
+                safe_file_type = "image/gif"
+            else:
+                safe_file_type = "application/octet-stream"
+        
         # Create database record (without duration to avoid schema cache issues)
         media_record = {
             "user_id": current_user["id"],
             "original_filename": file.filename or f"upload{file_extension}",
-            "file_type": file.content_type,
+            "file_type": safe_file_type,
             "file_size": actual_file_size,
             "r2_key": temp_key,
             "cdn_url": cdn_url,
             "thumbnail_url": thumbnail_url,
             "metadata": metadata,
-            "processing_status": "completed" if file.content_type.startswith('image/') else "pending"
+            "processing_status": "completed" if safe_file_type.startswith('image/') else "pending"
         }
         
         result = supabase.table("media_files").insert(media_record).execute()

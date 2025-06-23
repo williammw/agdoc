@@ -1,11 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 import uuid
 import json
+import logging
 from datetime import datetime, timezone
 from app.dependencies.auth import get_current_user
 from app.utils.database import get_db
+
+logger = logging.getLogger(__name__)
+
+try:
+    from app.services.platform_publisher import PlatformPublisher, PublishStatus
+    logger.info("Successfully imported PlatformPublisher")
+except ImportError as e:
+    logger.error(f"Failed to import PlatformPublisher: {e}")
+    PlatformPublisher = None
+    PublishStatus = None
 
 # Helper function to safely parse JSON strings
 def safe_json_parse(value, default):
@@ -88,7 +99,9 @@ class PublishResponse(BaseModel):
     message: str
     published_count: int = 0
     scheduled_count: int = 0
+    failed_count: int = 0
     errors: List[str] = Field(default_factory=list)
+    platform_results: List[Dict[str, Any]] = Field(default_factory=list)
 
 # Posts endpoints - unified single-table approach
 @router.get("/", response_model=List[PostResponse])
@@ -250,11 +263,16 @@ async def delete_post(
 async def publish_post(
     post_id: UUID,
     publish_data: PublishRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db = Depends(db_admin)
 ):
-    """Publish a post - for now this is a mock implementation"""
+    """Publish a post to social media platforms"""
     try:
+        # Debug: Log current user info
+        logger.warning(f"🚀 PUBLISH ENDPOINT CALLED - Publishing post {post_id} for user: {current_user}")
+        print(f"🚀 PUBLISH ENDPOINT CALLED - Publishing post {post_id}")
+        
         # Get the post
         post = await get_post(post_id, current_user, db)
         
@@ -265,53 +283,31 @@ async def publish_post(
                 errors=["Post not found"]
             )
         
-        if not post.platforms:
+        # Debug: Log the post data to understand its structure
+        logger.warning(f"📄 Retrieved post data keys: {list(post.keys()) if isinstance(post, dict) else 'Not a dict'}")
+        logger.warning(f"📱 Post platforms: {post.get('platforms', [])}")
+        logger.warning(f"📁 Post media_files: {post.get('media_files', [])}")
+        logger.warning(f"📝 Post content_mode: {post.get('content_mode', 'NOT FOUND')}")
+        
+        platforms = post.get('platforms', [])
+        if not platforms:
             return PublishResponse(
                 success=False,
                 message="No platforms selected for publishing",
                 errors=["No platforms configured"]
             )
         
-        # Mock publishing logic
-        try:
-            if publish_data.immediate:
-                # Update post status to published
-                await update_post(
-                    post_id, 
-                    PostUpdate(status="published"), 
-                    current_user, 
-                    db
-                )
+        # Check if this is immediate or scheduled publishing
+        if publish_data.immediate:
+            # Immediate publishing
+            return await _publish_immediately(post_id, post, current_user, db)
+        else:
+            # Scheduled publishing
+            schedule_date = publish_data.schedule_for or datetime.now(timezone.utc)
+            return await _schedule_post(post_id, post, schedule_date, current_user, db, background_tasks)
                 
-                return PublishResponse(
-                    success=True,
-                    message=f"Post published successfully to {len(post.platforms)} platform(s)",
-                    published_count=len(post.platforms)
-                )
-            else:
-                # Update post status to scheduled
-                schedule_date = publish_data.schedule_for or datetime.now(timezone.utc)
-                await update_post(
-                    post_id, 
-                    PostUpdate(status="scheduled", schedule_date=schedule_date), 
-                    current_user, 
-                    db
-                )
-                
-                return PublishResponse(
-                    success=True,
-                    message=f"Post scheduled successfully for {len(post.platforms)} platform(s)",
-                    scheduled_count=len(post.platforms)
-                )
-                
-        except Exception as e:
-            return PublishResponse(
-                success=False,
-                message="Publishing failed",
-                errors=[str(e)]
-            )
-        
     except Exception as e:
+        logger.error(f"Error in publish_post: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to publish post: {str(e)}"
@@ -342,6 +338,279 @@ async def bulk_update_posts(
             detail=f"Bulk update failed: {str(e)}"
         )
 
+# Helper functions for publishing
+
+async def _publish_immediately(
+    post_id: UUID, 
+    post: dict, 
+    current_user: dict, 
+    db
+) -> PublishResponse:
+    """Handle immediate publishing to all platforms"""
+    try:
+        # Update post status to publishing
+        await update_post(
+            post_id, 
+            PostUpdate(status="publishing"), 
+            current_user, 
+            db
+        )
+        
+        # Get platforms from the post dict
+        platforms = post.get('platforms', [])
+        if not platforms:
+            return PublishResponse(
+                success=False,
+                message="No platforms configured for this post",
+                errors=["No platforms found in post data"]
+            )
+        
+        # Initialize publishing results tracking
+        await _create_publishing_results_records(post_id, platforms, db)
+        
+        # Check if PlatformPublisher is available
+        if PlatformPublisher is None:
+            logger.error("PlatformPublisher not available - import failed")
+            return PublishResponse(
+                success=False,
+                message="Publishing service not available",
+                errors=["Platform publisher import failed"]
+            )
+        
+        # Initialize platform publisher
+        logger.warning(f"🔧 Initializing PlatformPublisher...")
+        publisher = PlatformPublisher()
+        
+        # Prepare content data for publishing
+        content_data = {
+            'content_mode': post.get('content_mode', 'universal'),
+            'universal_content': post.get('universal_content', ''),
+            'universal_metadata': post.get('universal_metadata', {}),
+            'platform_content': post.get('platform_content', {}),
+            'media_files': post.get('media_files', [])
+        }
+        
+        logger.warning(f"📤 About to publish to {len(platforms)} platforms")
+        logger.warning(f"📤 Content data: content_mode={content_data['content_mode']}")
+        logger.warning(f"📤 Media files count: {len(content_data['media_files'])}")
+        logger.warning(f"📤 Media files: {content_data['media_files']}")
+        
+        # Publish to all platforms
+        results = await publisher.publish_to_platforms(
+            current_user["id"], 
+            platforms, 
+            content_data
+        )
+        
+        # Process results and update database
+        published_count = 0
+        failed_count = 0
+        errors = []
+        platform_results = []
+        
+        for result in results:
+            platform_results.append({
+                "platform": result.platform,
+                "status": result.status.value,
+                "platform_post_id": result.platform_post_id,
+                "error_message": result.error_message
+            })
+            
+            if result.status == PublishStatus.SUCCESS:
+                published_count += 1
+                await _update_publishing_result(
+                    post_id, result.platform, "success", 
+                    result.platform_post_id, None, result.metadata, db
+                )
+            else:
+                failed_count += 1
+                errors.append(f"{result.platform}: {result.error_message}")
+                await _update_publishing_result(
+                    post_id, result.platform, "failed", 
+                    None, result.error_message, result.metadata, db
+                )
+        
+        # Update final post status
+        if published_count > 0 and failed_count == 0:
+            final_status = "published"
+        elif published_count > 0 and failed_count > 0:
+            final_status = "published"  # Partial success still counts as published
+        else:
+            final_status = "failed"
+        
+        await update_post(
+            post_id, 
+            PostUpdate(status=final_status), 
+            current_user, 
+            db
+        )
+        
+        success = published_count > 0
+        message = f"Published to {published_count}/{len(platforms)} platforms"
+        if failed_count > 0:
+            message += f", {failed_count} failed"
+        
+        return PublishResponse(
+            success=success,
+            message=message,
+            published_count=published_count,
+            failed_count=failed_count,
+            errors=errors,
+            platform_results=platform_results
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in immediate publishing: {str(e)}")
+        # Update post status to failed
+        await update_post(
+            post_id, 
+            PostUpdate(status="failed"), 
+            current_user, 
+            db
+        )
+        
+        return PublishResponse(
+            success=False,
+            message="Publishing failed",
+            errors=[str(e)]
+        )
+
+async def _schedule_post(
+    post_id: UUID, 
+    post: dict, 
+    schedule_date: datetime, 
+    current_user: dict, 
+    db,
+    background_tasks: BackgroundTasks
+) -> PublishResponse:
+    """Handle scheduled publishing"""
+    try:
+        # Update post status and schedule date
+        await update_post(
+            post_id, 
+            PostUpdate(status="scheduled", schedule_date=schedule_date), 
+            current_user, 
+            db
+        )
+        
+        # Get platforms from the post dict
+        platforms = post.get('platforms', [])
+        platform_count = len(platforms)
+        
+        # Create scheduled post record
+        scheduled_data = {
+            "post_id": str(post_id),
+            "user_id": current_user["id"],
+            "scheduled_for": schedule_date.isoformat(),
+            "status": "pending"
+        }
+        
+        db.table('scheduled_posts').insert(scheduled_data).execute()
+        
+        # Add background task to process scheduled posts
+        background_tasks.add_task(_process_scheduled_posts)
+        
+        return PublishResponse(
+            success=True,
+            message=f"Post scheduled for {schedule_date.strftime('%Y-%m-%d %H:%M UTC')} on {platform_count} platform(s)",
+            scheduled_count=platform_count
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in scheduled publishing: {str(e)}")
+        return PublishResponse(
+            success=False,
+            message="Scheduling failed",
+            errors=[str(e)]
+        )
+
+async def _create_publishing_results_records(post_id: UUID, platforms: List[Dict[str, Any]], db):
+    """Create initial publishing result records"""
+    try:
+        records = []
+        logger.info(f"Creating publishing records for {len(platforms)} platforms")
+        
+        for platform in platforms:
+            logger.info(f"Processing platform: {platform}")
+            records.append({
+                "post_id": str(post_id),
+                "platform": platform.get("provider", "unknown"),
+                "platform_account_id": platform.get("accountId", "unknown"),
+                "status": "pending"
+            })
+        
+        if records:
+            logger.info(f"Inserting {len(records)} publishing result records")
+            result = db.table('post_publishing_results').insert(records).execute()
+            logger.info(f"Insert result: {result}")
+            
+    except Exception as e:
+        logger.error(f"Error creating publishing result records: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+async def _update_publishing_result(
+    post_id: UUID, 
+    platform: str, 
+    status: str, 
+    platform_post_id: Optional[str],
+    error_message: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    db
+):
+    """Update publishing result record"""
+    try:
+        update_data = {
+            "status": status,
+            "platform_post_id": platform_post_id,
+            "error_message": error_message,
+            "metadata": metadata or {},
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if status == "success":
+            update_data["published_at"] = datetime.now(timezone.utc).isoformat()
+        
+        db.table('post_publishing_results').update(update_data).eq(
+            'post_id', str(post_id)
+        ).eq('platform', platform).execute()
+        
+    except Exception as e:
+        logger.error(f"Error updating publishing result: {str(e)}")
+
+async def _process_scheduled_posts():
+    """Background task to process scheduled posts"""
+    try:
+        from app.services.scheduler import process_scheduled_posts
+        await process_scheduled_posts()
+    except Exception as e:
+        logger.error(f"Error in background task: {str(e)}")
+
+# Publishing status endpoint
+@router.get("/{post_id}/publishing-status")
+async def get_publishing_status(
+    post_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db = Depends(db_admin)
+):
+    """Get detailed publishing status for a post"""
+    try:
+        # Get publishing results
+        response = db.table('post_publishing_results').select('*').eq(
+            'post_id', str(post_id)
+        ).execute()
+        
+        return {
+            "success": True,
+            "post_id": str(post_id),
+            "platform_results": response.data
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch publishing status: {str(e)}"
+        )
+
 # Statistics endpoint
 @router.get("/stats/summary")
 async def get_posts_summary(
@@ -357,6 +626,7 @@ async def get_posts_summary(
             'total': len(response.data),
             'draft': 0,
             'scheduled': 0,
+            'publishing': 0,
             'published': 0,
             'failed': 0
         }

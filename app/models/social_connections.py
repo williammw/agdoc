@@ -24,6 +24,12 @@ class SocialConnection(Base):
     account_label = Column(String(255), nullable=True)
     is_primary = Column(Boolean, default=False, nullable=False)
     account_type = Column(String(50), default='personal', nullable=False)
+    # OAuth 1.0a columns
+    oauth1_access_token = Column(String, nullable=True)
+    oauth1_access_token_secret = Column(String, nullable=True)
+    oauth1_user_id = Column(String(255), nullable=True)
+    oauth1_screen_name = Column(String(255), nullable=True)
+    oauth1_created_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -101,6 +107,11 @@ class SocialConnectionResponse(BaseModel):
     account_label: Optional[str] = None
     is_primary: bool = False
     account_type: str = 'personal'
+    # OAuth 1.0a status flags (boolean indicators, not actual tokens)
+    has_oauth1_tokens: bool = False
+    oauth1_user_id: Optional[str] = None
+    oauth1_screen_name: Optional[str] = None
+    oauth1_created_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     
@@ -120,6 +131,11 @@ class SocialConnectionResponse(BaseModel):
             "account_label": obj.account_label,
             "is_primary": obj.is_primary,
             "account_type": obj.account_type,
+            # OAuth 1.0a fields - check if tokens exist without exposing them
+            "has_oauth1_tokens": bool(getattr(obj, 'oauth1_access_token', None) and getattr(obj, 'oauth1_access_token_secret', None)),
+            "oauth1_user_id": getattr(obj, 'oauth1_user_id', None),
+            "oauth1_screen_name": getattr(obj, 'oauth1_screen_name', None),
+            "oauth1_created_at": getattr(obj, 'oauth1_created_at', None),
             "created_at": obj.created_at,
             "updated_at": obj.updated_at
         }
@@ -130,6 +146,9 @@ class SocialConnectionWithTokens(SocialConnectionResponse):
     """Model for social connection responses that include decrypted tokens"""
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
+    # OAuth 1.0a tokens (only included when explicitly requested)
+    oauth1_access_token: Optional[str] = None
+    oauth1_access_token_secret: Optional[str] = None
     
     class Config:
         from_attributes = True  # Updated from orm_mode for Pydantic v2 
