@@ -808,61 +808,6 @@ async def tiktok_oauth(
             detail="Failed to process TikTok authentication"
         )
 
-@router.post("/token")
-async def get_auth_token(
-    data: Dict[str, str] = Body(...),
-    supabase = Depends(db_admin)
-):
-    """
-    Get a Firebase token by email lookup
-    
-    This endpoint looks up a user by email and returns a Firebase custom token
-    that can be used for authenticating with other backend services.
-    """
-    try:
-        email = data.get("email")
-        if not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email is required"
-            )
-        
-        # Get user from database by email
-        from app.utils.database import get_user_by_email
-        user = await get_user_by_email(supabase, email)
-        
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        firebase_uid = user.get("firebase_uid")
-        if not firebase_uid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing Firebase UID in user data"
-            )
-        
-        # Create a custom token for the user
-        custom_token = auth.create_custom_token(firebase_uid)
-        token_str = custom_token.decode('utf-8') if isinstance(custom_token, bytes) else custom_token
-        
-        return {
-            "firebase_token": token_str,
-            "user_id": user.get("id"),
-            "firebase_uid": firebase_uid,
-            "email": user.get("email")
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error creating auth token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create authentication token"
-        )
 
 @router.post("/token-refresh")
 async def refresh_token(
