@@ -46,6 +46,15 @@ class PlatformContent:
     hashtags: List[str] = None
     mentions: List[str] = None
     metadata: Dict[str, Any] = None
+    media_files: List[Dict[str, Any]] = None
+    # YouTube-specific fields
+    youtube_title: Optional[str] = None
+    youtube_description: Optional[str] = None
+    youtube_tags: Optional[List[str]] = None
+    youtube_privacy: Optional[str] = None
+    # TikTok-specific fields
+    tiktok_description: Optional[str] = None
+    tiktok_privacy: Optional[str] = None
 
 # COMPLETELY REMOVED: The global function that was using environment variables
 # Any code still calling the old function will now fail explicitly
@@ -331,6 +340,7 @@ class PlatformPublisher:
             logger.info(f"📁 Media file {i}: type={type(media)}, data={media}")
             # Handle both string URLs and media objects
             if isinstance(media, str):
+                logger.info(f"📎 Adding string URL to compatible media: {media}")
                 compatible_media.append(media)
                 compatible_media_objects.append({'cdn_url': media, 'type': 'unknown'})
             else:
@@ -344,8 +354,8 @@ class PlatformPublisher:
                 logger.info(f"📋 Media details: compatibility={platform_compatibility}, cdn_url={bool(cdn_url)}, status={processing_status}, type={media_type}, file_type={file_type}")
                 
                 # Check platform compatibility
-                is_compatible = provider in platform_compatibility or not platform_compatibility
-                logger.info(f"🔍 Platform compatibility check: provider='{provider}', is_compatible={is_compatible}")
+                is_compatible = provider in platform_compatibility or not platform_compatibility or 'all' in platform_compatibility
+                logger.info(f"🔍 Platform compatibility check: provider='{provider}', platform_compatibility={platform_compatibility}, is_compatible={is_compatible}")
                 
                 if is_compatible:
                     # Only process media files that have a valid CDN URL and are fully processed
@@ -389,12 +399,39 @@ class PlatformPublisher:
             metadata = {}
         metadata['media_objects'] = compatible_media_objects
         
+        # Extract YouTube-specific fields from platform-specific content
+        youtube_title = None
+        youtube_description = None
+        youtube_tags = None
+        youtube_privacy = None
+        
+        if provider == 'youtube' and platform_specific:
+            youtube_title = platform_specific.get('youtubeTitle')
+            youtube_description = platform_specific.get('youtubeDescription')
+            youtube_tags = platform_specific.get('youtubeTags', [])
+            youtube_privacy = platform_specific.get('youtubePrivacy', 'private')
+        
+        # Extract TikTok-specific fields from platform-specific content
+        tiktok_description = None
+        tiktok_privacy = None
+        
+        if provider == 'tiktok' and platform_specific:
+            tiktok_description = platform_specific.get('tiktokDescription') or platform_specific.get('content')
+            tiktok_privacy = platform_specific.get('tiktokPrivacy', 'SELF_ONLY')
+        
         return PlatformContent(
             content=cleaned_content,
             media_urls=compatible_media,
             hashtags=hashtags,
             mentions=mentions,
-            metadata=metadata
+            metadata=metadata,
+            media_files=compatible_media_objects,
+            youtube_title=youtube_title,
+            youtube_description=youtube_description,
+            youtube_tags=youtube_tags,
+            youtube_privacy=youtube_privacy,
+            tiktok_description=tiktok_description,
+            tiktok_privacy=tiktok_privacy
         )
 
     # Platform-specific publishing methods
@@ -406,18 +443,25 @@ class PlatformPublisher:
         platform: Dict[str, Any],
         user_id: int
     ) -> PublishResult:
-        """Publish to Twitter/X"""
+        """Publish to Twitter/X using OAuth 2.0 for posting and mixed OAuth for media"""
         try:
+            logger.info(f"🐦 Starting Twitter publishing with OAuth 2.0 authentication")
+            logger.info(f"🐦 Using OAuth 2.0 Bearer token for posting")
+            
+            if not access_token:
+                logger.error(f"🚨 CRITICAL: No OAuth 2.0 access token found for Twitter publishing!")
+                return PublishResult(
+                    platform="twitter",
+                    status=PublishStatus.FAILED,
+                    error_message="OAuth 2.0 access token required for Twitter publishing"
+                )
+            
+            logger.info(f"✅ Successfully retrieved OAuth 2.0 access token for Twitter publishing")
+            
             # Prepare tweet content
             tweet_text = content.content
             if content.hashtags:
                 tweet_text += " " + " ".join([f"#{tag}" for tag in content.hashtags])
-            
-            # Twitter API v2
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
             
             tweet_data = {"text": tweet_text}
             
@@ -427,12 +471,10 @@ class PlatformPublisher:
             
             if content.media_urls:
                 logger.info(f"🐦 Attempting to upload {len(content.media_urls)} media files to X")
-                logger.info(f"🐦 Calling _upload_twitter_media with platform: {platform}")
-                logger.info(f"🐦 User ID: {user_id}")
                 for media_url in content.media_urls[:4]:  # Twitter allows max 4 media
                     logger.info(f"🐦 About to call _upload_twitter_media for: {media_url}")
                     try:
-                        media_id = await self._upload_twitter_media(access_token, media_url, platform, user_id)
+                        media_id = await self._upload_twitter_media(media_url, platform, user_id)
                         logger.info(f"🐦 _upload_twitter_media returned: {media_id}")
                     except Exception as e:
                         logger.error(f"🐦 Exception in _upload_twitter_media: {str(e)}")
@@ -450,6 +492,139 @@ class PlatformPublisher:
             elif content.media_urls:
                 # We had media but couldn't upload any
                 logger.warning(f"🐦 Had {len(content.media_urls)} media files but couldn't upload any - posting text-only")
+            
+            # Twitter requires different OAuth flows:
+            # - OAuth 2.0: For text-only tweets  
+            # - OAuth 1.0a: For tweets with media (images/videos)
+            logger.info(f"🔑 Token format check: {access_token[:20]}..." if access_token and len(access_token) > 20 else f"🔑 Token: {access_token}")
+            logger.info(f"📝 Tweet data: {tweet_data}")
+            
+            has_media = bool(media_ids)
+            logger.info(f"🎯 Tweet type: {'WITH MEDIA' if has_media else 'TEXT-ONLY'}")
+            
+            if has_media:
+                # Media tweets require OAuth 1.0a
+                logger.info(f"🐦 Media tweet detected - using OAuth 1.0a authentication")
+                
+                # Get OAuth 1.0a tokens for media tweets
+                oauth1_tokens = await self._get_oauth1_tokens('twitter', platform, user_id)
+                if not oauth1_tokens:
+                    logger.error(f"🚨 No OAuth 1.0a tokens found for media tweet!")
+                    return PublishResult(
+                        platform="twitter",
+                        status=PublishStatus.FAILED,
+                        error_message="OAuth 1.0a tokens required for media tweets"
+                    )
+                
+                # Generate OAuth 1.0a header for media tweet creation
+                oauth_header = self._generate_oauth1_header_user_tokens(
+                    method="POST",
+                    url="https://api.twitter.com/2/tweets",
+                    oauth_token=oauth1_tokens['access_token'],
+                    oauth_token_secret=oauth1_tokens['access_token_secret'],
+                    params={}
+                )
+                
+                headers = {
+                    "Authorization": oauth_header,
+                    "Content-Type": "application/json"
+                }
+            else:
+                # Text-only tweets - check token format first
+                logger.info(f"🐦 Text-only tweet detected - checking token format")
+                
+                # Check if token is base64-encoded OAuth 1.0a format
+                is_base64_oauth1 = False
+                try:
+                    import base64
+                    decoded = base64.b64decode(access_token).decode('utf-8')
+                    if ':' in decoded:
+                        is_base64_oauth1 = True
+                        logger.info(f"🔍 Detected base64-encoded OAuth 1.0a token for text tweet")
+                except:
+                    pass
+                
+                if is_base64_oauth1:
+                    # Use OAuth 1.0a directly from the base64 token
+                    logger.info(f"🐦 Using OAuth 1.0a from base64 token for text-only tweet")
+                    try:
+                        import base64
+                        decoded = base64.b64decode(access_token).decode('utf-8')
+                        parts = decoded.split(':')
+                        if len(parts) >= 2:
+                            oauth_token = parts[0]
+                            oauth_token_secret = parts[1]
+                            
+                            logger.info(f"🔍 Extracted OAuth 1.0a credentials from base64:")
+                            logger.info(f"  - oauth_token: {oauth_token[:20]}...")
+                            logger.info(f"  - oauth_token_secret: {oauth_token_secret[:10]}...")
+                            
+                            # Generate OAuth 1.0a header for text-only tweet
+                            oauth_header = self._generate_oauth1_header_user_tokens(
+                                method="POST",
+                                url="https://api.twitter.com/2/tweets",
+                                oauth_token=oauth_token,
+                                oauth_token_secret=oauth_token_secret,
+                                params={}
+                            )
+                            
+                            headers = {
+                                "Authorization": oauth_header,
+                                "Content-Type": "application/json"
+                            }
+                        else:
+                            raise ValueError("Invalid OAuth 1.0a token format")
+                    except Exception as e:
+                        logger.error(f"🚨 Failed to parse base64 OAuth 1.0a token: {str(e)}")
+                        return PublishResult(
+                            platform="twitter",
+                            status=PublishStatus.FAILED,
+                            error_message=f"Failed to parse OAuth 1.0a token: {str(e)}"
+                        )
+                else:
+                    # Try OAuth 2.0 token decryption
+                    logger.info(f"🐦 Attempting OAuth 2.0 Bearer token for text-only tweet")
+                    from app.utils.encryption import decrypt_token
+                    try:
+                        logger.info(f"🔍 Attempting to decrypt OAuth 2.0 token: {access_token[:20]}..." if access_token else "🔍 No access_token provided")
+                        decrypted_oauth2_token = decrypt_token(access_token)
+                        logger.info(f"🔑 Successfully decrypted OAuth 2.0 token: {decrypted_oauth2_token[:20]}..." if decrypted_oauth2_token else "🔑 Decryption returned None")
+                        
+                        if not decrypted_oauth2_token:
+                            raise ValueError("Decryption returned None or empty token")
+                        
+                        headers = {
+                            "Authorization": f"Bearer {decrypted_oauth2_token}",
+                            "Content-Type": "application/json"
+                        }
+                    except Exception as decrypt_error:
+                        logger.warning(f"🔄 OAuth 2.0 token decryption failed: {str(decrypt_error)}")
+                        logger.warning(f"🔄 Falling back to OAuth 1.0a from database for text-only tweet")
+                        
+                        # Fallback to OAuth 1.0a from database
+                        oauth1_tokens = await self._get_oauth1_tokens('twitter', platform, user_id)
+                        if not oauth1_tokens:
+                            logger.error(f"🚨 All OAuth methods failed for text-only tweet!")
+                            return PublishResult(
+                                platform="twitter",
+                                status=PublishStatus.FAILED,
+                                error_message=f"Failed to decrypt OAuth 2.0 token and no OAuth 1.0a tokens found: {str(decrypt_error)}"
+                            )
+                        
+                        # Generate OAuth 1.0a header for text-only tweet
+                        oauth_header = self._generate_oauth1_header_user_tokens(
+                            method="POST",
+                            url="https://api.twitter.com/2/tweets",
+                            oauth_token=oauth1_tokens['access_token'],
+                            oauth_token_secret=oauth1_tokens['access_token_secret'],
+                            params={}
+                        )
+                        
+                        headers = {
+                            "Authorization": oauth_header,
+                            "Content-Type": "application/json"
+                        }
+                
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -470,8 +645,8 @@ class PlatformPublisher:
                         # Had media but couldn't upload any - partial success
                         result_status = PublishStatus.PARTIAL
                         result_metadata["warnings"] = media_upload_warnings
-                        result_metadata["limitation"] = "X API v2 OAuth doesn't support media uploads - text posted successfully"
-                        logger.warning(f"🐦 Partial success: Text posted but media upload failed due to OAuth 2.0 limitation")
+                        result_metadata["limitation"] = "Media upload failed - text posted successfully"
+                        logger.warning(f"🐦 Partial success: Text posted but media upload failed")
                     elif content.media_urls and len(media_ids) < len(content.media_urls):
                         # Some media uploaded but not all
                         result_status = PublishStatus.PARTIAL
@@ -486,7 +661,17 @@ class PlatformPublisher:
                     )
                 else:
                     error_text = response.text
-                    logger.error(f"🐦 Tweet creation failed: {error_text}")
+                    logger.error(f"🐦 Tweet creation failed - Status: {response.status_code}")
+                    logger.error(f"🐦 Error response: {error_text}")
+                    logger.error(f"🔑 Request headers: {headers}")
+                    
+                    # Try to parse Twitter API error details
+                    try:
+                        error_json = response.json()
+                        logger.error(f"🐦 Detailed Twitter error: {error_json}")
+                    except:
+                        pass
+                    
                     return PublishResult(
                         platform="twitter",
                         status=PublishStatus.FAILED,
@@ -501,28 +686,21 @@ class PlatformPublisher:
                 error_message=f"Twitter publishing error: {str(e)}"
             )
 
-    async def _upload_twitter_media(self, access_token: str, media_url: str, platform: Dict[str, Any] = None, user_id: int = None) -> Optional[str]:
-        """Upload media to Twitter using OAuth 1.0a authentication with chunked upload for larger files"""
+    async def _upload_twitter_media(self, media_url: str, platform: Dict[str, Any] = None, user_id: int = None) -> Optional[str]:
+        """Upload media to Twitter using OAuth 1.0a (media uploads require OAuth 1.0a)"""
         try:
             logger.info(f"🐦 ===== STARTING X MEDIA UPLOAD PROCESS =====")
             logger.info(f"🐦 Media URL: {media_url}")
             logger.info(f"🐦 User ID: {user_id}")
             logger.info(f"🐦 Platform data: {platform}")
             
-            # Get OAuth 1.0a tokens from social connections
-            logger.info(f"🐦 Attempting to get OAuth 1.0a tokens...")
+            # Get OAuth 1.0a tokens for media upload (required by Twitter)
             oauth1_tokens = await self._get_oauth1_tokens('twitter', platform, user_id)
-            
             if not oauth1_tokens:
-                logger.error(f"🚨 CRITICAL: No OAuth 1.0a tokens found!")
-                logger.error(f"🚨 User needs to complete OAuth 1.0a authentication for media uploads")
-                logger.error(f"🚨 This means the TwitterOAuth1Button flow needs to be completed")
-                logger.error(f"🚨 Media upload will fail - returning None")
+                logger.error(f"🚨 CRITICAL: No OAuth 1.0a tokens found for media upload!")
                 return None
             
-            logger.info(f"✅ Successfully retrieved OAuth 1.0a tokens!")
-            logger.info(f"🐦 Twitter user: {oauth1_tokens.get('screen_name')} (ID: {oauth1_tokens.get('user_id')})")
-            logger.info(f"🐦 Access token preview: {oauth1_tokens.get('access_token', '')[:20]}...")
+            logger.info(f"✅ Successfully retrieved OAuth 1.0a tokens for Twitter media upload")
             
             # Download media first
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -550,37 +728,32 @@ class PlatformPublisher:
                     logger.error(f"🐦 Image file too large: {media_size / 1024 / 1024:.2f}MB (max 5MB)")
                     return None
                 
-                # Use chunked upload for videos or files > 5MB, simple upload for smaller images
+                # Use chunked upload for videos (requires OAuth 1.0a), simple upload for images (uses OAuth 2.0)
                 if is_video or media_size > 5 * 1024 * 1024:
-                    logger.info(f"🐦 Using chunked upload for {media_size / 1024 / 1024:.2f}MB file")
+                    logger.info(f"🐦 Using chunked upload for {media_size / 1024 / 1024:.2f}MB file - OAuth 1.0a + API v2")
+                    
+                    # Get OAuth 1.0a tokens for chunked upload
+                    oauth1_tokens = await self._get_oauth1_tokens('twitter', platform, user_id)
+                    if not oauth1_tokens:
+                        logger.error(f"🚨 CRITICAL: No OAuth 1.0a tokens found for chunked upload!")
+                        logger.error(f"🚨 User needs to complete OAuth 1.0a authentication for video uploads")
+                        return None
+                    
                     return await self._upload_twitter_media_chunked(
                         media_data, content_type, oauth1_tokens, is_video
                     )
                 else:
-                    # Simple upload for small images
-                    logger.info(f"🐦 Using simple upload for {media_size / 1024:.2f}KB image")
+                    # Simple upload for small images using OAuth 1.0a
+                    logger.info(f"🐦 Using simple upload for {media_size / 1024:.2f}KB image - using OAuth 1.0a")
                     
-                    # Generate OAuth 1.0a signature for media upload using user's tokens
-                    logger.info(f"🔐 Generating OAuth header with user-specific tokens")
-                    logger.info(f"🔐 Access token preview: {oauth1_tokens['access_token'][:20]}...")
-                    logger.info(f"🔐 Access token secret preview: {oauth1_tokens['access_token_secret'][:10]}...")
-                    logger.info(f"🔐 User ID: {oauth1_tokens.get('user_id')}")
-                    logger.info(f"🔐 Screen name: {oauth1_tokens.get('screen_name')}")
-                    
+                    # Generate OAuth 1.0a header for simple media upload
                     oauth_header = self._generate_oauth1_header_user_tokens(
                         method="POST",
                         url="https://upload.twitter.com/1.1/media/upload.json",
                         oauth_token=oauth1_tokens['access_token'],
-                        oauth_token_secret=oauth1_tokens['access_token_secret']
+                        oauth_token_secret=oauth1_tokens['access_token_secret'],
+                        params={}
                     )
-                    logger.info(f"🔐 Generated OAuth header (preview): {oauth_header[:100]}...")
-                    
-                    # Verify we're not using environment variable tokens
-                    if oauth1_tokens['access_token'] == os.getenv('TWITTER_ACCESS_TOKEN'):
-                        logger.error(f"🚨 ERROR: Using environment variable token instead of user token!")
-                        logger.error(f"🚨 This should not happen - check token retrieval logic")
-                    else:
-                        logger.info(f"✅ Confirmed using user-specific OAuth 1.0a tokens (not environment variables)")
                     
                     headers = {
                         "Authorization": oauth_header
@@ -588,8 +761,7 @@ class PlatformPublisher:
                     
                     files = {"media": media_data}
                     
-                    logger.info(f"🐦 Uploading media using OAuth 1.0a authentication")
-                    logger.info(f"🐦 Using tokens for user: {oauth1_tokens.get('screen_name')} ({oauth1_tokens.get('user_id')})")
+                    logger.info(f"🐦 Uploading media using OAuth 1.0a signature (API v1.1)")
                     logger.info(f"🐦 Media size: {len(media_data) / 1024:.2f}KB")
                     
                     upload_response = await client.post(
@@ -660,7 +832,7 @@ class PlatformPublisher:
                     data=init_params
                 )
                 
-                if init_response.status_code != 200:
+                if init_response.status_code not in [200, 202]:
                     logger.error(f"🐦 INIT failed: {init_response.status_code} - {init_response.text}")
                     return None
                 
@@ -681,9 +853,13 @@ class PlatformPublisher:
                     
                     append_params = {
                         "command": "APPEND",
-                        "media_id": media_id,
+                        "media_id": str(media_id),
                         "segment_index": str(segment_index)
                     }
+                    
+                    logger.info(f"🐦 APPEND: Generating OAuth header for chunk {segment_index}")
+                    logger.info(f"🐦 APPEND: Using tokens - access_token: {oauth1_tokens['access_token'][:20]}..., access_token_secret: {oauth1_tokens['access_token_secret'][:10]}...")
+                    logger.info(f"🐦 APPEND: Request params: {append_params}")
                     
                     append_oauth_header = self._generate_oauth1_header_user_tokens(
                         method="POST",
@@ -693,18 +869,40 @@ class PlatformPublisher:
                         params=append_params
                     )
                     
+                    logger.info(f"🐦 APPEND: Generated OAuth header length: {len(append_oauth_header)}")
+                    
                     # Use multipart/form-data for chunk upload
-                    files = {"media": chunk}
+                    # For OAuth 1.0a with multipart, include non-file params in files dict
+                    files = {
+                        "command": (None, "APPEND"),
+                        "media_id": (None, str(media_id)),
+                        "segment_index": (None, str(segment_index)),
+                        "media": ("media", chunk, content_type)
+                    }
+                    
+                    logger.info(f"🐦 APPEND: Sending request with:")
+                    logger.info(f"🐦   URL: https://upload.twitter.com/1.1/media/upload.json")
+                    logger.info(f"🐦   Method: POST")
+                    logger.info(f"🐦   Auth header present: {bool(append_oauth_header)}")
+                    logger.info(f"🐦   Files: command=APPEND, media_id={media_id}, segment_index={segment_index}, media chunk size={len(chunk)} bytes")
                     
                     append_response = await client.post(
                         "https://upload.twitter.com/1.1/media/upload.json",
                         headers={"Authorization": append_oauth_header},
-                        data=append_params,
                         files=files
                     )
                     
                     if append_response.status_code != 204:
                         logger.error(f"🐦 APPEND failed for chunk {segment_index}: {append_response.status_code}")
+                        logger.error(f"🐦 APPEND response: {append_response.text}")
+                        logger.error(f"🐦 APPEND request headers: {dict(append_response.request.headers)}")
+                        logger.error(f"🐦 APPEND request URL: {append_response.request.url}")
+                        # Try to get more info about the request
+                        try:
+                            if hasattr(append_response.request, 'content'):
+                                logger.error(f"🐦 APPEND request content preview: {str(append_response.request.content)[:500]}...")
+                        except Exception as e:
+                            logger.error(f"🐦 Could not log request content: {e}")
                         return None
                 
                 # Step 3: FINALIZE - Complete upload
@@ -795,38 +993,66 @@ class PlatformPublisher:
         try:
             logger.info(f"🔍 _get_oauth1_tokens called with provider={provider}, user_id={user_id}")
             logger.info(f"🔍 Platform data received: {platform}")
+            logger.info(f"🔍 Platform data type: {type(platform)}")
             
             # Get provider account ID from platform data
             provider_account_id = platform.get('accountId') if platform else None
-            logger.info(f"🔍 Provider account ID: {provider_account_id}")
+            logger.info(f"🔍 Provider account ID from platform: {provider_account_id} (type: {type(provider_account_id)})")
             
             # Convert account_id to string for consistent comparison
             account_id_str = str(provider_account_id) if provider_account_id else None
+            logger.info(f"🔍 Account ID converted to string: {account_id_str}")
+            
+            # Log all query parameters before building query
+            logger.info(f"🔍 Query parameters - provider: '{provider}', user_id: {user_id}, account_id_str: '{account_id_str}'")
             
             # Query for OAuth 1.0a tokens using dedicated columns
-            query = self.db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at, provider_account_id, account_label').eq('provider', provider)
+            query = self.db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at, provider_account_id, account_label, user_id, is_primary, created_at').eq('provider', provider)
             
             if user_id:
                 query = query.eq('user_id', user_id)
+                logger.info(f"🔍 Added user_id filter: {user_id}")
             
             if account_id_str:
                 query = query.eq('provider_account_id', account_id_str)
+                logger.info(f"🔍 Added provider_account_id filter: {account_id_str}")
             else:
                 # If no specific account ID, get primary connection
                 query = query.order('is_primary desc, created_at asc').limit(1)
+                logger.info(f"🔍 No specific account ID, using primary connection order")
             
-            logger.info(f"🔍 Executing database query for OAuth 1.0a tokens: user_id={user_id}, provider={provider}, provider_account_id={account_id_str}")
+            logger.info(f"🔍 Executing database query for OAuth 1.0a tokens...")
             response = query.execute()
             
-            logger.info(f"🔍 Database response: {len(response.data) if response.data else 0} connections found")
+            logger.info(f"🔍 Database response status: {response}")
+            logger.info(f"🔍 Database response data count: {len(response.data) if response.data else 0}")
+            
+            # Log raw response data (with sensitive data masked)
+            if response.data:
+                for i, conn in enumerate(response.data):
+                    logger.info(f"🔍 Connection {i}: provider={conn.get('provider')}, user_id={conn.get('user_id')}, provider_account_id={conn.get('provider_account_id')}, account_label={conn.get('account_label')}")
+                    logger.info(f"🔍 Connection {i} OAuth1 tokens: access_token_present={bool(conn.get('oauth1_access_token'))}, access_token_secret_present={bool(conn.get('oauth1_access_token_secret'))}")
             
             if not response.data:
                 logger.warning(f"🐦 No {provider} connection found for user {user_id}")
                 
-                # Debug: List all connections for this user
-                debug_query = self.db.table('social_connections').select('provider, provider_account_id, account_label').eq('user_id', user_id)
+                # Debug: List all connections for this user with full details
+                debug_query = self.db.table('social_connections').select('provider, provider_account_id, account_label, user_id, is_primary, created_at').eq('user_id', user_id)
                 debug_response = debug_query.execute()
-                logger.warning(f"🔍 All connections for user {user_id}: {debug_response.data}")
+                logger.warning(f"🔍 All connections for user {user_id}:")
+                if debug_response.data:
+                    for i, conn in enumerate(debug_response.data):
+                        logger.warning(f"🔍   Connection {i}: provider={conn.get('provider')}, provider_account_id={conn.get('provider_account_id')}, account_label={conn.get('account_label')}, is_primary={conn.get('is_primary')}")
+                else:
+                    logger.warning(f"🔍   No connections found for user {user_id}")
+                
+                # Additional debug: Check if provider exists for any user
+                provider_check = self.db.table('social_connections').select('provider, provider_account_id, user_id').eq('provider', provider).limit(5)
+                provider_response = provider_check.execute()
+                logger.warning(f"🔍 Sample connections for provider '{provider}' (any user): {len(provider_response.data if provider_response.data else [])} found")
+                if provider_response.data:
+                    for conn in provider_response.data:
+                        logger.warning(f"🔍   Sample: user_id={conn.get('user_id')}, provider_account_id={conn.get('provider_account_id')}")
                 
                 return None
             
@@ -835,16 +1061,37 @@ class PlatformPublisher:
             found_account_id = connection.get('provider_account_id')
             account_label = connection.get('account_label', 'unknown')
             
-            logger.info(f"🔍 Found connection: account_id={found_account_id}, label={account_label}")
+            logger.info(f"🔍 Found connection details:")
+            logger.info(f"🔍   provider: {connection.get('provider')}")
+            logger.info(f"🔍   user_id: {connection.get('user_id')}")
+            logger.info(f"🔍   provider_account_id: {found_account_id}")
+            logger.info(f"🔍   account_label: {account_label}")
+            logger.info(f"🔍   is_primary: {connection.get('is_primary')}")
+            logger.info(f"🔍   created_at: {connection.get('created_at')}")
             
             # Check if OAuth 1.0a tokens exist in dedicated columns
             oauth1_access_token = connection.get('oauth1_access_token')
             oauth1_access_token_secret = connection.get('oauth1_access_token_secret')
+            oauth1_user_id = connection.get('oauth1_user_id')
+            oauth1_screen_name = connection.get('oauth1_screen_name')
+            
+            logger.info(f"🔍 OAuth 1.0a token fields:")
+            logger.info(f"🔍   oauth1_access_token present: {bool(oauth1_access_token)}")
+            logger.info(f"🔍   oauth1_access_token_secret present: {bool(oauth1_access_token_secret)}")
+            logger.info(f"🔍   oauth1_user_id: {oauth1_user_id}")
+            logger.info(f"🔍   oauth1_screen_name: {oauth1_screen_name}")
+            
+            if oauth1_access_token:
+                logger.info(f"🔍   oauth1_access_token length: {len(oauth1_access_token)}")
+                logger.info(f"🔍   oauth1_access_token starts_with: {oauth1_access_token[:10]}...")
+            
+            if oauth1_access_token_secret:
+                logger.info(f"🔍   oauth1_access_token_secret length: {len(oauth1_access_token_secret)}")
+                logger.info(f"🔍   oauth1_access_token_secret starts_with: {oauth1_access_token_secret[:10]}...")
             
             if not oauth1_access_token or not oauth1_access_token_secret:
                 logger.warning(f"🐦 No OAuth 1.0a tokens found in dedicated columns for {provider} account {found_account_id}")
-                logger.warning(f"🔍 oauth1_access_token present: {bool(oauth1_access_token)}")
-                logger.warning(f"🔍 oauth1_access_token_secret present: {bool(oauth1_access_token_secret)}")
+                logger.warning(f"🔍 Missing tokens: access_token={not bool(oauth1_access_token)}, access_token_secret={not bool(oauth1_access_token_secret)}")
                 return None
             
             logger.info(f"✅ Found OAuth 1.0a tokens in dedicated columns")
@@ -853,28 +1100,46 @@ class PlatformPublisher:
             from app.utils.encryption import decrypt_token
             
             try:
+                logger.info(f"🔍 Starting token decryption...")
+                
+                decrypted_access_token = decrypt_token(oauth1_access_token)
+                logger.info(f"🔍 Access token decrypted successfully, length: {len(decrypted_access_token)}")
+                
+                decrypted_access_token_secret = decrypt_token(oauth1_access_token_secret)
+                logger.info(f"🔍 Access token secret decrypted successfully, length: {len(decrypted_access_token_secret)}")
+                
                 decrypted_tokens = {
-                    'access_token': decrypt_token(oauth1_access_token),
-                    'access_token_secret': decrypt_token(oauth1_access_token_secret),
-                    'user_id': connection.get('oauth1_user_id'),
-                    'screen_name': connection.get('oauth1_screen_name')
+                    'access_token': decrypted_access_token,
+                    'access_token_secret': decrypted_access_token_secret,
+                    'user_id': oauth1_user_id,
+                    'screen_name': oauth1_screen_name
                 }
                 
                 logger.info(f"🐦 Successfully retrieved and decrypted OAuth 1.0a tokens from dedicated columns for {provider} user {decrypted_tokens['screen_name']} (account: {found_account_id})")
                 logger.info(f"🔍 Decrypted token preview: {decrypted_tokens['access_token'][:20]}...") 
+                logger.info(f"🔍 Decrypted token secret preview: {decrypted_tokens['access_token_secret'][:20]}...")
                 
                 return decrypted_tokens
                 
             except Exception as decrypt_error:
                 logger.error(f"🐦 Failed to decrypt OAuth 1.0a tokens from dedicated columns: {str(decrypt_error)}")
+                logger.error(f"🔍 Decryption error type: {type(decrypt_error)}")
                 logger.error(f"🔍 Raw tokens - access_token length: {len(oauth1_access_token) if oauth1_access_token else 0}")
                 logger.error(f"🔍 Raw tokens - access_token_secret length: {len(oauth1_access_token_secret) if oauth1_access_token_secret else 0}")
+                
+                # Try to identify if tokens are already decrypted or have encryption issues
+                if oauth1_access_token and len(oauth1_access_token) < 100:
+                    logger.error(f"🔍 Access token appears unusually short, might be unencrypted: {oauth1_access_token[:20]}...")
+                
+                import traceback
+                logger.error(f"🔍 Decryption traceback: {traceback.format_exc()}")
                 return None
                 
         except Exception as e:
             logger.error(f"🐦 Error getting OAuth 1.0a tokens: {str(e)}")
+            logger.error(f"🔍 Error type: {type(e)}")
             import traceback
-            logger.error(f"🔍 Traceback: {traceback.format_exc()}")
+            logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
             return None
     
     def _generate_oauth1_header_user_tokens(self, method: str, url: str, oauth_token: str, oauth_token_secret: str, params: dict = None) -> str:
@@ -882,12 +1147,23 @@ class PlatformPublisher:
         if params is None:
             params = {}
         
+        # Log input parameters for debugging
+        logger.info(f"🔐 _generate_oauth1_header_user_tokens called:")
+        logger.info(f"🔐   method: {method}")
+        logger.info(f"🔐   url: {url}")
+        logger.info(f"🔐   oauth_token preview: {oauth_token[:20]}..." if oauth_token else "🔐   oauth_token: None")
+        logger.info(f"🔐   oauth_token_secret preview: {oauth_token_secret[:10]}..." if oauth_token_secret else "🔐   oauth_token_secret: None")
+        logger.info(f"🔐   params: {params}")
+        
         # Generate OAuth parameters
         timestamp = str(int(time.time()))
         nonce = secrets.token_hex(16)
         
         consumer_key = os.getenv('TWITTER_CONSUMER_API_KEY')
         consumer_secret = os.getenv('TWITTER_CONSUMER_API_SECRET')
+        
+        logger.info(f"🔐   consumer_key present: {bool(consumer_key)}")
+        logger.info(f"🔐   consumer_secret present: {bool(consumer_secret)}")
         
         # OAuth base parameters
         oauth_params = {
@@ -900,19 +1176,24 @@ class PlatformPublisher:
         }
         
         # Combine all parameters for signature generation
+        # Only include non-file parameters (which is what we're doing)
         all_params = {**params, **oauth_params}
         
-        # Sort parameters
+        # Sort parameters by key
         sorted_params = sorted(all_params.items())
         
-        # Create parameter string
-        param_string = '&'.join([f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_params])
+        # Create parameter string using proper percent encoding
+        # OAuth 1.0a requires percent-encoding (RFC 3986)
+        def percent_encode(s):
+            return urllib.parse.quote(str(s), safe='')
+        
+        param_string = '&'.join([f"{percent_encode(k)}={percent_encode(v)}" for k, v in sorted_params])
         
         # Create signature base string
-        base_string = f"{method.upper()}&{urllib.parse.quote_plus(url)}&{urllib.parse.quote_plus(param_string)}"
+        base_string = f"{method.upper()}&{percent_encode(url)}&{percent_encode(param_string)}"
         
         # Create signing key
-        signing_key = f"{urllib.parse.quote_plus(consumer_secret)}&{urllib.parse.quote_plus(oauth_token_secret)}"
+        signing_key = f"{percent_encode(consumer_secret)}&{percent_encode(oauth_token_secret)}"
         
         # Generate signature
         signature = base64.b64encode(
@@ -922,9 +1203,20 @@ class PlatformPublisher:
         # Add signature to OAuth parameters
         oauth_params['oauth_signature'] = signature
         
+        # Log signature details for debugging
+        logger.info(f"🔐 OAuth signature generated:")
+        logger.info(f"🔐   signature: {signature[:20]}...")
+        logger.info(f"🔐   timestamp: {timestamp}")
+        logger.info(f"🔐   nonce: {nonce[:20]}...")
+        
         # Create OAuth header string
-        oauth_string = ', '.join([f'{k}="{urllib.parse.quote(str(v))}"' for k, v in sorted(oauth_params.items())])
-        return f"OAuth {oauth_string}"
+        oauth_string = ', '.join([f'{k}="{percent_encode(v)}"' for k, v in sorted(oauth_params.items())])
+        oauth_header = f"OAuth {oauth_string}"
+        
+        # Log the generated header (with sensitive parts masked)
+        logger.info(f"🔐 Generated OAuth header preview: OAuth oauth_consumer_key=\"...\", oauth_nonce=\"{nonce[:10]}...\", oauth_signature=\"{signature[:10]}...\", oauth_signature_method=\"HMAC-SHA1\", oauth_timestamp=\"{timestamp}\", oauth_token=\"{oauth_token[:10] if oauth_token else ''}...\", oauth_version=\"1.0\"")
+        
+        return oauth_header
 
     async def _upload_linkedin_media(self, client: httpx.AsyncClient, access_token: str, media_url: str, author_urn: str) -> Optional[str]:
         """Upload media to LinkedIn and return the asset URN"""
@@ -1182,12 +1474,15 @@ class PlatformPublisher:
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # Handle media by uploading directly to Facebook
+                logger.info(f"🎯 Facebook publish decision: media_urls={content.media_urls}, count={len(content.media_urls) if content.media_urls else 0}")
                 if content.media_urls:
+                    logger.info(f"📁 Publishing Facebook post WITH media: {len(content.media_urls)} files")
                     # Upload image(s) and create post with photo
                     return await self._publish_facebook_with_photos(
                         client, endpoint, access_token, post_text, content.media_urls, account_label
                     )
                 else:
+                    logger.info(f"📝 Publishing Facebook post WITHOUT media (text-only)")
                     # Text-only post
                     return await self._publish_facebook_text_only(
                         client, endpoint, access_token, post_text, account_label
@@ -2084,11 +2379,224 @@ class PlatformPublisher:
         platform: Dict[str, Any]
     ) -> PublishResult:
         """Publish to TikTok (requires video)"""
-        return PublishResult(
-            platform="tiktok",
-            status=PublishStatus.FAILED,
-            error_message="TikTok publishing not yet implemented - requires video upload workflow"
-        )
+        try:
+            logger.info(f"🎵 Starting TikTok video publishing process")
+            
+            # TikTok requires at least one video file
+            if not content.media_files:
+                return PublishResult(
+                    platform="tiktok",
+                    status=PublishStatus.FAILED,
+                    error_message="TikTok requires at least one video file"
+                )
+            
+            # Find the first video file
+            video_file = None
+            for media in content.media_files:
+                if media.get('type') == 'video':
+                    video_file = media
+                    break
+            
+            if not video_file:
+                return PublishResult(
+                    platform="tiktok",
+                    status=PublishStatus.FAILED,
+                    error_message="TikTok requires a video file - no video found in media files"
+                )
+            
+            # Extract TikTok-specific metadata
+            description = content.tiktok_description or content.content or ""
+            # For unaudited apps, TikTok requires SELF_ONLY privacy
+            privacy_level = 'SELF_ONLY'  # Force private for unaudited apps
+            logger.info(f"📱 TikTok privacy level forced to SELF_ONLY for unaudited app")
+            
+            # TikTok has a 2200 character limit for descriptions
+            if len(description) > 2200:
+                description = description[:2197] + "..."
+            
+            # Extract video duration from metadata
+            video_duration = video_file.get('metadata', {}).get('duration', 0)
+            
+            # Upload video to TikTok
+            result = await self._upload_tiktok_video(
+                access_token=access_token,
+                video_url=video_file.get('cdn_url'),
+                description=description,
+                privacy_level=privacy_level,
+                video_duration=video_duration
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"TikTok publishing error: {str(e)}")
+            return PublishResult(
+                platform="tiktok",
+                status=PublishStatus.FAILED,
+                error_message=f"TikTok publishing failed: {str(e)}"
+            )
+
+    async def _upload_tiktok_video(
+        self,
+        access_token: str,
+        video_url: str,
+        description: str,
+        privacy_level: str,
+        video_duration: int
+    ) -> PublishResult:
+        """Upload video to TikTok using their API"""
+        try:
+            logger.info(f"🎵 Starting TikTok video upload process")
+            logger.info(f"📁 Video URL: {video_url}")
+            logger.info(f"📝 Description: {description[:100]}...")
+            logger.info(f"🔒 Privacy level: {privacy_level}")
+            logger.info(f"📹 Video duration: {video_duration} seconds")
+            
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                # Step 1: Initialize video upload
+                logger.info(f"🚀 Initializing TikTok video upload...")
+                
+                init_headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                }
+                
+                # For TikTok, we need to use their newer Direct Post API
+                # Domain verification should now be complete
+                
+                logger.info(f"🎬 Using TikTok Direct Post API with PULL_FROM_URL")
+                
+                # TikTok Direct Post API with public URL
+                # We'll create a post that references the video URL
+                post_payload = {
+                    "post_info": {
+                        "title": description[:150],  # TikTok allows 150 chars for title
+                        "privacy_level": privacy_level,
+                        "disable_duet": False,
+                        "disable_comment": False,
+                        "disable_stitch": False,
+                        "video_cover_timestamp_ms": 1000
+                    },
+                    "source_info": {
+                        "source": "PULL_FROM_URL",
+                        "video_url": video_url
+                    },
+                    "post_mode": "DIRECT_POST",
+                    "media_type": "VIDEO"
+                }
+                
+                # Add disclaimer about URL ownership
+                logger.warning(f"⚠️ Note: TikTok requires URL ownership verification for PULL_FROM_URL")
+                logger.warning(f"⚠️ The domain 'cdn.multivio.com' must be verified in TikTok Developer Portal")
+                
+                init_response = await client.post(
+                    'https://open.tiktokapis.com/v2/post/publish/video/init/',
+                    headers=init_headers,
+                    json=post_payload
+                )
+                
+                if init_response.status_code != 200:
+                    error_text = init_response.text
+                    logger.error(f"❌ TikTok post initialization failed: {error_text}")
+                    
+                    # Check specific TikTok error types
+                    if 'url_ownership_unverified' in error_text:
+                        return PublishResult(
+                            platform="tiktok",
+                            status=PublishStatus.FAILED,
+                            error_message="TikTok requires URL domain verification. Please verify 'cdn.multivio.com' in TikTok Developer Portal at https://developers.tiktok.com/"
+                        )
+                    elif 'unaudited_client_can_only_post_to_private_accounts' in error_text:
+                        return PublishResult(
+                            platform="tiktok",
+                            status=PublishStatus.FAILED,
+                            error_message="TikTok app audit required. Unaudited apps can only post private videos. Submit your app for review at https://developers.tiktok.com/"
+                        )
+                    
+                    return PublishResult(
+                        platform="tiktok",
+                        status=PublishStatus.FAILED,
+                        error_message=f"TikTok post initialization failed: {error_text}"
+                    )
+                
+                response_data = init_response.json()
+                publish_id = response_data.get('data', {}).get('publish_id')
+                
+                if not publish_id:
+                    return PublishResult(
+                        platform="tiktok",
+                        status=PublishStatus.FAILED,
+                        error_message="TikTok did not return a publish_id"
+                    )
+                
+                logger.info(f"✅ Post initialized, publish_id: {publish_id}")
+                
+                # Step 2: Check publish status
+                logger.info(f"🔍 Checking upload status...")
+                
+                status_headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                }
+                
+                # Poll for upload completion
+                max_checks = 10
+                for check_num in range(max_checks):
+                    await asyncio.sleep(3)  # Wait 3 seconds between checks
+                    
+                    status_response = await client.get(
+                        f'https://open.tiktokapis.com/v2/post/publish/status/fetch/',
+                        headers=status_headers,
+                        params={'publish_id': publish_id}
+                    )
+                    
+                    if status_response.status_code == 200:
+                        status_data = status_response.json()
+                        status = status_data.get('data', {}).get('status')
+                        
+                        logger.info(f"📊 Upload status: {status}")
+                        
+                        if status == 'PUBLISH_COMPLETE':
+                            video_id = status_data.get('data', {}).get('video_id')
+                            share_url = status_data.get('data', {}).get('share_url')
+                            
+                            logger.info(f"✅ TikTok video published successfully!")
+                            logger.info(f"🎵 Video ID: {video_id}")
+                            logger.info(f"🔗 Share URL: {share_url}")
+                            
+                            return PublishResult(
+                                platform="tiktok",
+                                status=PublishStatus.SUCCESS,
+                                platform_post_id=video_id,
+                                metadata={
+                                    "tiktok_data": status_data.get('data', {}),
+                                    "video_id": video_id,
+                                    "share_url": share_url,
+                                    "publish_id": publish_id
+                                }
+                            )
+                        elif status in ['FAILED', 'CANCELED']:
+                            error_msg = status_data.get('data', {}).get('fail_reason', 'Unknown error')
+                            return PublishResult(
+                                platform="tiktok",
+                                status=PublishStatus.FAILED,
+                                error_message=f"TikTok publishing failed: {error_msg}"
+                            )
+                
+                # If we've exhausted status checks
+                return PublishResult(
+                    platform="tiktok",
+                    status=PublishStatus.FAILED,
+                    error_message="TikTok upload status check timeout - video may still be processing"
+                )
+                
+        except Exception as e:
+            logger.error(f"TikTok upload error: {str(e)}")
+            return PublishResult(
+                platform="tiktok",
+                status=PublishStatus.FAILED,
+                error_message=f"TikTok upload error: {str(e)}"
+            )
 
     async def _publish_to_youtube(
         self, 
@@ -2097,8 +2605,186 @@ class PlatformPublisher:
         platform: Dict[str, Any]
     ) -> PublishResult:
         """Publish to YouTube (requires video)"""
-        return PublishResult(
-            platform="youtube",
-            status=PublishStatus.FAILED,
-            error_message="YouTube publishing not yet implemented - requires video upload workflow"
-        )
+        try:
+            # YouTube requires at least one video file
+            if not content.media_files:
+                return PublishResult(
+                    platform="youtube",
+                    status=PublishStatus.FAILED,
+                    error_message="YouTube requires at least one video file"
+                )
+            
+            # Find the first video file
+            video_file = None
+            for media in content.media_files:
+                if media.get('type') == 'video':
+                    video_file = media
+                    break
+            
+            if not video_file:
+                return PublishResult(
+                    platform="youtube",
+                    status=PublishStatus.FAILED,
+                    error_message="YouTube requires a video file - no video found in media files"
+                )
+            
+            # Extract YouTube-specific metadata
+            youtube_title = content.youtube_title or content.content[:100] or "Untitled Video"
+            youtube_description = content.youtube_description or content.content or ""
+            youtube_tags = content.youtube_tags or []
+            youtube_privacy = getattr(content, 'youtube_privacy', 'private')  # Default to private
+            
+            # Prepare video metadata
+            video_metadata = {
+                "snippet": {
+                    "title": youtube_title,
+                    "description": youtube_description,
+                    "tags": youtube_tags[:10],  # YouTube allows max 10 tags
+                    "categoryId": "22"  # Default to "People & Blogs"
+                },
+                "status": {
+                    "privacyStatus": youtube_privacy,
+                    "embeddable": True,
+                    "publicStatsViewable": True
+                }
+            }
+            
+            # Upload video using resumable upload
+            result = await self._upload_youtube_video(
+                access_token=access_token,
+                video_url=video_file.get('cdn_url'),
+                metadata=video_metadata
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"YouTube publishing error: {str(e)}")
+            return PublishResult(
+                platform="youtube",
+                status=PublishStatus.FAILED,
+                error_message=f"YouTube publishing failed: {str(e)}"
+            )
+
+    async def _upload_youtube_video(
+        self,
+        access_token: str,
+        video_url: str,
+        metadata: Dict[str, Any]
+    ) -> PublishResult:
+        """Upload video to YouTube using resumable upload"""
+        try:
+            logger.info(f"🎬 Starting YouTube video upload process")
+            logger.info(f"📁 Video URL: {video_url}")
+            logger.info(f"📋 Metadata: {metadata}")
+            
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                # Step 1: Download video file to get its content and size
+                logger.info(f"📥 Downloading video file from CDN...")
+                video_response = await client.get(video_url)
+                
+                if video_response.status_code != 200:
+                    return PublishResult(
+                        platform="youtube",
+                        status=PublishStatus.FAILED,
+                        error_message=f"Failed to download video from CDN: {video_response.status_code}"
+                    )
+                
+                video_content = video_response.content
+                video_size = len(video_content)
+                logger.info(f"📊 Video downloaded successfully, size: {video_size} bytes")
+                
+                # Step 2: Initiate resumable upload session
+                logger.info(f"🚀 Initiating YouTube resumable upload session...")
+                
+                upload_headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json',
+                    'X-Upload-Content-Type': 'video/*',
+                    'X-Upload-Content-Length': str(video_size)
+                }
+                
+                upload_params = {
+                    'part': 'snippet,status',
+                    'uploadType': 'resumable'
+                }
+                
+                # Initiate upload
+                init_response = await client.post(
+                    'https://www.googleapis.com/upload/youtube/v3/videos',
+                    headers=upload_headers,
+                    params=upload_params,
+                    json=metadata
+                )
+                
+                if init_response.status_code != 200:
+                    error_text = init_response.text
+                    logger.error(f"❌ YouTube upload initiation failed: {error_text}")
+                    return PublishResult(
+                        platform="youtube",
+                        status=PublishStatus.FAILED,
+                        error_message=f"YouTube upload initiation failed: {error_text}"
+                    )
+                
+                # Get upload URL from Location header
+                upload_url = init_response.headers.get('Location')
+                if not upload_url:
+                    return PublishResult(
+                        platform="youtube",
+                        status=PublishStatus.FAILED,
+                        error_message="YouTube upload URL not received"
+                    )
+                
+                logger.info(f"✅ Upload session initiated, upload URL: {upload_url[:50]}...")
+                
+                # Step 3: Upload video content
+                logger.info(f"📤 Uploading video content...")
+                
+                upload_headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'video/*',
+                    'Content-Length': str(video_size)
+                }
+                
+                upload_response = await client.put(
+                    upload_url,
+                    headers=upload_headers,
+                    content=video_content
+                )
+                
+                if upload_response.status_code in [200, 201]:
+                    response_data = upload_response.json()
+                    video_id = response_data.get('id')
+                    
+                    logger.info(f"✅ YouTube video uploaded successfully!")
+                    logger.info(f"🎬 Video ID: {video_id}")
+                    logger.info(f"📋 Video metadata: {response_data.get('snippet', {})}")
+                    
+                    return PublishResult(
+                        platform="youtube",
+                        status=PublishStatus.SUCCESS,
+                        platform_post_id=video_id,
+                        metadata={
+                            "youtube_data": response_data,
+                            "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                            "title": response_data.get('snippet', {}).get('title'),
+                            "description": response_data.get('snippet', {}).get('description'),
+                            "privacy_status": response_data.get('status', {}).get('privacyStatus')
+                        }
+                    )
+                else:
+                    error_text = upload_response.text
+                    logger.error(f"❌ YouTube video upload failed: {error_text}")
+                    return PublishResult(
+                        platform="youtube",
+                        status=PublishStatus.FAILED,
+                        error_message=f"YouTube video upload failed: {error_text}"
+                    )
+                    
+        except Exception as e:
+            logger.error(f"YouTube upload error: {str(e)}")
+            return PublishResult(
+                platform="youtube",
+                status=PublishStatus.FAILED,
+                error_message=f"YouTube upload error: {str(e)}"
+            )
