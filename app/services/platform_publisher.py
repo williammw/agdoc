@@ -1592,6 +1592,7 @@ class PlatformPublisher:
             # For unaudited apps, TikTok requires SELF_ONLY privacy
             privacy_level = 'SELF_ONLY'  # Force private for unaudited apps
             logger.info(f"📱 TikTok privacy level forced to SELF_ONLY for unaudited app")
+            logger.warning("⚠️ IMPORTANT: The TikTok user account must be set to PRIVATE in TikTok app settings for sandbox posting to work!")
             
             # TikTok has a 2200 character limit for descriptions
             if len(description) > 2200:
@@ -1693,7 +1694,7 @@ class PlatformPublisher:
                         return PublishResult(
                             platform="tiktok",
                             status=PublishStatus.FAILED,
-                            error_message="TikTok app audit required. Unaudited apps can only post private videos. Submit your app for review at https://developers.tiktok.com/"
+                            error_message="TikTok sandbox requirement: The TikTok user account must be set to PRIVATE in the TikTok app settings. Unaudited apps can only post to private accounts. Please change your TikTok account to private and try again."
                         )
                     
                     return PublishResult(
@@ -1727,10 +1728,10 @@ class PlatformPublisher:
                 for check_num in range(max_checks):
                     await asyncio.sleep(3)  # Wait 3 seconds between checks
                     
-                    status_response = await client.get(
-                        f'https://open.tiktokapis.com/v2/post/publish/status/fetch/',
+                    status_response = await client.post(
+                        'https://open.tiktokapis.com/v2/post/publish/status/fetch/',
                         headers=status_headers,
-                        params={'publish_id': publish_id}
+                        json={'publish_id': publish_id}
                     )
                     
                     if status_response.status_code == 200:
@@ -1765,12 +1766,32 @@ class PlatformPublisher:
                                 status=PublishStatus.FAILED,
                                 error_message=f"TikTok publishing failed: {error_msg}"
                             )
+                    else:
+                        # Log the status check error for debugging
+                        logger.warning(f"⚠️ TikTok status check failed: HTTP {status_response.status_code}")
+                        if status_response.status_code != 404:
+                            try:
+                                error_data = status_response.json()
+                                logger.warning(f"⚠️ TikTok status error response: {error_data}")
+                            except:
+                                logger.warning(f"⚠️ TikTok status error text: {status_response.text}")
+                        
+                        # If it's the last check and still failing, we'll timeout below
+                        if check_num == max_checks - 1:
+                            logger.warning(f"⚠️ Final status check failed, considering timeout")
                 
-                # If we've exhausted status checks
+                # If we've exhausted status checks but video was uploaded
+                logger.warning(f"⚠️ TikTok status check timeout but video was successfully initialized (publish_id: {publish_id})")
+                logger.warning("⚠️ Video may appear in TikTok account despite timeout - check manually")
+                
                 return PublishResult(
                     platform="tiktok",
                     status=PublishStatus.FAILED,
-                    error_message="TikTok upload status check timeout - video may still be processing"
+                    error_message="TikTok status check timeout. Video was uploaded but status verification failed. Check your TikTok account - the video may have posted successfully.",
+                    metadata={
+                        "publish_id": publish_id,
+                        "note": "Video upload initialized successfully but status check timed out"
+                    }
                 )
                 
         except Exception as e:
