@@ -1439,12 +1439,33 @@ class PlatformPublisher:
                 "access_token": access_token
             }
             
-            # Handle media if present (single image support)
+            # Handle media if present (support both image and video)
             if content.media_urls and len(content.media_urls) > 0:
                 media_url = content.media_urls[0]
-                container_data["media_type"] = "IMAGE"
-                container_data["image_url"] = media_url
-                logger.warning(f"🧵 Adding image: {media_url}")
+                
+                # Detect media type based on file extension
+                if media_url.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+                    container_data["media_type"] = "VIDEO"
+                    container_data["video_url"] = media_url
+                    logger.warning(f"🧵 Adding video: {media_url}")
+                    
+                    # Check if video URL is accessible (critical for Threads)
+                    try:
+                        async with httpx.AsyncClient(timeout=30) as check_client:
+                            head_response = await check_client.head(media_url)
+                            logger.warning(f"🧵 Video URL check - Status: {head_response.status_code}")
+                            logger.warning(f"🧵 Video URL check - Content-Type: {head_response.headers.get('content-type', 'unknown')}")
+                            logger.warning(f"🧵 Video URL check - Content-Length: {head_response.headers.get('content-length', 'unknown')}")
+                            
+                            if head_response.status_code != 200:
+                                logger.error(f"🧵 Video URL not accessible! Status: {head_response.status_code}")
+                    except Exception as e:
+                        logger.error(f"🧵 Failed to check video URL accessibility: {str(e)}")
+                else:
+                    # Default to image for other file types
+                    container_data["media_type"] = "IMAGE"
+                    container_data["image_url"] = media_url
+                    logger.warning(f"🧵 Adding image: {media_url}")
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # Debug: Check token permissions first - use Threads API endpoint
@@ -1509,10 +1530,39 @@ class PlatformPublisher:
                 container_id = container_data_response.get("id")
                 logger.warning(f"🧵 Container created successfully with ID: {container_id}")
                 
-                # Step 2: Wait before publishing (Threads recommendation: ~30 seconds)
-                # For now, let's use a shorter delay for testing
-                logger.warning(f"🧵 Waiting 5 seconds before publishing...")
-                await asyncio.sleep(5)
+                # Step 2: Wait before publishing - different timing for videos vs images
+                # Videos need more processing time than images
+                if container_data.get("media_type") == "VIDEO":
+                    wait_time = 45  # Videos need 30-60 seconds according to Threads API docs
+                    logger.warning(f"🧵 Video detected - waiting {wait_time} seconds for processing...")
+                elif container_data.get("media_type") == "IMAGE":
+                    wait_time = 10  # Images need less time
+                    logger.warning(f"🧵 Image detected - waiting {wait_time} seconds for processing...")
+                else:
+                    wait_time = 5   # Text posts need minimal time
+                    logger.warning(f"🧵 Text post - waiting {wait_time} seconds before publishing...")
+                
+                await asyncio.sleep(wait_time)
+                
+                # Step 2.5: Check container status (especially important for videos)
+                if container_data.get("media_type") in ["VIDEO", "IMAGE"]:
+                    logger.warning(f"🧵 Checking container {container_id} status before publishing...")
+                    status_response = await client.get(
+                        f"https://graph.threads.net/v1.0/{container_id}?fields=id,status,status_code&access_token={access_token}"
+                    )
+                    
+                    if status_response.status_code == 200:
+                        status_data = status_response.json()
+                        container_status = status_data.get("status", "unknown")
+                        status_code = status_data.get("status_code", "unknown")
+                        logger.warning(f"🧵 Container status: {container_status}, status_code: {status_code}")
+                        
+                        # If status indicates processing, wait a bit more
+                        if container_status in ["IN_PROGRESS", "PROCESSING"] or status_code == "IN_PROGRESS":
+                            logger.warning(f"🧵 Container still processing, waiting additional 15 seconds...")
+                            await asyncio.sleep(15)
+                    else:
+                        logger.warning(f"🧵 Could not check container status: {status_response.text}")
                 
                 # Step 3: Publish the container
                 publish_data = {
@@ -1542,10 +1592,29 @@ class PlatformPublisher:
                         metadata={"threads_data": response_data}
                     )
                 else:
+                    error_text = publish_response.text
+                    logger.error(f"🧵 Publish failed: {error_text}")
+                    
+                    # Parse error for specific issues
+                    try:
+                        error_data = publish_response.json()
+                        error_message = error_data.get('error', {}).get('message', error_text)
+                        
+                        # Handle specific "Media not found" error for videos
+                        if "Media with ID" in error_message and "cannot be found" in error_message:
+                            if container_data.get("media_type") == "VIDEO":
+                                error_message = f"Video processing timed out. Threads videos can take 60-90 seconds to process. Try waiting longer or check if the video URL is publicly accessible. Original error: {error_message}"
+                            else:
+                                error_message = f"Media processing failed. Check if the media URL is publicly accessible. Original error: {error_message}"
+                        
+                        detailed_error = f"Threads publish failed: {error_message}"
+                    except:
+                        detailed_error = f"Threads publish failed: {error_text}"
+                    
                     return PublishResult(
                         platform="threads",
                         status=PublishStatus.FAILED,
-                        error_message=f"Threads publish failed: {publish_response.text}"
+                        error_message=detailed_error
                     )
                     
         except Exception as e:

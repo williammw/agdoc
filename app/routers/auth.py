@@ -808,6 +808,72 @@ async def tiktok_oauth(
             detail="Failed to process TikTok authentication"
         )
 
+@router.post("/oauth/threads")
+async def threads_oauth(
+    data: Dict[str, Any] = Body(...),
+    supabase = Depends(db_admin)
+):
+    """
+    Process Threads OAuth authentication
+    
+    This endpoint receives the Threads OAuth data from the frontend and
+    either finds an existing user or creates a new one, then stores the
+    Threads connection with tokens and user data.
+    
+    Threads uses a separate OAuth flow from Facebook/Instagram.
+    """
+    try:
+        # Extract data from the request
+        email = data.get("email")
+        name = data.get("name")
+        picture = data.get("picture")
+        provider_account_id = data.get("provider_account_id")  # Threads user ID
+        threads_username = data.get("threads_username")
+        user_session_email = data.get("user_session_email")  # Email from NextAuth session
+        
+        print(f"Processing Threads OAuth for {email or user_session_email} (Threads ID: {provider_account_id})")
+        
+        # Use session email as primary identifier if provided
+        auth_email = user_session_email or email
+        
+        if not auth_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required for Threads authentication"
+            )
+        
+        if not provider_account_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Threads user ID is required"
+            )
+        
+        # Process OAuth authentication
+        result = await process_oauth_authentication(
+            provider="threads",
+            email=auth_email,
+            name=name,
+            picture=picture,
+            provider_account_id=provider_account_id,
+            supabase=supabase
+        )
+        
+        # Add Threads-specific metadata to the result
+        if threads_username:
+            result["threads_username"] = threads_username
+        
+        return result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"Threads OAuth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process Threads authentication"
+        )
+
 
 @router.post("/token-refresh")
 async def refresh_token(
