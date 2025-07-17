@@ -824,16 +824,39 @@ class PlatformPublisher:
                 logger.info(f"📥 LinkedIn response: Status {response.status_code}")
                 
                 if response.status_code in [200, 201]:
-                    response_data = response.json()
-                    post_id = response_data.get("id")
-                    
-                    logger.info(f"✅ LinkedIn post published successfully: {post_id}")
-                    return PublishResult(
-                        platform="linkedin",
-                        status=PublishStatus.SUCCESS,
-                        platform_post_id=post_id,
-                        metadata={"linkedin_data": response_data}
-                    )
+                    # Handle empty response bodies for 201 Created responses
+                    try:
+                        response_text = response.text.strip()
+                        if not response_text:
+                            # Empty response body is valid for 201 Created
+                            logger.info(f"✅ LinkedIn post published successfully (empty response body)")
+                            return PublishResult(
+                                platform="linkedin",
+                                status=PublishStatus.SUCCESS,
+                                platform_post_id=None,  # LinkedIn doesn't return post ID for some 201 responses
+                                metadata={"linkedin_data": {"status": "created"}}
+                            )
+                        
+                        response_data = response.json()
+                        post_id = response_data.get("id")
+                        
+                        logger.info(f"✅ LinkedIn post published successfully: {post_id}")
+                        return PublishResult(
+                            platform="linkedin",
+                            status=PublishStatus.SUCCESS,
+                            platform_post_id=post_id,
+                            metadata={"linkedin_data": response_data}
+                        )
+                    except ValueError as json_error:
+                        # JSON parsing failed but status is success - treat as successful
+                        logger.warning(f"LinkedIn post successful but JSON parsing failed: {json_error}")
+                        logger.info(f"✅ LinkedIn post published successfully (JSON parse error ignored)")
+                        return PublishResult(
+                            platform="linkedin",
+                            status=PublishStatus.SUCCESS,
+                            platform_post_id=None,
+                            metadata={"linkedin_data": {"status": "created", "parse_error": str(json_error)}}
+                        )
                 else:
                     error_msg = f"LinkedIn API error: Status {response.status_code} - {response.text}"
                     logger.error(error_msg)
