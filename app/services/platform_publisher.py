@@ -508,6 +508,214 @@ class PlatformPublisher:
                 error_message=f"Twitter publishing error: {str(e)}"
             )
 
+    async def _upload_linkedin_media(
+        self, 
+        client: httpx.AsyncClient, 
+        access_token: str, 
+        media_url: str, 
+        author_urn: str
+    ) -> Optional[str]:
+        """
+        Upload media to LinkedIn using their Images/Videos API
+        
+        Args:
+            client: httpx AsyncClient instance
+            access_token: LinkedIn access token
+            media_url: URL of the media file to upload
+            author_urn: LinkedIn URN of the author (person or organization)
+            
+        Returns:
+            Asset URN if successful, None if failed
+        """
+        try:
+            logger.info(f"🔗 Starting LinkedIn media upload process")
+            logger.info(f"📁 Media URL: {media_url}")
+            logger.info(f"👤 Author URN: {author_urn}")
+            
+            # Step 1: Download the media file to determine type and size
+            media_response = await client.get(media_url, timeout=30.0)
+            if media_response.status_code != 200:
+                logger.error(f"Failed to download media from {media_url}: {media_response.status_code}")
+                return None
+            
+            media_content = media_response.content
+            media_size = len(media_content)
+            content_type = media_response.headers.get('content-type', '').lower()
+            
+            logger.info(f"📊 Media downloaded: size={media_size} bytes, content-type={content_type}")
+            
+            # Step 2: Determine if this is an image or video
+            is_video = (
+                content_type.startswith('video/') or
+                any(media_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm'])
+            )
+            
+            # Step 3: Set up common headers for LinkedIn API
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "LinkedIn-Version": "202411",  # Use latest version from 2024
+                "X-RestLi-Protocol-Version": "2.0.0",
+                "Content-Type": "application/json"
+            }
+            
+            if is_video:
+                # Use Videos API for video uploads
+                logger.info(f"🎬 Uploading as video using LinkedIn Videos API")
+                
+                # Initialize video upload
+                init_payload = {
+                    "initializeUploadRequest": {
+                        "owner": author_urn,
+                        "fileSizeBytes": media_size,
+                        "uploadCaptions": False,
+                        "uploadThumbnail": False
+                    }
+                }
+                
+                init_response = await client.post(
+                    "https://api.linkedin.com/rest/videos?action=initializeUpload",
+                    headers=headers,
+                    json=init_payload
+                )
+                
+                if init_response.status_code != 200:
+                    logger.error(f"LinkedIn video upload initialization failed: {init_response.text}")
+                    return None
+                
+                init_data = init_response.json().get('value', {})
+                video_urn = init_data.get('video')
+                upload_instructions = init_data.get('uploadInstructions', [])
+                
+                if not video_urn or not upload_instructions:
+                    logger.error(f"LinkedIn video initialization missing required data: {init_data}")
+                    return None
+                
+                # Validate URN format
+                if not video_urn.startswith('urn:li:video:'):
+                    logger.error(f"LinkedIn returned invalid video URN format: {video_urn}")
+                    return None
+                
+                logger.info(f"✅ Video upload initialized: {video_urn}")
+                
+                # Upload video in parts
+                uploaded_part_ids = []
+                for i, instruction in enumerate(upload_instructions):
+                    try:
+                        first_byte = instruction['firstByte']
+                        last_byte = instruction['lastByte']
+                        upload_url = instruction['uploadUrl']
+                        
+                        # Extract the part data
+                        part_data = media_content[first_byte:last_byte + 1]
+                        
+                        logger.info(f"Uploading video part {i + 1}/{len(upload_instructions)}: bytes {first_byte}-{last_byte}")
+                        
+                        part_response = await client.put(
+                            upload_url,
+                            headers={"Content-Type": "application/octet-stream"},
+                            content=part_data,
+                            timeout=60.0
+                        )
+                        
+                        # LinkedIn video part upload should return 200 OK
+                        if part_response.status_code == 200:
+                            etag = part_response.headers.get('ETag', '').strip('"')
+                            uploaded_part_ids.append(etag)
+                            logger.info(f"✅ Part {i + 1} uploaded successfully: ETag={etag}")
+                        else:
+                            logger.error(f"Video part {i + 1} upload failed: Status {part_response.status_code} - {part_response.text}")
+                            logger.error(f"Part response headers: {dict(part_response.headers)}")
+                            return None
+                            
+                    except Exception as e:
+                        logger.error(f"Error uploading video part {i + 1}: {str(e)}")
+                        return None
+                
+                # Finalize video upload
+                finalize_payload = {
+                    "finalizeUploadRequest": {
+                        "video": video_urn,
+                        "uploadToken": init_data.get('uploadToken'),
+                        "uploadedPartIds": uploaded_part_ids
+                    }
+                }
+                
+                finalize_response = await client.post(
+                    "https://api.linkedin.com/rest/videos?action=finalizeUpload",
+                    headers=headers,
+                    json=finalize_payload
+                )
+                
+                if finalize_response.status_code == 200:
+                    logger.info(f"✅ LinkedIn video upload finalized successfully: {video_urn}")
+                    return video_urn
+                else:
+                    logger.error(f"LinkedIn video finalization failed: Status {finalize_response.status_code} - {finalize_response.text}")
+                    logger.error(f"Finalize request payload: {finalize_payload}")
+                    logger.error(f"Finalize response headers: {dict(finalize_response.headers)}")
+                    return None
+                    
+            else:
+                # Use Images API for image uploads
+                logger.info(f"📷 Uploading as image using LinkedIn Images API")
+                
+                # Initialize image upload
+                init_payload = {
+                    "initializeUploadRequest": {
+                        "owner": author_urn
+                    }
+                }
+                
+                init_response = await client.post(
+                    "https://api.linkedin.com/rest/images?action=initializeUpload",
+                    headers=headers,
+                    json=init_payload
+                )
+                
+                if init_response.status_code != 200:
+                    logger.error(f"LinkedIn image upload initialization failed: Status {init_response.status_code} - {init_response.text}")
+                    logger.error(f"Init request payload: {init_payload}")
+                    logger.error(f"Init response headers: {dict(init_response.headers)}")
+                    return None
+                
+                init_data = init_response.json().get('value', {})
+                image_urn = init_data.get('image')
+                upload_url = init_data.get('uploadUrl')
+                
+                if not image_urn or not upload_url:
+                    logger.error(f"LinkedIn image initialization missing required data: {init_data}")
+                    return None
+                
+                # Validate URN format
+                if not image_urn.startswith('urn:li:image:'):
+                    logger.error(f"LinkedIn returned invalid image URN format: {image_urn}")
+                    return None
+                
+                logger.info(f"✅ Image upload initialized: {image_urn}")
+                logger.info(f"📤 Upload URL: {upload_url[:100]}...")
+                
+                # Upload the image content
+                upload_response = await client.put(
+                    upload_url,
+                    headers={"Content-Type": "application/octet-stream"},
+                    content=media_content,
+                    timeout=60.0
+                )
+                
+                # LinkedIn image upload returns 201 Created on success
+                if upload_response.status_code == 201:
+                    logger.info(f"✅ LinkedIn image uploaded successfully: {image_urn}")
+                    return image_urn
+                else:
+                    logger.error(f"LinkedIn image upload failed: Status {upload_response.status_code} - {upload_response.text}")
+                    # Log response headers for debugging
+                    logger.error(f"Response headers: {dict(upload_response.headers)}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"LinkedIn media upload error: {str(e)}")
+            return None
+
     async def _publish_to_linkedin(
         self, 
         access_token: str, 
@@ -519,7 +727,8 @@ class PlatformPublisher:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                "X-Restli-Protocol-Version": "2.0.0"
+                "LinkedIn-Version": "202411",  # Use latest version from 2024
+                "X-RestLi-Protocol-Version": "2.0.0"
             }
             
             # Determine if this is a personal or organization post
@@ -542,18 +751,18 @@ class PlatformPublisher:
             if content.hashtags:
                 post_text += "\n\n" + " ".join([f"#{tag}" for tag in content.hashtags])
             
+            # Use the new LinkedIn Posts API format
             share_content = {
                 "author": author_urn,
-                "lifecycleState": "PUBLISHED",
-                "specificContent": {
-                    "com.linkedin.ugc.ShareContent": {
-                        "shareCommentary": {"text": post_text},
-                        "shareMediaCategory": "NONE"
-                    }
+                "commentary": post_text,
+                "visibility": "PUBLIC",
+                "distribution": {
+                    "feedDistribution": "MAIN_FEED",
+                    "targetEntities": [],
+                    "thirdPartyDistributionChannels": []
                 },
-                "visibility": {
-                    "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-                }
+                "lifecycleState": "PUBLISHED",
+                "isReshareDisabledByAuthor": False
             }
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -584,31 +793,41 @@ class PlatformPublisher:
                         if not is_video and isinstance(media_url, str):
                             is_video = any(media_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.mpeg4', '.avi'])
                         
-                        # Update share content with media URN
-                        media_category = "VIDEO" if is_video else "IMAGE"
-                        share_content["specificContent"]["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = media_category
-                        share_content["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [{
-                            "status": "READY",
-                            "description": {"text": ""},
-                            "media": media_urn,  # Use the URN instead of URL
-                            "title": {"text": ""}
-                        }]
-                        logger.info(f"LinkedIn: Media uploaded successfully as {media_category}, URN: {media_urn}")
+                        # Update share content with media URN using new Posts API format
+                        if is_video:
+                            share_content["content"] = {
+                                "media": {
+                                    "title": "Video",
+                                    "id": media_urn
+                                }
+                            }
+                        else:
+                            share_content["content"] = {
+                                "media": {
+                                    "title": "Image",
+                                    "id": media_urn
+                                }
+                            }
+                        logger.info(f"LinkedIn: Media uploaded successfully as {'VIDEO' if is_video else 'IMAGE'}, URN: {media_urn}")
                     else:
                         logger.warning(f"LinkedIn: Failed to upload media, posting text-only")
                         # Continue with text-only post
                 
-                # Post to LinkedIn
+                # Post to LinkedIn using the REST API endpoint
+                logger.info(f"📤 Posting to LinkedIn: {share_content}")
                 response = await client.post(
-                    "https://api.linkedin.com/v2/ugcPosts",
+                    "https://api.linkedin.com/rest/posts",
                     headers=headers,
                     json=share_content
                 )
+                
+                logger.info(f"📥 LinkedIn response: Status {response.status_code}")
                 
                 if response.status_code in [200, 201]:
                     response_data = response.json()
                     post_id = response_data.get("id")
                     
+                    logger.info(f"✅ LinkedIn post published successfully: {post_id}")
                     return PublishResult(
                         platform="linkedin",
                         status=PublishStatus.SUCCESS,
@@ -616,10 +835,14 @@ class PlatformPublisher:
                         metadata={"linkedin_data": response_data}
                     )
                 else:
+                    error_msg = f"LinkedIn API error: Status {response.status_code} - {response.text}"
+                    logger.error(error_msg)
+                    logger.error(f"Request payload: {share_content}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
                     return PublishResult(
                         platform="linkedin",
                         status=PublishStatus.FAILED,
-                        error_message=f"LinkedIn API error: {response.text}"
+                        error_message=error_msg
                     )
                     
         except Exception as e:
