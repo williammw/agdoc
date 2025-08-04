@@ -20,7 +20,7 @@ router = APIRouter(
 )
 
 
-# Create database dependencies
+# Create database dependencies - these return dependency functions, not clients
 db_admin = get_db(admin_access=True)
 db_standard = get_db(admin_access=False)
 

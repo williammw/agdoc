@@ -7,30 +7,66 @@ from fastapi import Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Environment variables loaded from .env file")
+except ImportError:
+    print("python-dotenv not installed, relying on environment variables")
+
 # Get Supabase configuration from environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Service role key for admin operations
 
+# Debug: Print which variables are set
+print(f"SUPABASE_URL: {'SET' if SUPABASE_URL else 'NOT SET'}")
+print(f"SUPABASE_KEY: {'SET' if SUPABASE_KEY else 'NOT SET'}")
+print(f"SUPABASE_SERVICE_KEY: {'SET' if SUPABASE_SERVICE_KEY else 'NOT SET'}")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("ERROR: Missing required Supabase environment variables!")
+    print("Required: SUPABASE_URL, SUPABASE_KEY")
+    print("Optional: SUPABASE_SERVICE_KEY (for admin operations)")
+    raise RuntimeError("Supabase configuration missing")
+
 # Base directory for SQL files
 DB_DIR = pathlib.Path(__file__).parent.parent / "db"
 
 # Initialize Supabase client with standard key
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("Supabase client initialized successfully")
+supabase: Client = None
+service_supabase: Client = None
+
+def initialize_supabase_clients():
+    """Initialize Supabase clients - can be called multiple times safely"""
+    global supabase, service_supabase
     
-    # Initialize service role client for admin operations
-    if SUPABASE_SERVICE_KEY:
-        service_supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        print("Supabase service client initialized successfully")
-    else:
+    if supabase is not None:
+        return  # Already initialized
+    
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase client initialized successfully")
+        
+        # Initialize service role client for admin operations
+        if SUPABASE_SERVICE_KEY:
+            service_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            print("Supabase service client initialized successfully")
+        else:
+            service_supabase = None
+            print("Warning: SUPABASE_SERVICE_KEY not set, admin operations may be limited")
+    except Exception as e:
+        print(f"Failed to initialize Supabase client: {e}")
+        supabase = None
         service_supabase = None
-        print("Warning: SUPABASE_SERVICE_KEY not set, admin operations may be limited")
+        raise
+
+# Try to initialize immediately
+try:
+    initialize_supabase_clients()
 except Exception as e:
-    print(f"Failed to initialize Supabase client: {e}")
-    supabase = None
-    service_supabase = None
+    print(f"Initial Supabase initialization failed, will retry on first use: {e}")
 
 # Basic database access function
 def get_database(admin_access: bool = False):
@@ -40,17 +76,29 @@ def get_database(admin_access: bool = False):
     Args:
         admin_access: If True, returns the service role client that bypasses RLS
     """
+    global supabase, service_supabase
+    
     try:
+        # Try to initialize if not already done
+        if supabase is None:
+            print("Supabase client not initialized, attempting initialization...")
+            initialize_supabase_clients()
+        
         if admin_access and service_supabase:
             return service_supabase
+        elif admin_access and not service_supabase:
+            print("Warning: Admin access requested but service client not available, using standard client")
+            return supabase
             
         if not supabase:
-            print("Error: Supabase client not initialized")
+            print("Error: Supabase client still not initialized after retry")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Database connection error: Supabase client not initialized"
             )
         return supabase
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error getting database connection: {e}")
         raise HTTPException(

@@ -1,6 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# Load environment variables first, before importing other modules
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Environment variables loaded in main.py")
+except ImportError:
+    print("python-dotenv not installed")
+
 # Import our routers
 from app.routers import auth, social_connections, subscriptions, media, ai
 from app.routers import content_simple as content

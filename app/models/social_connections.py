@@ -67,6 +67,7 @@ class SocialConnectionCreate(BaseModel):
 
 class SocialConnectionUpdate(BaseModel):
     """Model for updating social connection data"""
+    provider: Optional[str] = None  # Added for token refresh endpoint
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
     expires_at: Optional[Union[datetime, str]] = None
@@ -151,4 +152,17 @@ class SocialConnectionWithTokens(SocialConnectionResponse):
     oauth1_access_token_secret: Optional[str] = None
     
     class Config:
-        from_attributes = True  # Updated from orm_mode for Pydantic v2 
+        from_attributes = True  # Updated from orm_mode for Pydantic v2
+
+
+class RefreshTokenRequest(BaseModel):
+    """Model for refresh token update requests"""
+    provider: str
+    provider_account_id: Optional[str] = None
+    refresh_token: str
+
+
+class RefreshTokenResponse(BaseModel):
+    """Model for refresh token responses"""
+    refresh_token: str
+    expires_at: Optional[datetime] = None 

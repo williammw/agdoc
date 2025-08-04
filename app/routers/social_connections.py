@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy import select
 from typing import Dict, Any, List, Optional, Union
 from app.dependencies.auth import get_current_user
-from app.models.social_connections import SocialConnection, SocialConnectionCreate, SocialConnectionUpdate, SocialConnectionResponse, SocialConnectionWithTokens
+from app.models.social_connections import SocialConnection, SocialConnectionCreate, SocialConnectionUpdate, SocialConnectionResponse, SocialConnectionWithTokens, RefreshTokenRequest, RefreshTokenResponse
 from app.utils.database import get_database
 from app.utils.encryption import encrypt_token, decrypt_token
 from pydantic import BaseModel
@@ -308,7 +308,7 @@ async def get_token(
             response = db.table('social_connections').select('access_token, refresh_token, expires_at, oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
         else:
             # Get primary account first, then fallback to first account
-            response = db.table('social_connections').select('access_token, refresh_token, expires_at, oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
+            response = db.table('social_connections').select('access_token, refresh_token, expires_at, oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name').eq('user_id', current_user["id"]).eq('provider', provider).order('created_at').limit(1).execute()
         
         if not response.data or len(response.data) == 0:
             if provider_account_id:
@@ -441,6 +441,56 @@ async def set_primary_account(
     except Exception as e:
         print(f"Error setting primary account: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to set primary account: {str(e)}")
+
+@router.put("/update-token")
+async def update_token(
+    data: SocialConnectionUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Update social connection token (for refresh operations)"""
+    try:
+        if not data.provider or not data.access_token:
+            raise HTTPException(status_code=400, detail="Provider and access_token are required")
+        
+        # Encrypt the new tokens
+        encrypted_access_token = encrypt_token(data.access_token)
+        encrypted_refresh_token = encrypt_token(data.refresh_token) if data.refresh_token else None
+        
+        # Prepare update data
+        update_data = {
+            'access_token': encrypted_access_token,
+            'updated_at': 'now()'
+        }
+        
+        if encrypted_refresh_token:
+            update_data['refresh_token'] = encrypted_refresh_token
+        
+        if data.expires_at:
+            # Handle expires_at datetime conversion
+            if isinstance(data.expires_at, str):
+                update_data['expires_at'] = data.expires_at
+            elif isinstance(data.expires_at, datetime):
+                update_data['expires_at'] = data.expires_at.isoformat()
+            else:
+                update_data['expires_at'] = str(data.expires_at)
+        
+        # Update the first matching connection for the provider
+        # In practice, the frontend should identify which specific account to update
+        response = db.table('social_connections').update(update_data).eq('user_id', current_user["id"]).eq('provider', data.provider).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {data.provider} connection found")
+        
+        logger.info(f"Successfully updated token for {data.provider} user {current_user['id']}")
+        
+        return {"status": "success", "message": f"{data.provider} token updated successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
 
 @router.put("/update-label/{provider}/{provider_account_id}")
 async def update_account_label(
@@ -1968,6 +2018,7 @@ class OAuth1TokensRequest(BaseModel):
     provider_account_id: str
     oauth1_tokens: Dict[str, Any]
 
+
 @router.post("/update-oauth1-tokens")
 async def update_oauth1_tokens(
     data: OAuth1TokensRequest,
@@ -2039,7 +2090,7 @@ async def get_oauth1_tokens(
             response = db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
         else:
             # Get primary account first, then fallback to first account
-            response = db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at').eq('user_id', current_user["id"]).eq('provider', provider).order('is_primary desc, created_at asc').limit(1).execute()
+            response = db.table('social_connections').select('oauth1_access_token, oauth1_access_token_secret, oauth1_user_id, oauth1_screen_name, oauth1_created_at').eq('user_id', current_user["id"]).eq('provider', provider).order('created_at').limit(1).execute()
         
         if not response.data or len(response.data) == 0:
             raise HTTPException(status_code=404, detail=f"No {provider} connection found")
@@ -2561,3 +2612,352 @@ async def twitter_oauth1_status(
     except Exception as e:
         logger.error(f"Error checking Twitter OAuth 1.0a status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check Twitter OAuth 1.0a status: {str(e)}")
+
+
+@router.post("/get-refresh-token")
+async def get_refresh_token(
+    request: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Get the refresh token for a specific provider and account.
+    
+    This endpoint retrieves the encrypted refresh token from the database,
+    decrypts it, and returns it along with expiration information.
+    """
+    try:
+        provider = request.get('provider')
+        provider_account_id = request.get('provider_account_id')
+        
+        if not provider:
+            raise HTTPException(status_code=400, detail="Provider is required")
+        
+        logger.info(f"Getting refresh token for provider {provider} and user {current_user.get('id')}")
+        
+        # Build query based on whether provider_account_id is provided
+        if provider_account_id:
+            # Get token for specific account
+            response = db.table('social_connections').select('refresh_token, expires_at, provider_account_id, account_label').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        else:
+            # Get primary account first, then fallback to first account
+            response = db.table('social_connections').select('refresh_token, expires_at, provider_account_id, account_label').eq('user_id', current_user["id"]).eq('provider', provider).order('created_at').limit(1).execute()
+        
+        if not response.data or len(response.data) == 0:
+            if provider_account_id:
+                raise HTTPException(status_code=404, detail=f"No {provider} account found with ID {provider_account_id}")
+            else:
+                raise HTTPException(status_code=404, detail=f"No {provider} connection found")
+        
+        connection = response.data[0]
+        
+        # Check if refresh token exists
+        if not connection.get('refresh_token'):
+            raise HTTPException(status_code=404, detail=f"No refresh token found for {provider} account")
+        
+        # Decrypt the refresh token
+        try:
+            decrypted_refresh_token = decrypt_token(connection['refresh_token'])
+            if not decrypted_refresh_token:
+                raise HTTPException(status_code=404, detail=f"Unable to decrypt refresh token for {provider} account")
+        except Exception as decrypt_error:
+            logger.error(f"Error decrypting refresh token: {str(decrypt_error)}")
+            raise HTTPException(status_code=500, detail="Failed to decrypt refresh token")
+        
+        # Parse expires_at if present
+        expires_at = None
+        if connection.get('expires_at'):
+            try:
+                if isinstance(connection['expires_at'], str):
+                    expires_at = datetime.fromisoformat(connection['expires_at'].replace('Z', '+00:00'))
+                else:
+                    expires_at = connection['expires_at']
+            except ValueError:
+                logger.warning(f"Invalid expires_at format: {connection.get('expires_at')}")
+        
+        return RefreshTokenResponse(
+            refresh_token=decrypted_refresh_token,
+            expires_at=expires_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving refresh token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve refresh token: {str(e)}")
+
+
+@router.post("/update-refresh-token")
+async def update_refresh_token(
+    data: RefreshTokenRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Update or store a refresh token for a specific provider and account.
+    
+    This endpoint encrypts the provided refresh token and stores it in the database.
+    It can be used to update existing refresh tokens or store new ones.
+    """
+    try:
+        logger.info(f"Updating refresh token for provider {data.provider} and user {current_user.get('id')}")
+        
+        # Validate input
+        if not data.refresh_token:
+            raise HTTPException(status_code=400, detail="Refresh token is required")
+        
+        # Encrypt the refresh token
+        try:
+            encrypted_refresh_token = encrypt_token(data.refresh_token)
+        except Exception as encrypt_error:
+            logger.error(f"Error encrypting refresh token: {str(encrypt_error)}")
+            raise HTTPException(status_code=500, detail="Failed to encrypt refresh token")
+        
+        # Find the connection to update
+        if data.provider_account_id:
+            # Update specific account
+            response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', data.provider).eq('provider_account_id', data.provider_account_id).execute()
+        else:
+            # Update primary account first, then fallback to first account
+            response = db.table('social_connections').select('id').eq('user_id', current_user["id"]).eq('provider', data.provider).order('created_at').limit(1).execute()
+        
+        if not response.data or len(response.data) == 0:
+            if data.provider_account_id:
+                raise HTTPException(status_code=404, detail=f"No {data.provider} account found with ID {data.provider_account_id}")
+            else:
+                raise HTTPException(status_code=404, detail=f"No {data.provider} connection found")
+        
+        connection_id = response.data[0]['id']
+        
+        # Update the refresh token
+        update_data = {
+            'refresh_token': encrypted_refresh_token,
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        update_response = db.table('social_connections').update(update_data).eq('id', connection_id).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update refresh token in database")
+        
+        logger.info(f"Successfully updated refresh token for {data.provider} account")
+        
+        return {
+            "success": True,
+            "message": f"Refresh token updated successfully for {data.provider} account",
+            "provider": data.provider,
+            "provider_account_id": data.provider_account_id,
+            "updated_at": update_data['updated_at']
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating refresh token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update refresh token: {str(e)}")
+
+
+@router.post("/refresh-platform-token")
+async def refresh_platform_token(
+    request: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Refresh an OAuth token for a specific platform using the refresh token.
+    
+    This endpoint handles the OAuth refresh flow on the backend to avoid CORS issues.
+    """
+    try:
+        provider = request.get('provider')
+        provider_account_id = request.get('provider_account_id')
+        
+        if not provider:
+            raise HTTPException(status_code=400, detail="Provider is required")
+        
+        logger.info(f"Refreshing token for provider {provider} and user {current_user.get('id')}")
+        
+        # Get the refresh token first
+        if provider_account_id:
+            response = db.table('social_connections').select('refresh_token, access_token, expires_at').eq('user_id', current_user["id"]).eq('provider', provider).eq('provider_account_id', provider_account_id).execute()
+        else:
+            response = db.table('social_connections').select('refresh_token, access_token, expires_at, id').eq('user_id', current_user["id"]).eq('provider', provider).order('created_at').limit(1).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(status_code=404, detail=f"No {provider} connection found")
+        
+        connection = response.data[0]
+        connection_id = connection['id']
+        
+        if not connection.get('refresh_token'):
+            raise HTTPException(status_code=404, detail=f"No refresh token found for {provider} account")
+        
+        # Decrypt the refresh token
+        try:
+            decrypted_refresh_token = decrypt_token(connection['refresh_token'])
+            if not decrypted_refresh_token:
+                raise HTTPException(status_code=400, detail="Failed to decrypt refresh token")
+        except Exception as decrypt_error:
+            logger.error(f"Error decrypting refresh token: {str(decrypt_error)}")
+            raise HTTPException(status_code=500, detail="Failed to decrypt refresh token")
+        
+        # Perform platform-specific token refresh
+        if provider.lower() in ['twitter', 'x']:
+            new_tokens = await refresh_twitter_token(decrypted_refresh_token)
+        elif provider.lower() == 'tiktok':
+            new_tokens = await refresh_tiktok_token(decrypted_refresh_token)
+        else:
+            raise HTTPException(status_code=400, detail=f"Token refresh not supported for {provider}")
+        
+        if not new_tokens:
+            raise HTTPException(status_code=400, detail=f"Failed to refresh {provider} token")
+        
+        # Encrypt the new tokens
+        try:
+            encrypted_access_token = encrypt_token(new_tokens['access_token'])
+            encrypted_refresh_token = encrypt_token(new_tokens.get('refresh_token', decrypted_refresh_token))
+        except Exception as encrypt_error:
+            logger.error(f"Error encrypting new tokens: {str(encrypt_error)}")
+            raise HTTPException(status_code=500, detail="Failed to encrypt new tokens")
+        
+        # Update the database with new tokens
+        update_data = {
+            'access_token': encrypted_access_token,
+            'refresh_token': encrypted_refresh_token,
+            'expires_at': new_tokens.get('expires_at'),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        update_response = db.table('social_connections').update(update_data).eq('id', connection_id).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update tokens in database")
+        
+        logger.info(f"Successfully refreshed {provider} token for user {current_user.get('id')}")
+        
+        return {
+            "success": True,
+            "message": f"{provider} token refreshed successfully",
+            "provider": provider,
+            "expires_at": new_tokens.get('expires_at'),
+            "updated_at": update_data['updated_at']
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error refreshing platform token: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to refresh platform token: {str(e)}")
+
+
+async def refresh_twitter_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    """Refresh Twitter OAuth 2.0 token"""
+    import httpx
+    import os
+    import base64
+    from datetime import datetime, timedelta
+    
+    try:
+        client_id = os.getenv('TWITTER_OAUTH2_CLIENT_ID')
+        client_secret = os.getenv('TWITTER_OAUTH2_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            logger.error("Missing Twitter OAuth credentials")
+            return None
+        
+        # Create Basic Auth header
+        credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': f'Basic {credentials}',
+        }
+        
+        data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': client_id,
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                'https://api.twitter.com/2/oauth2/token',
+                headers=headers,
+                data=data,
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                
+                # Calculate expiration time
+                expires_in = token_data.get('expires_in', 7200)  # Default 2 hours
+                expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat() + '+00:00'
+                
+                return {
+                    'access_token': token_data['access_token'],
+                    'refresh_token': token_data.get('refresh_token', refresh_token),
+                    'expires_at': expires_at
+                }
+            else:
+                logger.error(f"Twitter token refresh failed: {response.status_code} - {response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error refreshing Twitter token: {str(e)}")
+        return None
+
+
+async def refresh_tiktok_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    """Refresh TikTok OAuth token"""
+    import httpx
+    import os
+    from datetime import datetime, timedelta
+    
+    try:
+        client_key = os.getenv('TIKTOK_CLIENT_KEY')
+        client_secret = os.getenv('TIKTOK_CLIENT_SECRET')
+        
+        if not client_key or not client_secret:
+            logger.error("Missing TikTok OAuth credentials")
+            return None
+        
+        data = {
+            'client_key': client_key,
+            'client_secret': client_secret,
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                'https://open.tiktokapis.com/v2/oauth/token/',
+                data=data,
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                
+                if token_data.get('error_code') == 0:
+                    data = token_data.get('data', {})
+                    
+                    # Calculate expiration time
+                    expires_in = data.get('expires_in', 3600)  # Default 1 hour
+                    expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat() + '+00:00'
+                    
+                    return {
+                        'access_token': data['access_token'],
+                        'refresh_token': data.get('refresh_token', refresh_token),
+                        'expires_at': expires_at
+                    }
+                else:
+                    logger.error(f"TikTok token refresh error: {token_data.get('message')}")
+                    return None
+            else:
+                logger.error(f"TikTok token refresh failed: {response.status_code} - {response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error refreshing TikTok token: {str(e)}")
+        return None
