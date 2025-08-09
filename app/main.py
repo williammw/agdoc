@@ -53,7 +53,7 @@ app.include_router(twitter_test.router, prefix="/api/v1")
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to Multivio API v2.2.0 "}
+    return {"message": "Welcome to Multivio API v3.0.0 "}
 
 @app.on_event("startup")
 async def on_startup():
