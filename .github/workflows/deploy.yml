@@ -16,8 +16,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to DockerHub
-        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login registry.digitalocean.com -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Login to DigitalOcean Container Registry
+        run: doctl registry login
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
