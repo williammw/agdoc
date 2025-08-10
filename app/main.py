@@ -82,12 +82,27 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    return {
+    health_status = {
         "status": "healthy",
         "version": "3.0.1",
         "api": "Multivio API",
-        "environment": "production"
+        "environment": "production",
+        "database": "unknown"
     }
+    
+    # Test database connection
+    try:
+        from app.utils.database import get_db
+        # Try to get a database connection
+        db = await get_db().__anext__()
+        if db:
+            health_status["database"] = "connected"
+        await db.close()
+    except Exception as e:
+        health_status["database"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+    
+    return health_status
 
 @app.on_event("startup")
 async def on_startup():
