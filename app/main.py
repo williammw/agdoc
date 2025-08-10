@@ -1,5 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+# Import custom middleware
+from app.middleware.https_redirect import ProxyHeadersMiddleware
 
 # Load environment variables first, before importing other modules
 try:
@@ -20,7 +24,28 @@ from app.utils.database import initialize_database
 app = FastAPI(
     title="Multivio API",
     description="API for Multivio",
-    version="1.0.0"
+    version="1.0.0",
+    # Important for DigitalOcean App Platform - ensures HTTPS URLs
+    root_path="",
+    servers=[
+        {"url": "https://jellyfish-app-ds6sv.ondigitalocean.app", "description": "Production"},
+        {"url": "https://dev.ohmeowkase.com", "description": "Development"},
+    ]
+)
+
+# IMPORTANT: Add ProxyHeaders middleware FIRST (before other middleware)
+# This fixes HTTPS redirect issues on DigitalOcean App Platform
+app.add_middleware(ProxyHeadersMiddleware)
+
+# Add TrustedHost middleware to handle proxy headers
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[
+        "jellyfish-app-ds6sv.ondigitalocean.app",
+        "dev.ohmeowkase.com",
+        "localhost",
+        "127.0.0.1"
+    ]
 )
 
 # Configure CORS
@@ -52,7 +77,17 @@ app.include_router(ai.router)  # AI content generation and transformation
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to Multivio API v3.0.1 "}
+    return {"message": "Welcome to Multivio API v3.0.1"}
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "version": "3.0.1",
+        "api": "Multivio API",
+        "environment": "production"
+    }
 
 @app.on_event("startup")
 async def on_startup():
