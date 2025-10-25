@@ -70,3 +70,4 @@ fine-tune/
 test_r2_public_url.py
 test_r2_upload.py
 app/routers/twitter_test.py
+node_modules/

@@ -1,0 +1,35 @@
+# Multivio Background Scheduler Crontab Configuration
+# Copy this to your system crontab using: crontab -e
+
+# Run scheduler every 5 minutes to process scheduled posts
+*/5 * * * * /app/scripts/run_scheduler.sh run
+
+# Alternative schedules (choose one based on your needs):
+
+# Every minute (high frequency for real-time scheduling)
+# * * * * * /app/scripts/run_scheduler.sh run
+
+# Every 2 minutes (balanced frequency)
+# */2 * * * * /app/scripts/run_scheduler.sh run
+
+# Every 10 minutes (low frequency for less critical timing)
+# */10 * * * * /app/scripts/run_scheduler.sh run
+
+# Daily cleanup at 2 AM (remove old completed queue items)
+0 2 * * * /app/scripts/run_scheduler.sh run
+
+# Weekly log rotation at 3 AM on Sundays
+0 3 * * 0 find /var/log -name "multivio_scheduler.log.old*" -type f -mtime +7 -delete
+
+# Monitor scheduler health every hour and restart if needed
+0 * * * * pgrep -f "background_scheduler.py" || /app/scripts/run_scheduler.sh restart
+
+# Example for production monitoring:
+# Send alert if scheduler fails repeatedly
+# */15 * * * * [ $(grep -c "failed" /var/log/multivio_scheduler.log | tail -100) -gt 10 ] && echo "Scheduler failing repeatedly" | mail -s "Multivio Scheduler Alert" admin@multivio.com
+
+# Environment variables that may be needed
+# Add these to the top of your crontab if environment issues occur:
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# PYTHONPATH=/app
+# DATABASE_URL=your_database_url_here
