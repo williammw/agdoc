@@ -1,5 +1,0 @@
-{
-  "dependencies": {
-    "@supabase/mcp-server-supabase": "^0.5.5"
-  }
-}
