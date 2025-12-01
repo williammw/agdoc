@@ -575,6 +575,81 @@ async def get_media_variants(
             detail=f"Failed to get media variants: {str(e)}"
         )
 
+# Internal API key for server-to-server communication
+# SECURITY: This must be set via environment variable, no default allowed
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+if not INTERNAL_API_KEY:
+    print("WARNING: INTERNAL_API_KEY not set. Public endpoints will reject all requests.")
+
+@public_router.post("/generate-thumbnail")
+async def generate_thumbnail_public(
+    file: UploadFile = File(...),
+    api_key: str = Form(...),
+):
+    """
+    Generate thumbnail from video file.
+
+    This is a public endpoint secured by API key for server-to-server calls.
+    Used by the Next.js frontend to generate video thumbnails.
+
+    Returns:
+        - thumbnail_url: CDN URL of the generated thumbnail
+        - duration: Video duration in seconds
+    """
+    # Verify API key - reject if not configured or invalid
+    if not INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not configured"
+        )
+    if api_key != INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key"
+        )
+
+    # Validate file type
+    if not file.content_type or not file.content_type.startswith('video/'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only video files are supported"
+        )
+
+    try:
+        # Read video content
+        video_content = await file.read()
+
+        # Generate thumbnail
+        thumbnail_content, duration = await generate_video_thumbnail(video_content)
+
+        if not thumbnail_content:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate thumbnail from video"
+            )
+
+        # Upload thumbnail to R2
+        thumb_id = str(uuid.uuid4())
+        thumb_key = f"thumbnails/video/{thumb_id}.jpg"
+
+        cdn_url = await upload_to_r2(thumbnail_content, thumb_key, "image/jpeg")
+
+        return {
+            "success": True,
+            "thumbnail_url": cdn_url,
+            "duration": duration,
+            "thumbnail_key": thumb_key
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error generating thumbnail: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate thumbnail: {str(e)}"
+        )
+
 @public_router.get("/ffmpeg-info")
 async def get_ffmpeg_info():
     """Get ffmpeg installation and system information"""
