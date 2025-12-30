@@ -34,6 +34,8 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=[
         "dev.ohmeowkase.com",
+        "jellyfish-app-ds6sv.ondigitalocean.app",  # DigitalOcean App Platform
+        "*.ondigitalocean.app",  # Allow all DigitalOcean subdomains
         "localhost",
         "127.0.0.1"
     ]
@@ -48,6 +50,7 @@ app.add_middleware(
         "https://dev.multivio.com",  # Development frontend
         "https://multivio.com",  # Production frontend
         "https://www.multivio.com",  # Production frontend with www
+        "https://jellyfish-app-ds6sv.ondigitalocean.app",  # DigitalOcean App Platform
     ],
     allow_credentials=True,
     allow_methods=["*"],
