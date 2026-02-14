@@ -650,6 +650,159 @@ async def generate_thumbnail_public(
             detail=f"Failed to generate thumbnail: {str(e)}"
         )
 
+@public_router.post("/create-zip")
+async def create_zip(
+    api_key: str = Form(...),
+    r2_keys: str = Form(...),       # JSON array of R2 keys
+    file_names: str = Form(...),    # JSON array of original file names
+):
+    """
+    Create a zip archive of multiple R2 files and return a presigned download URL.
+
+    This is a public endpoint secured by API key for server-to-server calls.
+    Used by the Next.js frontend for batch media downloads.
+
+    Safeguards:
+        - Max 50 files per request
+        - Max 500MB total size
+        - Temp files cleaned up after zip creation
+    """
+    # Verify API key
+    if not INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not configured"
+        )
+    if api_key != INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key"
+        )
+
+    # Parse JSON arrays
+    try:
+        keys_list = json.loads(r2_keys)
+        names_list = json.loads(file_names)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="r2_keys and file_names must be valid JSON arrays"
+        )
+
+    if not isinstance(keys_list, list) or not isinstance(names_list, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="r2_keys and file_names must be arrays"
+        )
+
+    if len(keys_list) != len(names_list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="r2_keys and file_names must have the same length"
+        )
+
+    if len(keys_list) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one file is required"
+        )
+
+    if len(keys_list) > 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 50 files per zip"
+        )
+
+    import zipfile
+
+    temp_dir = None
+    zip_path = None
+    try:
+        temp_dir = tempfile.mkdtemp()
+        zip_id = str(uuid.uuid4())
+        zip_path = os.path.join(temp_dir, f"{zip_id}.zip")
+
+        # Deduplicate file names
+        seen_names: Dict[str, int] = {}
+        unique_names: List[str] = []
+        for name in names_list:
+            if name in seen_names:
+                seen_names[name] += 1
+                base, ext = os.path.splitext(name)
+                unique_names.append(f"{base} ({seen_names[name]}){ext}")
+            else:
+                seen_names[name] = 0
+                unique_names.append(name)
+
+        total_size = 0
+        max_total_size = 500 * 1024 * 1024  # 500MB
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, r2_key in enumerate(keys_list):
+                try:
+                    response = r2_client.get_object(
+                        Bucket=R2_BUCKET_NAME,
+                        Key=r2_key
+                    )
+                    file_content = response['Body'].read()
+                    total_size += len(file_content)
+
+                    if total_size > max_total_size:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Total file size exceeds 500MB limit"
+                        )
+
+                    zf.writestr(unique_names[i], file_content)
+                except ClientError as e:
+                    print(f"Failed to download R2 key {r2_key}: {e}")
+                    # Skip files that fail to download
+                    continue
+
+        # Upload zip to R2
+        zip_key = f"downloads/{zip_id}.zip"
+        with open(zip_path, 'rb') as zf:
+            zip_content = zf.read()
+
+        await upload_to_r2(zip_content, zip_key, "application/zip")
+
+        # Generate presigned download URL (1 hour)
+        download_url = r2_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': R2_BUCKET_NAME,
+                'Key': zip_key,
+                'ResponseContentDisposition': 'attachment; filename="multivio-media.zip"',
+            },
+            ExpiresIn=3600,
+        )
+
+        return {
+            "success": True,
+            "download_url": download_url,
+            "file_count": len(keys_list),
+            "total_size": total_size,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creating zip: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create zip: {str(e)}"
+        )
+    finally:
+        # Clean up temp files
+        try:
+            if zip_path and os.path.exists(zip_path):
+                os.unlink(zip_path)
+            if temp_dir and os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
+        except Exception:
+            pass
+
+
 @public_router.get("/ffmpeg-info")
 async def get_ffmpeg_info():
     """Get ffmpeg installation and system information"""
