@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -13,8 +14,19 @@ try:
 except ImportError:
     print("python-dotenv not installed")
 
-# Import our routers - ONLY media and AI processing
-from app.routers import media, ai
+# Import our routers - media, AI processing, and video composition
+from app.routers import media, ai, compose
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage background workers on startup/shutdown."""
+    # Startup: launch the compose worker loop
+    compose.start_worker()
+    yield
+    # Shutdown: cancel the worker
+    compose.stop_worker()
+
 
 app = FastAPI(
     title="AGDOC Media Processing API",
@@ -23,7 +35,8 @@ app = FastAPI(
     root_path="",
     servers=[
         {"url": "https://dev.ohmeowkase.com", "description": "Development"},
-    ]
+    ],
+    lifespan=lifespan,
 )
 
 # IMPORTANT: Add ProxyHeaders middleware FIRST (before other middleware)
@@ -57,10 +70,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers - ONLY media and AI
+# Include routers - media, AI, and compose
 app.include_router(media.router)
 app.include_router(media.public_router)
 app.include_router(ai.router)
+app.include_router(compose.router)
+app.include_router(compose.public_router)
 
 @app.get("/")
 async def root():
@@ -69,6 +84,7 @@ async def root():
         "endpoints": {
             "media": "/api/v1/media",
             "ai": "/api/v1/ai",
+            "compose": "/api/v1/compose",
             "docs": "/docs"
         }
     }
@@ -80,5 +96,5 @@ async def health():
         "status": "healthy",
         "version": "2.0.0",
         "api": "AGDOC Media Processing API",
-        "services": ["media", "ai"]
+        "services": ["media", "ai", "compose"]
     }
