@@ -23,6 +23,10 @@ RUN apt-get update && apt-get install -y \
   libxrender-dev \
   libgomp1 \
   wget \
+  fonts-noto-cjk \
+  fonts-noto-color-emoji \
+  fontconfig \
+  && fc-cache -fv \
   && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container

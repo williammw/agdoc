@@ -453,7 +453,8 @@ async def _process_subtitle_job(job_id: str) -> None:
         _update_job(supabase, job_id, 30, "rendering")
 
         # Build FFmpeg subtitle filter
-        font_family = style.get("font_family", "Arial")
+        # Use Noto Sans CJK for full Unicode/CJK support (installed in Dockerfile)
+        font_family = style.get("font_family", "Noto Sans CJK SC")
         font_size = style.get("font_size", 24)
         font_color = style.get("font_color", "&HFFFFFF")
         outline_color = style.get("outline_color", "&H000000")
