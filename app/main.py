@@ -14,18 +14,20 @@ try:
 except ImportError:
     print("python-dotenv not installed")
 
-# Import our routers - media, AI processing, and video composition
-from app.routers import media, ai, compose
+# Import our routers - media, AI processing, video composition, and video processing
+from app.routers import media, ai, compose, videos
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage background workers on startup/shutdown."""
-    # Startup: launch the compose worker loop
+    # Startup: launch background workers
     compose.start_worker()
+    videos.start_worker()
     yield
-    # Shutdown: cancel the worker
+    # Shutdown: cancel workers
     compose.stop_worker()
+    videos.stop_worker()
 
 
 app = FastAPI(
@@ -70,12 +72,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers - media, AI, and compose
+# Include routers - media, AI, compose, and videos
 app.include_router(media.router)
 app.include_router(media.public_router)
 app.include_router(ai.router)
 app.include_router(compose.router)
 app.include_router(compose.public_router)
+app.include_router(videos.public_router)
 
 @app.get("/")
 async def root():
@@ -85,6 +88,7 @@ async def root():
             "media": "/api/v1/media",
             "ai": "/api/v1/ai",
             "compose": "/api/v1/compose",
+            "videos": "/api/v1/videos",
             "docs": "/docs"
         }
     }
