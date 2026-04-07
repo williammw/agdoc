@@ -384,6 +384,8 @@ async def _worker_loop() -> None:
                     logger.info("Claimed video job %s (type=%s)", job_id, job_type)
                     if job_type == "slideshow":
                         await _process_slideshow_job(job_id)
+                    elif job_type == "subtitle_burn":
+                        await _process_subtitle_job(job_id)
                     else:
                         logger.warning("Unknown job type: %s", job_type)
                     continue
@@ -412,8 +414,231 @@ def stop_worker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subtitle burn processing
+# ---------------------------------------------------------------------------
+
+async def _process_subtitle_job(job_id: str) -> None:
+    supabase = None
+    temp_dir = None
+    start_ts = time.monotonic()
+
+    try:
+        supabase = get_db(admin_access=True)()
+        job_resp = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
+        if not job_resp.data:
+            return
+        job = job_resp.data
+        params = job.get("params") or {}
+
+        video_url = params.get("video_url")
+        srt_content = params.get("srt_content")
+        style = params.get("style", {})
+        user_id = job["user_id"]
+
+        if not video_url or not srt_content:
+            raise ValueError("video_url and srt_content required")
+
+        temp_dir = tempfile.mkdtemp(prefix="agdoc_subtitle_")
+        _update_job(supabase, job_id, 5, "downloading")
+
+        # Download video
+        video_path = os.path.join(temp_dir, "input.mp4")
+        await _download_file(video_url, video_path)
+
+        # Write SRT file
+        srt_path = os.path.join(temp_dir, "subs.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        _update_job(supabase, job_id, 30, "rendering")
+
+        # Build FFmpeg subtitle filter
+        font_family = style.get("font_family", "Arial")
+        font_size = style.get("font_size", 24)
+        font_color = style.get("font_color", "&HFFFFFF")
+        outline_color = style.get("outline_color", "&H000000")
+        outline_width = style.get("outline_width", 2)
+        bold = 1 if style.get("bold", False) else 0
+        margin_v = style.get("margin_bottom", 40)
+
+        # ASS force_style for FFmpeg subtitles filter
+        force_style = (
+            f"FontName={font_family},"
+            f"FontSize={font_size},"
+            f"PrimaryColour={font_color},"
+            f"OutlineColour={outline_color},"
+            f"Outline={outline_width},"
+            f"Bold={bold},"
+            f"MarginV={margin_v},"
+            f"Alignment=2"
+        )
+
+        output_path = os.path.join(temp_dir, f"subtitled-{job_id}.mp4")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vf", f"subtitles={srt_path}:force_style='{force_style}'",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-c:a", "copy",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        logger.info("Subtitle job %s: running ffmpeg", job_id)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")
+            logger.error("FFmpeg subtitle failed (rc=%d): %s", proc.returncode, err[-1000:])
+            raise RuntimeError(f"FFmpeg failed: {err[-300:]}")
+
+        # Upload to R2
+        _update_job(supabase, job_id, 80, "uploading")
+        r2_key = f"{user_id}/generated/videos/subtitled-{job_id}.mp4"
+        with open(output_path, "rb") as f:
+            content = f.read()
+        output_url = await _upload_to_r2(content, r2_key, "video/mp4")
+
+        duration = await _get_duration(output_path)
+
+        elapsed = time.monotonic() - start_ts
+        now_iso = datetime.now(timezone.utc).isoformat()
+        supabase.table("video_jobs").update({
+            "status": "completed",
+            "progress": 100,
+            "output_url": output_url,
+            "download_url": output_url,
+            "duration_seconds": duration,
+            "file_size_bytes": len(content),
+            "processing_time_seconds": round(elapsed, 2),
+            "completed_at": now_iso,
+            "updated_at": now_iso,
+        }).eq("id", job_id).execute()
+
+        logger.info("Subtitle job %s: completed in %.1fs → %s", job_id, elapsed, output_url)
+
+    except Exception as exc:
+        logger.exception("Subtitle job %s failed: %s", job_id, exc)
+        if supabase:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                supabase.table("video_jobs").update({
+                    "status": "failed",
+                    "error": str(exc)[:2000],
+                    "completed_at": now_iso,
+                    "updated_at": now_iso,
+                }).eq("id", job_id).execute()
+            except Exception:
+                pass
+    finally:
+        if temp_dir:
+            try:
+                for f in os.listdir(temp_dir):
+                    try:
+                        os.unlink(os.path.join(temp_dir, f))
+                    except OSError:
+                        pass
+                os.rmdir(temp_dir)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@public_router.post("/subtitle")
+async def create_subtitle_burn(
+    request: Request,
+    supabase=Depends(db_admin),
+):
+    """
+    Burn subtitles onto a video using FFmpeg.
+
+    Request body:
+    {
+        "video_url": "https://...",
+        "subtitle_content": "1\\n00:00:00,000 --> 00:00:03,000\\nHello world",
+        "subtitle_format": "srt",
+        "font_family": "Arial",
+        "font_size": 24,
+        "font_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_width": 2,
+        "bold": false,
+        "margin_bottom": 40,
+        "user_id": "uuid"
+    }
+
+    Returns: {"job_id": "uuid", "status": "queued"}
+    """
+    _verify_api_key(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    video_url = body.get("video_url")
+    srt_content = body.get("subtitle_content")
+    if not video_url or not srt_content:
+        raise HTTPException(status_code=400, detail="video_url and subtitle_content required")
+
+    user_id = body.get("user_id", "anonymous")
+
+    # Convert hex colors to ASS format (&HBBGGRR)
+    def hex_to_ass(hex_color: str) -> str:
+        hex_color = hex_color.lstrip("#")
+        if len(hex_color) == 6:
+            r, g, b = hex_color[0:2], hex_color[2:4], hex_color[4:6]
+            return f"&H00{b}{g}{r}"
+        return "&H00FFFFFF"
+
+    style = {
+        "font_family": body.get("font_family", "Arial"),
+        "font_size": body.get("font_size", 24),
+        "font_color": hex_to_ass(body.get("font_color", "#FFFFFF")),
+        "outline_color": hex_to_ass(body.get("outline_color", "#000000")),
+        "outline_width": body.get("outline_width", 2),
+        "bold": body.get("bold", False),
+        "margin_bottom": body.get("margin_bottom", 40),
+    }
+
+    job_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        row = {
+            "id": job_id,
+            "user_id": user_id,
+            "job_type": "subtitle_burn",
+            "status": "queued",
+            "progress": 0,
+            "params": {
+                "video_url": video_url,
+                "srt_content": srt_content,
+                "style": style,
+            },
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        result = supabase.table("video_jobs").insert(row).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create job")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("DB insert failed for subtitle job: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    logger.info("Queued subtitle job %s", job_id)
+    return {"job_id": job_id, "status": "queued"}
+
 
 @public_router.post("/slideshow")
 async def create_slideshow(
