@@ -432,6 +432,7 @@ async def _process_subtitle_job(job_id: str) -> None:
 
         video_url = params.get("video_url")
         srt_content = params.get("srt_content")
+        subtitle_format = params.get("subtitle_format", "srt")
         style = params.get("style", {})
         user_id = job["user_id"]
 
@@ -445,47 +446,62 @@ async def _process_subtitle_job(job_id: str) -> None:
         video_path = os.path.join(temp_dir, "input.mp4")
         await _download_file(video_url, video_path)
 
-        # Write SRT file
-        srt_path = os.path.join(temp_dir, "subs.srt")
-        with open(srt_path, "w", encoding="utf-8") as f:
+        # Write subtitle file (SRT or ASS)
+        is_ass = subtitle_format == "ass"
+        sub_ext = "ass" if is_ass else "srt"
+        sub_path = os.path.join(temp_dir, f"subs.{sub_ext}")
+        with open(sub_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
 
         _update_job(supabase, job_id, 30, "rendering")
 
-        # Build FFmpeg subtitle filter
-        # Use Noto Sans CJK for full Unicode/CJK support (installed in Dockerfile)
-        font_family = style.get("font_family", "Noto Sans CJK SC")
-        font_size = style.get("font_size", 24)
-        font_color = style.get("font_color", "&HFFFFFF")
-        outline_color = style.get("outline_color", "&H000000")
-        outline_width = style.get("outline_width", 2)
-        bold = 1 if style.get("bold", False) else 0
-        margin_v = style.get("margin_bottom", 40)
-
-        # ASS force_style for FFmpeg subtitles filter
-        force_style = (
-            f"FontName={font_family},"
-            f"FontSize={font_size},"
-            f"PrimaryColour={font_color},"
-            f"OutlineColour={outline_color},"
-            f"Outline={outline_width},"
-            f"Bold={bold},"
-            f"MarginV={margin_v},"
-            f"Alignment=2"
-        )
-
         output_path = os.path.join(temp_dir, f"subtitled-{job_id}.mp4")
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", f"subtitles={srt_path}:force_style='{force_style}'",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-c:a", "copy",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            output_path,
-        ]
+        if is_ass:
+            # ASS file already contains full styling + karaoke tags
+            # Use ass filter directly (no force_style override)
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", f"ass={sub_path}",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:a", "copy",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+        else:
+            # SRT mode: build FFmpeg subtitle filter with force_style
+            # Use Noto Sans CJK for full Unicode/CJK support (installed in Dockerfile)
+            font_family = style.get("font_family", "Noto Sans CJK SC")
+            font_size = style.get("font_size", 24)
+            font_color = style.get("font_color", "&HFFFFFF")
+            outline_color = style.get("outline_color", "&H000000")
+            outline_width = style.get("outline_width", 2)
+            bold = 1 if style.get("bold", False) else 0
+            margin_v = style.get("margin_bottom", 40)
+
+            force_style = (
+                f"FontName={font_family},"
+                f"FontSize={font_size},"
+                f"PrimaryColour={font_color},"
+                f"OutlineColour={outline_color},"
+                f"Outline={outline_width},"
+                f"Bold={bold},"
+                f"MarginV={margin_v},"
+                f"Alignment=2"
+            )
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", f"subtitles={sub_path}:force_style='{force_style}'",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:a", "copy",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                output_path,
+            ]
 
         logger.info("Subtitle job %s: running ffmpeg", job_id)
         proc = await asyncio.create_subprocess_exec(
@@ -600,6 +616,8 @@ async def create_subtitle_burn(
             return f"&H00{b}{g}{r}"
         return "&H00FFFFFF"
 
+    subtitle_format = body.get("subtitle_format", "srt")
+
     style = {
         "font_family": body.get("font_family", "Arial"),
         "font_size": body.get("font_size", 24),
@@ -623,6 +641,7 @@ async def create_subtitle_burn(
             "params": {
                 "video_url": video_url,
                 "srt_content": srt_content,
+                "subtitle_format": subtitle_format,
                 "style": style,
             },
             "created_at": now_iso,
