@@ -106,6 +106,10 @@ class Segment:
     start_time: float        # seconds, position on the timeline
     end_time: float          # seconds, position on the timeline
     local_path: str = ""     # populated after download
+    # Optional audio overlay (e.g. TTS voiceover) — when present, this URL's
+    # audio replaces the source video's audio for this segment.
+    audio_overlay_url: str = ""
+    audio_overlay_local_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -284,20 +288,48 @@ def _parse_composition(composition: Dict[str, Any]) -> List[Segment]:
         t["id"] for t in tracks
         if t.get("type", "video") in ("video", "main")
     }
+    audio_track_ids = {
+        t["id"] for t in tracks
+        if t.get("type") == "audio"
+    }
 
     if not video_track_ids:
         logger.warning("No video tracks found in composition")
         return []
 
-    # --- Collect clips on video tracks ---
     all_clips = composition.get("clips", [])
+
+    # --- Pre-collect audio-track clips so we can match them to video segments ---
+    audio_clips: List[Dict[str, Any]] = []
+    for clip in all_clips:
+        track_id = clip.get("trackId") or clip.get("track_id")
+        if track_id not in audio_track_ids:
+            continue
+        layer_id = clip.get("layerId") or clip.get("layer_id")
+        layer = layers.get(layer_id, {}) if layer_id else {}
+        audio_url = (
+            layer.get("audioUrl")
+            or layer.get("audio_url")
+            or clip.get("audioUrl")
+            or clip.get("audio_url")
+            or ""
+        )
+        if not audio_url:
+            continue
+        audio_clips.append({
+            "url": audio_url,
+            "start": float(clip.get("startTime", 0)),
+            "end": float(clip.get("endTime", 0)),
+        })
+
+    # --- Collect clips on video tracks ---
     segments: List[Segment] = []
     index = 0
 
     for clip in all_clips:
         track_id = clip.get("trackId") or clip.get("track_id")
         if track_id not in video_track_ids:
-            continue  # Skip audio-only clips
+            continue  # Skip audio-only clips (collected above)
 
         layer_id = clip.get("layerId") or clip.get("layer_id")
         layer = layers.get(layer_id, {}) if layer_id else {}
@@ -338,12 +370,21 @@ def _parse_composition(composition: Dict[str, Any]) -> List[Segment]:
             logger.warning("Clip %s has invalid timing (%.2f-%.2f), skipping", clip.get("id"), start_time, end_time)
             continue
 
+        # Match an audio overlay clip whose time range overlaps this segment.
+        # Common case (Flow / Studio): exact same start/end as the video clip.
+        overlay_url = ""
+        for ac in audio_clips:
+            if ac["end"] > start_time and ac["start"] < end_time:
+                overlay_url = ac["url"]
+                break
+
         segments.append(Segment(
             index=index,
             media_type=media_type,
             media_url=media_url,
             start_time=start_time,
             end_time=end_time,
+            audio_overlay_url=overlay_url,
         ))
         index += 1
 
@@ -380,6 +421,10 @@ def _build_ffmpeg_command(
 
     inputs: List[str] = []
     filter_parts: List[str] = []
+    # When a segment has an audio overlay, we add it as an extra ffmpeg input AFTER
+    # all the segment media inputs. The first overlay input index = len(segments) + offset.
+    overlay_input_indices: Dict[int, int] = {}
+    next_extra_input = len(segments)
 
     for seg in segments:
         duration = seg.end_time - seg.start_time
@@ -394,8 +439,14 @@ def _build_ffmpeg_command(
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{seg.index}]"
             )
 
-            # Audio: use source audio if present, otherwise generate silence
-            if has_audio_flags.get(seg.index, False):
+            # Audio resolution priority for this segment:
+            #   1) explicit overlay (TTS / voiceover) attached on track-audio
+            #   2) the source video's own audio
+            #   3) silence
+            if seg.audio_overlay_local_path:
+                # Will be wired below after we add the overlay input.
+                pass
+            elif has_audio_flags.get(seg.index, False):
                 filter_parts.append(
                     f"[{seg.index}:a]atrim=0:{duration},asetpts=PTS-STARTPTS[a{seg.index}]"
                 )
@@ -411,10 +462,27 @@ def _build_ffmpeg_command(
                 f"[{seg.index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{seg.index}]"
             )
-            # Images never have audio
+            # Images don't have native audio. Overlay (if any) is wired below.
+            if not seg.audio_overlay_local_path:
+                filter_parts.append(
+                    f"anullsrc=r=44100:cl=stereo:d={duration}[a{seg.index}]"
+                )
+
+    # --- Audio overlay inputs (TTS / voiceover) ---
+    for seg in segments:
+        if seg.audio_overlay_local_path:
+            inputs.extend(["-i", seg.audio_overlay_local_path])
+            overlay_input_indices[seg.index] = next_extra_input
+            duration = seg.end_time - seg.start_time
+            ai = next_extra_input
+            # Take overlay audio, trim to clip duration, pad with silence if shorter.
+            # apad ensures the audio stream length matches the video segment so the
+            # subsequent concat doesn't desync.
             filter_parts.append(
-                f"anullsrc=r=44100:cl=stereo:d={duration}[a{seg.index}]"
+                f"[{ai}:a]atrim=0:{duration},asetpts=PTS-STARTPTS,"
+                f"apad=pad_dur={duration},atrim=0:{duration}[a{seg.index}]"
             )
+            next_extra_input += 1
 
     # Concat all segments
     n = len(segments)
@@ -555,6 +623,20 @@ async def _process_job(job_id: str) -> None:
             local_path = os.path.join(temp_dir, f"seg_{seg.index}{ext}")
             await _download_media(seg.media_url, local_path)
             seg.local_path = local_path
+
+            # Download audio overlay (TTS) if attached to this segment.
+            if seg.audio_overlay_url:
+                aud_ext = _guess_extension(seg.audio_overlay_url) or ".webm"
+                overlay_path = os.path.join(temp_dir, f"overlay_{seg.index}{aud_ext}")
+                try:
+                    await _download_media(seg.audio_overlay_url, overlay_path)
+                    seg.audio_overlay_local_path = overlay_path
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to download audio overlay for seg %d (%s): %s — falling back to source audio",
+                        seg.index, seg.audio_overlay_url, exc,
+                    )
+
             # Progress: downloading is 5-30% range
             dl_progress = 5 + int(25 * (i + 1) / len(segments))
             _update_progress(supabase, job_id, dl_progress, "downloading")
