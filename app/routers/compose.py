@@ -484,11 +484,14 @@ def _build_ffmpeg_command(
             )
             next_extra_input += 1
 
-    # Concat all segments
+    # Concat all segments. FFmpeg's concat filter expects inputs INTERLEAVED by
+    # segment — i.e. [v0][a0][v1][a1]…[vN][aN] — not grouped by stream type.
+    # The earlier `[v0][v1]…[a0][a1]…` ordering used to work only when n=1
+    # (Studio's typical case); for n>=2 FFmpeg fails with
+    # "Media type mismatch between … (video) and … input pad 1 (audio)".
     n = len(segments)
-    concat_v = "".join(f"[v{seg.index}]" for seg in segments)
-    concat_a = "".join(f"[a{seg.index}]" for seg in segments)
-    filter_parts.append(f"{concat_v}{concat_a}concat=n={n}:v=1:a=1[outv][outa]")
+    concat_inputs = "".join(f"[v{seg.index}][a{seg.index}]" for seg in segments)
+    filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]")
 
     filter_complex = ";".join(filter_parts)
 
