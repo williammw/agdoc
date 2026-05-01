@@ -669,22 +669,63 @@ async def _process_job(job_id: str) -> None:
         # ------ 6. Build and run FFmpeg ------
         _update_progress(supabase, job_id, 35, "rendering")
         output_path = os.path.join(temp_dir, f"export-{job_id}.mp4")
+        stderr_log_path = os.path.join(temp_dir, f"ffmpeg-{job_id}.log")
 
         cmd = _build_ffmpeg_command(segments, output_path, width, height, has_audio_flags)
         logger.info("Job %s: running ffmpeg with %d inputs", job_id, len(segments))
-        logger.debug("FFmpeg command: %s", " ".join(cmd))
+        logger.info("Job %s: full ffmpeg command: %s", job_id, " ".join(cmd))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        # Redirect stderr to a file rather than a pipe. FFmpeg can write a lot
+        # of progress/log output to stderr, and a full PIPE buffer is a
+        # well-known cause of subprocess deadlocks. With a file, the kernel
+        # never blocks the writer.
+        with open(stderr_log_path, "wb") as stderr_file:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=stderr_file,
+            )
+
+            # Cap a single FFmpeg run at 10 minutes. A 12-second 1080p clip
+            # finishes in well under 60s, so 10 min is a generous safety net
+            # that still kicks in when FFmpeg deadlocks. Without this, a
+            # hung FFmpeg blocks the worker forever and the job sits at
+            # status='processing' indefinitely.
+            FFMPEG_TIMEOUT_SECONDS = 600
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=FFMPEG_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Job %s: FFmpeg exceeded %ds — killing subprocess",
+                    job_id, FFMPEG_TIMEOUT_SECONDS,
+                )
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                # Read whatever FFmpeg wrote to stderr before the kill so the
+                # job's `error` field carries an actionable message.
+                stderr_tail = ""
+                try:
+                    with open(stderr_log_path, "rb") as f:
+                        stderr_tail = f.read()[-2000:].decode(errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"FFmpeg timed out after {FFMPEG_TIMEOUT_SECONDS}s. "
+                    f"stderr tail: {stderr_tail[-500:]}"
+                )
 
         if proc.returncode != 0:
-            stderr_text = stderr.decode(errors="replace")
-            logger.error("FFmpeg failed (rc=%d): %s", proc.returncode, stderr_text[-2000:])
-            raise RuntimeError(f"FFmpeg exited with code {proc.returncode}: {stderr_text[-500:]}")
+            stderr_tail = ""
+            try:
+                with open(stderr_log_path, "rb") as f:
+                    stderr_tail = f.read()[-4000:].decode(errors="replace")
+            except Exception:
+                pass
+            logger.error("FFmpeg failed (rc=%d): %s", proc.returncode, stderr_tail[-2000:])
+            raise RuntimeError(f"FFmpeg exited with code {proc.returncode}: {stderr_tail[-500:]}")
 
         logger.info("Job %s: FFmpeg completed successfully", job_id)
 
