@@ -44,8 +44,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . /app
 
-# Make port 80 available to the world outside this container
-EXPOSE 80
+# Match what uvicorn actually binds to. EXPOSE is documentation/metadata;
+# the real port mapping is configured by the deployment platform. App Platform
+# routes external traffic to whatever port the container listens on.
+EXPOSE 8000
 
-# Run uvicorn server
+# Production: no --reload (file watcher would restart mid-render and kill jobs).
+# Local dev runs `uvicorn ... --reload` against a venv outside the container.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

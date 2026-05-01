@@ -69,12 +69,24 @@ R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 CDN_DOMAIN = os.getenv("CDN_DOMAIN", "cdn.multivio.com")
 
+from botocore.config import Config as BotoConfig
+
+# Connect/read timeouts so a hung R2 endpoint doesn't wedge the worker forever.
+# Without these, a stalled TCP connection can hold _upload_to_r2 indefinitely
+# because boto3's defaults are effectively unbounded for some environments.
+# Plus a few retries for transient network blips.
 r2_client = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT_URL,
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     region_name="auto",
+    config=BotoConfig(
+        connect_timeout=15,        # 15s to establish TCP / TLS handshake
+        read_timeout=120,          # 2 min ceiling for a single S3 request
+        retries={"max_attempts": 3, "mode": "standard"},
+        signature_version="s3v4",
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -132,17 +144,47 @@ def _verify_api_key(request: Request) -> None:
 
 
 async def _upload_to_r2(file_content: bytes, key: str, content_type: str) -> str:
-    """Upload bytes to Cloudflare R2 and return the CDN URL."""
-    try:
+    """Upload bytes to Cloudflare R2 and return the CDN URL.
+
+    Two important wrinkles:
+
+    1. boto3 is synchronous. Calling it directly from an async function blocks
+       the entire asyncio event loop — including the FastAPI HTTP handler and
+       the background worker. We dispatch via `run_in_executor` so the upload
+       runs on a worker thread and the loop stays responsive.
+
+    2. Even with the boto3 client's `read_timeout=120`, a TCP connection that
+       stalls mid-transfer can sometimes outlast the configured timeout. Wrap
+       in `asyncio.wait_for` as defense in depth so a wedged upload fails the
+       job rather than hanging the worker.
+    """
+    loop = asyncio.get_running_loop()
+    UPLOAD_TIMEOUT_SECONDS = 180
+
+    def _do_upload():
         r2_client.put_object(
             Bucket=R2_BUCKET_NAME,
             Key=key,
             Body=file_content,
             ContentType=content_type,
         )
+
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, _do_upload),
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
         cdn_url = f"https://{CDN_DOMAIN}/{key}"
         logger.info("Uploaded to R2: %s (%d bytes)", cdn_url, len(file_content))
         return cdn_url
+    except asyncio.TimeoutError:
+        logger.error(
+            "R2 upload timed out for key=%s after %ds (%d bytes)",
+            key, UPLOAD_TIMEOUT_SECONDS, len(file_content),
+        )
+        raise RuntimeError(
+            f"R2 upload timed out after {UPLOAD_TIMEOUT_SECONDS}s for key={key}"
+        )
     except ClientError as exc:
         logger.error("R2 upload failed for key=%s: %s", key, exc)
         raise

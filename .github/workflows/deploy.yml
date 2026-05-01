@@ -31,6 +31,13 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: registry.digitalocean.com/umami-backend-api/docker-agdoc:latest
+          # Cache Docker layers between GitHub Action runs. The FFmpeg + Noto
+          # fonts + pip install layers rarely change but reinstall every push.
+          # GHA cache backend is free for public + private repos; mode=max caches
+          # intermediate layers (not just the final image). First run after
+          # adding this still slow; subsequent typically 2-3 min instead of ~10.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Log out from DockerHub
         run: docker logout registry.digitalocean.com 
