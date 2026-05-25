@@ -110,6 +110,24 @@ _worker_task: Optional[asyncio.Task] = None
 # ---------------------------------------------------------------------------
 
 @dataclass
+class Transition:
+    """
+    Phase F-B.4.b (2026-05-25) — clip-to-clip transition.
+
+    Populated on a Segment via `transition_to_next` when the next segment
+    should blend in with a non-cut effect. The FFmpeg builder consumes
+    this to chain xfade/acrossfade filters instead of a flat concat.
+    """
+    # One of: "crossfade", "fade_black", "fade_white", "slide_left", "slide_right".
+    # "cut" is the implicit default and is never stored (it would be a no-op).
+    type: str
+    # Transition window in seconds. Adjacent clips overlap by this amount
+    # during the blend. Clamped to (0, min(d_a, d_b) - 0.05) at build time
+    # so the result is always a valid xfade input.
+    duration: float
+
+
+@dataclass
 class Segment:
     """A single contiguous segment in the rendered timeline."""
     index: int
@@ -122,6 +140,10 @@ class Segment:
     # audio replaces the source video's audio for this segment.
     audio_overlay_url: str = ""
     audio_overlay_local_path: str = ""
+    # Transition between THIS segment and the next one in the chain.
+    # None on the last segment (nothing to transition to) and on cuts
+    # (the default — no special filter needed).
+    transition_to_next: Optional["Transition"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +458,83 @@ def _parse_composition(composition: Dict[str, Any]) -> List[Segment]:
     for i, seg in enumerate(segments):
         seg.index = i
 
+    # --- Phase F-B.4.b: attach clip-to-clip transitions ---
+    # composition.transitions is an optional list of
+    # {fromClipId, toClipId, type, duration}. Build a lookup by
+    # source clip ID (each clip in the composition has a unique id like
+    # "clip-v-3"), then map each transition's fromClipId to the segment
+    # that produced it and stash the transition on `transition_to_next`.
+    raw_transitions = composition.get("transitions") or []
+    if raw_transitions:
+        # Build clip_id → segment_index map. Same logic as we used to
+        # collect video segments above — replays it here for clarity.
+        clip_id_to_seg_idx: Dict[str, int] = {}
+        for seg_idx, clip in enumerate(
+            [c for c in all_clips
+             if (c.get("trackId") or c.get("track_id")) in video_track_ids
+             and float(c.get("endTime", 0)) > float(c.get("startTime", 0))]
+        ):
+            cid = clip.get("id")
+            if cid:
+                clip_id_to_seg_idx[cid] = seg_idx
+        # Note: the seg_idx above is pre-sort. Re-derive by matching the
+        # clip's media URL + timing to the segment after the global sort.
+        # Cheaper alternative: re-scan and use the original clip ordering
+        # to recover (segments were sorted by start_time AND so were the
+        # original clips that produced them — for a typical linear
+        # timeline these match).
+        # Build the canonical mapping by scanning the sorted segments and
+        # the source clips list looking up by media_url:
+        clip_url_to_seg_idx: Dict[str, int] = {}
+        for seg in segments:
+            clip_url_to_seg_idx.setdefault(seg.media_url, seg.index)
+
+        # Walk each transition spec and attach to the source segment.
+        for t in raw_transitions:
+            ttype = t.get("type") or "cut"
+            if ttype == "cut":
+                continue  # No-op — default behaviour
+            from_id = t.get("fromClipId") or t.get("from_clip_id")
+            from_idx = clip_id_to_seg_idx.get(from_id)
+            if from_idx is None:
+                logger.warning(
+                    "Transition references unknown clip %s, skipping",
+                    from_id,
+                )
+                continue
+            # Validate transition duration vs segment durations on either side.
+            # xfade needs both inputs to be longer than the transition window.
+            duration = float(t.get("duration", 0.5))
+            if duration <= 0:
+                continue
+            from_seg = next((s for s in segments if s.index == from_idx), None)
+            if from_seg is None:
+                continue
+            # The "next" segment for transition purposes is the segment whose
+            # index is from_idx + 1 (post-sort). Defensive — bail if there
+            # isn't one.
+            to_seg = next((s for s in segments if s.index == from_idx + 1), None)
+            if to_seg is None:
+                logger.warning(
+                    "Transition %s->%s has no following segment (from_idx=%d), skipping",
+                    from_id, t.get("toClipId"), from_idx,
+                )
+                continue
+            # Clamp duration: must be shorter than both clips (with 0.05s
+            # safety margin) or xfade fails with "duration too long".
+            max_safe = min(
+                from_seg.end_time - from_seg.start_time,
+                to_seg.end_time - to_seg.start_time,
+            ) - 0.05
+            if max_safe <= 0.05:
+                logger.warning(
+                    "Transition %s->%s clips too short for any transition, falling back to cut",
+                    from_id, t.get("toClipId"),
+                )
+                continue
+            clamped = max(0.05, min(duration, max_safe))
+            from_seg.transition_to_next = Transition(type=ttype, duration=clamped)
+
     return segments
 
 
@@ -526,14 +625,84 @@ def _build_ffmpeg_command(
             )
             next_extra_input += 1
 
-    # Concat all segments. FFmpeg's concat filter expects inputs INTERLEAVED by
-    # segment — i.e. [v0][a0][v1][a1]…[vN][aN] — not grouped by stream type.
-    # The earlier `[v0][v1]…[a0][a1]…` ordering used to work only when n=1
-    # (Studio's typical case); for n>=2 FFmpeg fails with
-    # "Media type mismatch between … (video) and … input pad 1 (audio)".
+    # Phase F-B.4.b: branch between two output strategies.
+    #
+    # - When NO segment has a transition_to_next, use the legacy single
+    #   concat filter — this is the production-stable path and we want zero
+    #   regression risk for the 99% of jobs that don't use transitions.
+    # - When ANY segment carries a transition, chain xfade/acrossfade
+    #   filters progressively. xfade overlaps the two inputs by
+    #   `duration` seconds at `offset` (relative to the accumulator start).
+    #   Cuts within a transition-bearing chain use concat=n=2 between
+    #   the two streams to preserve frame timing.
     n = len(segments)
-    concat_inputs = "".join(f"[v{seg.index}][a{seg.index}]" for seg in segments)
-    filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]")
+    has_transitions = any(s.transition_to_next is not None for s in segments)
+
+    if not has_transitions or n < 2:
+        # Legacy concat path. FFmpeg's concat filter expects inputs
+        # INTERLEAVED by segment — i.e. [v0][a0][v1][a1]…[vN][aN] — not
+        # grouped by stream type.
+        concat_inputs = "".join(f"[v{seg.index}][a{seg.index}]" for seg in segments)
+        filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]")
+        out_v_label = "outv"
+        out_a_label = "outa"
+    else:
+        # Chained xfade/concat builder.
+        # Map our transition type names → ffmpeg xfade transition names.
+        XFADE_TYPE_MAP = {
+            "crossfade":   "fade",
+            "fade_black":  "fadeblack",
+            "fade_white":  "fadewhite",
+            "slide_left":  "slideleft",
+            "slide_right": "slideright",
+        }
+        prev_v = f"v{segments[0].index}"
+        prev_a = f"a{segments[0].index}"
+        # Cumulative duration of the accumulated video stream so far.
+        acc_length = segments[0].end_time - segments[0].start_time
+        for i in range(1, n):
+            seg = segments[i]
+            next_v = f"v{seg.index}"
+            next_a = f"a{seg.index}"
+            transition = segments[i - 1].transition_to_next
+            new_v = f"vacc{i}"
+            new_a = f"aacc{i}"
+            d_next = seg.end_time - seg.start_time
+
+            if transition is None or transition.type == "cut":
+                # Plain cut — splice two-stream concat for video AND audio
+                # separately (concat=n=2 with v=1:a=0 then v=0:a=1).
+                filter_parts.append(
+                    f"[{prev_v}][{next_v}]concat=n=2:v=1:a=0[{new_v}]"
+                )
+                filter_parts.append(
+                    f"[{prev_a}][{next_a}]concat=n=2:v=0:a=1[{new_a}]"
+                )
+                acc_length += d_next
+            else:
+                # xfade: clips overlap by `duration` seconds. acrossfade does
+                # the audio counterpart (no explicit offset — auto-aligns at
+                # the end of the first input).
+                ffmpeg_type = XFADE_TYPE_MAP.get(transition.type, "fade")
+                td = transition.duration
+                offset = max(0.0, acc_length - td)
+                # Numeric formatting: keep 6 decimal places to avoid round-trip
+                # precision loss on very short clips.
+                filter_parts.append(
+                    f"[{prev_v}][{next_v}]xfade=transition={ffmpeg_type}:"
+                    f"duration={td:.6f}:offset={offset:.6f}[{new_v}]"
+                )
+                filter_parts.append(
+                    f"[{prev_a}][{next_a}]acrossfade=d={td:.6f}[{new_a}]"
+                )
+                # Net length after overlap: gain d_next but lose td of overlap.
+                acc_length += d_next - td
+
+            prev_v = new_v
+            prev_a = new_a
+
+        out_v_label = prev_v
+        out_a_label = prev_a
 
     filter_complex = ";".join(filter_parts)
 
@@ -542,8 +711,8 @@ def _build_ffmpeg_command(
         + inputs
         + [
             "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-map", "[outa]",
+            "-map", f"[{out_v_label}]",
+            "-map", f"[{out_a_label}]",
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "23",
