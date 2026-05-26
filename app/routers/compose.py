@@ -573,11 +573,17 @@ def _build_ffmpeg_command(
         if seg.media_type == "video":
             inputs.extend(["-i", seg.local_path])
 
-            # Video: trim to clip duration, scale + pad to canvas
+            # Video: trim to clip duration, scale + pad to canvas. Normalised
+            # to a common pixel format + framerate + timebase so the downstream
+            # concat / xfade filter sees compatible inputs. Without this,
+            # mixing an image segment (default loop fps) with a video segment
+            # (native fps) makes concat stall forever — the well-known
+            # 'More than 1000 frames duplicated' + frame=1 hang.
             filter_parts.append(
                 f"[{seg.index}:v]trim=0:{duration},setpts=PTS-STARTPTS,"
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{seg.index}]"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"format=yuv420p,fps=30[v{seg.index}]"
             )
 
             # Audio resolution priority for this segment:
@@ -596,12 +602,18 @@ def _build_ffmpeg_command(
                     f"anullsrc=r=44100:cl=stereo:d={duration}[a{seg.index}]"
                 )
         else:
-            # Image: loop for the clip duration
+            # Image: loop for the clip duration. Normalisation matches the
+            # video path above (format=yuv420p,fps=30) so concat / xfade sees
+            # compatible streams. The trim+setpts pair guarantees the image
+            # loop produces a clean finite stream that terminates at the
+            # specified duration — xfade in particular needs a definite EOF.
             inputs.extend(["-loop", "1", "-t", str(duration), "-i", seg.local_path])
 
             filter_parts.append(
-                f"[{seg.index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{seg.index}]"
+                f"[{seg.index}:v]trim=0:{duration},setpts=PTS-STARTPTS,"
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"format=yuv420p,fps=30[v{seg.index}]"
             )
             # Images don't have native audio. Overlay (if any) is wired below.
             if not seg.audio_overlay_local_path:
