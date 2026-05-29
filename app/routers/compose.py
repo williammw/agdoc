@@ -136,6 +136,12 @@ class Segment:
     start_time: float        # seconds, position on the timeline
     end_time: float          # seconds, position on the timeline
     local_path: str = ""     # populated after download
+    # Source in-point: seconds INTO the source media where this clip begins.
+    # 0 = from the start (the default, identical to prior behavior). Used to
+    # extract a sub-window of a longer source video (e.g. Distill highlight
+    # clips, Studio split clips) without a separate trim pass. Ignored for
+    # images (they have no timeline). See ffmpeg trim/atrim below.
+    source_start: float = 0.0
     # Optional audio overlay (e.g. TTS voiceover) — when present, this URL's
     # audio replaces the source video's audio for this segment.
     audio_overlay_url: str = ""
@@ -434,6 +440,17 @@ def _parse_composition(composition: Dict[str, Any]) -> List[Segment]:
             logger.warning("Clip %s has invalid timing (%.2f-%.2f), skipping", clip.get("id"), start_time, end_time)
             continue
 
+        # Source in-point: which second of the SOURCE media this clip starts
+        # from. Accepts mediaStartTime (camelCase, our client) or source_start.
+        # Defaults to 0 → from the start of the source (prior behavior).
+        source_start = float(
+            clip.get("mediaStartTime")
+            or clip.get("media_start_time")
+            or clip.get("sourceStart")
+            or clip.get("source_start")
+            or 0
+        )
+
         # Match an audio overlay clip whose time range overlaps this segment.
         # Common case (Flow / Studio): exact same start/end as the video clip.
         overlay_url = ""
@@ -449,6 +466,7 @@ def _parse_composition(composition: Dict[str, Any]) -> List[Segment]:
             start_time=start_time,
             end_time=end_time,
             audio_overlay_url=overlay_url,
+            source_start=source_start if media_type == "video" else 0.0,
         ))
         index += 1
 
@@ -579,8 +597,13 @@ def _build_ffmpeg_command(
             # mixing an image segment (default loop fps) with a video segment
             # (native fps) makes concat stall forever — the well-known
             # 'More than 1000 frames duplicated' + frame=1 hang.
+            # Source window: extract [source_start, source_start+duration] of
+            # the input, then setpts resets the clip to start at t=0. With the
+            # default source_start=0 this is identical to the prior trim=0:dur.
+            v_in = seg.source_start
+            v_out = seg.source_start + duration
             filter_parts.append(
-                f"[{seg.index}:v]trim=0:{duration},setpts=PTS-STARTPTS,"
+                f"[{seg.index}:v]trim={v_in}:{v_out},setpts=PTS-STARTPTS,"
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
                 f"format=yuv420p,fps=30[v{seg.index}]"
@@ -595,7 +618,7 @@ def _build_ffmpeg_command(
                 pass
             elif has_audio_flags.get(seg.index, False):
                 filter_parts.append(
-                    f"[{seg.index}:a]atrim=0:{duration},asetpts=PTS-STARTPTS[a{seg.index}]"
+                    f"[{seg.index}:a]atrim={v_in}:{v_out},asetpts=PTS-STARTPTS[a{seg.index}]"
                 )
             else:
                 filter_parts.append(
