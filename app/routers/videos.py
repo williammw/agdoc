@@ -96,19 +96,22 @@ async def _upload_to_r2(data: bytes, key: str, content_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# YouTube ingest (Distill source) — yt-dlp download -> R2
+# YouTube ingest (Distill source) — yt-dlp download -> R2  [ASYNC]
+#
+# Downloading a full video inside the HTTP request blows past the DigitalOcean
+# gateway timeout (~100s) -> 504. So this mirrors the compose pattern: the
+# POST inserts a `youtube_ingest_jobs` row, kicks the download off in a
+# detached asyncio task, and returns a job_id immediately. The caller polls
+# GET /youtube-ingest/{job_id}.
 #
 # YouTube blocks many datacenter IPs with a "Sign in to confirm you're not a
-# bot" challenge. If that happens from this host, set YTDLP_PROXY to a
-# residential/rotating proxy URL and the download routes through it.
-# Memory-safe: streams the file from disk to R2 (upload_file), never loads
-# the whole video into RAM. Duration-capped so a single ingest can't run for
-# many minutes (the caller's request would otherwise time out).
+# bot" challenge. If that happens, set YTDLP_PROXY to a residential proxy and
+# the download routes through it (the job's error makes the cause explicit).
+# Memory-safe: streams the file from disk to R2 (upload_file).
 # ---------------------------------------------------------------------------
 
 YTDLP_PROXY = os.getenv("YTDLP_PROXY")
-# Hard ceiling regardless of what the caller asks for (keeps ingest fast +
-# within the Next.js after() 300s budget for the whole pipeline).
+# Hard ceiling regardless of what the caller asks for.
 YT_MAX_DURATION_SEC = 30 * 60
 
 
@@ -116,32 +119,25 @@ class _YtTooLong(Exception):
     pass
 
 
-@public_router.post("/youtube-ingest")
-async def youtube_ingest(request: Request):
-    """Download a YouTube video (<=720p, duration-capped) and store it in R2.
+def _yt_set(job_id: str, fields: dict) -> None:
+    """Update a youtube_ingest_jobs row (best-effort, sync supabase client)."""
+    try:
+        fields = {**fields, "updated_at": datetime.now(timezone.utc).isoformat()}
+        db_admin().table("youtube_ingest_jobs").update(fields).eq("id", job_id).execute()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("yt job %s update failed: %s", job_id, exc)
 
-    Body: { url, user_id, max_duration_sec? }
-    Returns: { r2_url, r2_key, duration, title }
-    """
-    _verify_api_key(request)
 
-    body = await request.json()
-    url = (body.get("url") or "").strip()
-    user_id = (body.get("user_id") or "").strip()
-    requested_cap = int(body.get("max_duration_sec") or YT_MAX_DURATION_SEC)
-    max_duration = min(requested_cap, YT_MAX_DURATION_SEC)
+async def _run_youtube_ingest(job_id: str, url: str, user_id: str, max_duration: int) -> None:
+    """Background worker: download the video, upload to R2, update the job row."""
+    _yt_set(job_id, {"status": "processing"})
 
-    if not url or not user_id:
-        raise HTTPException(status_code=400, detail="url and user_id are required")
-
-    import yt_dlp  # imported lazily so a yt-dlp issue can't break module import
-
+    import yt_dlp  # lazy import — a yt-dlp issue can't break module import
     tmpdir = tempfile.mkdtemp(prefix="agdoc_yt_")
     out_tmpl = os.path.join(tmpdir, "src.%(ext)s")
     asset_id = str(uuid.uuid4())
 
     ydl_opts = {
-        # best video <=720p + best audio, merged to mp4; graceful fallbacks
         "format": "bv*[height<=720]+ba/b[height<=720]/b",
         "merge_output_format": "mp4",
         "outtmpl": out_tmpl,
@@ -170,21 +166,21 @@ async def youtube_ingest(request: Request):
         info, duration = await asyncio.to_thread(_run)
     except _YtTooLong as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        _yt_set(job_id, {"status": "failed", "error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001
         shutil.rmtree(tmpdir, ignore_errors=True)
         msg = str(e)
         logger.error("yt-dlp ingest failed for %s: %s", url, msg)
         low = msg.lower()
         if "sign in to confirm" in low or "not a bot" in low or "429" in low:
-            raise HTTPException(
-                status_code=502,
-                detail="YouTube blocked the download from our server (bot check). "
-                       "A residential proxy (YTDLP_PROXY) is required for this video.",
-            )
-        raise HTTPException(status_code=502, detail=f"YouTube download failed: {msg[:200]}")
+            err = ("YouTube blocked the download from our server (bot check). "
+                   "A residential proxy (YTDLP_PROXY) is required for this video.")
+        else:
+            err = f"YouTube download failed: {msg[:200]}"
+        _yt_set(job_id, {"status": "failed", "error": err})
+        return
 
-    # Locate the produced (merged) file.
     produced = None
     for name in os.listdir(tmpdir):
         if name.startswith("src."):
@@ -192,25 +188,92 @@ async def youtube_ingest(request: Request):
             break
     if not produced or not os.path.exists(produced):
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="Download produced no output file")
+        _yt_set(job_id, {"status": "failed", "error": "Download produced no output file"})
+        return
 
     key = f"{user_id}/distill/youtube-{asset_id}.mp4"
     try:
-        # Stream from disk to R2 — never loads the whole video into memory.
-        r2_client.upload_file(
-            produced, R2_BUCKET_NAME, key,
-            ExtraArgs={"ContentType": "video/mp4"},
+        # boto3 upload_file ExtraArgs is keyword-only — wrap in a lambda so
+        # asyncio.to_thread can pass it.
+        await asyncio.to_thread(
+            lambda: r2_client.upload_file(
+                produced, R2_BUCKET_NAME, key,
+                ExtraArgs={"ContentType": "video/mp4"},
+            )
         )
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _yt_set(job_id, {"status": "failed", "error": f"R2 upload failed: {str(e)[:200]}"})
+        return
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     r2_url = f"https://{CDN_DOMAIN}/{key}"
-    logger.info("YouTube ingest -> %s (%ds)", r2_url, duration)
-    return {
+    logger.info("YouTube ingest job %s -> %s (%ds)", job_id, r2_url, duration)
+    _yt_set(job_id, {
+        "status": "completed",
         "r2_url": r2_url,
         "r2_key": key,
         "duration": duration,
         "title": info.get("title") or "YouTube video",
+    })
+
+
+@public_router.post("/youtube-ingest")
+async def youtube_ingest(request: Request, supabase=Depends(db_admin)):
+    """Queue a YouTube download. Returns immediately with a job_id to poll.
+
+    Body: { url, user_id, max_duration_sec? }
+    Returns: { job_id, status: 'queued' }
+    """
+    _verify_api_key(request)
+
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    user_id = (body.get("user_id") or "").strip()
+    requested_cap = int(body.get("max_duration_sec") or YT_MAX_DURATION_SEC)
+    max_duration = min(requested_cap, YT_MAX_DURATION_SEC)
+
+    if not url or not user_id:
+        raise HTTPException(status_code=400, detail="url and user_id are required")
+
+    job_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        supabase.table("youtube_ingest_jobs").insert({
+            "id": job_id,
+            "user_id": user_id,
+            "url": url,
+            "status": "queued",
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }).execute()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to create yt ingest job: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to create ingest job")
+
+    # Detached background task — survives after the response is returned.
+    asyncio.create_task(_run_youtube_ingest(job_id, url, user_id, max_duration))
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@public_router.get("/youtube-ingest/{job_id}")
+async def youtube_ingest_status(job_id: str, request: Request, supabase=Depends(db_admin)):
+    """Poll a YouTube ingest job."""
+    _verify_api_key(request)
+    result = supabase.table("youtube_ingest_jobs").select("*").eq("id", job_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    job = result.data[0]
+    return {
+        "job_id": job["id"],
+        "status": job.get("status"),
+        "r2_url": job.get("r2_url"),
+        "r2_key": job.get("r2_key"),
+        "duration": job.get("duration"),
+        "title": job.get("title"),
+        "error": job.get("error"),
     }
 
 
