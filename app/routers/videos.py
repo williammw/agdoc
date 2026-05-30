@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -92,6 +93,125 @@ async def _upload_to_r2(data: bytes, key: str, content_type: str) -> str:
     cdn_url = f"https://{CDN_DOMAIN}/{key}"
     logger.info("Uploaded to R2: %s (%d bytes)", cdn_url, len(data))
     return cdn_url
+
+
+# ---------------------------------------------------------------------------
+# YouTube ingest (Distill source) — yt-dlp download -> R2
+#
+# YouTube blocks many datacenter IPs with a "Sign in to confirm you're not a
+# bot" challenge. If that happens from this host, set YTDLP_PROXY to a
+# residential/rotating proxy URL and the download routes through it.
+# Memory-safe: streams the file from disk to R2 (upload_file), never loads
+# the whole video into RAM. Duration-capped so a single ingest can't run for
+# many minutes (the caller's request would otherwise time out).
+# ---------------------------------------------------------------------------
+
+YTDLP_PROXY = os.getenv("YTDLP_PROXY")
+# Hard ceiling regardless of what the caller asks for (keeps ingest fast +
+# within the Next.js after() 300s budget for the whole pipeline).
+YT_MAX_DURATION_SEC = 30 * 60
+
+
+class _YtTooLong(Exception):
+    pass
+
+
+@public_router.post("/youtube-ingest")
+async def youtube_ingest(request: Request):
+    """Download a YouTube video (<=720p, duration-capped) and store it in R2.
+
+    Body: { url, user_id, max_duration_sec? }
+    Returns: { r2_url, r2_key, duration, title }
+    """
+    _verify_api_key(request)
+
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    user_id = (body.get("user_id") or "").strip()
+    requested_cap = int(body.get("max_duration_sec") or YT_MAX_DURATION_SEC)
+    max_duration = min(requested_cap, YT_MAX_DURATION_SEC)
+
+    if not url or not user_id:
+        raise HTTPException(status_code=400, detail="url and user_id are required")
+
+    import yt_dlp  # imported lazily so a yt-dlp issue can't break module import
+
+    tmpdir = tempfile.mkdtemp(prefix="agdoc_yt_")
+    out_tmpl = os.path.join(tmpdir, "src.%(ext)s")
+    asset_id = str(uuid.uuid4())
+
+    ydl_opts = {
+        # best video <=720p + best audio, merged to mp4; graceful fallbacks
+        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        "merge_output_format": "mp4",
+        "outtmpl": out_tmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "concurrent_fragment_downloads": 4,
+    }
+    if YTDLP_PROXY:
+        ydl_opts["proxy"] = YTDLP_PROXY
+
+    def _run():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duration = int(info.get("duration") or 0)
+            if duration and duration > max_duration:
+                raise _YtTooLong(
+                    f"This video is {duration // 60} min. Distill currently "
+                    f"supports up to {max_duration // 60} min — try a shorter video."
+                )
+            ydl.download([url])
+            return info, duration
+
+    try:
+        info, duration = await asyncio.to_thread(_run)
+    except _YtTooLong as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        msg = str(e)
+        logger.error("yt-dlp ingest failed for %s: %s", url, msg)
+        low = msg.lower()
+        if "sign in to confirm" in low or "not a bot" in low or "429" in low:
+            raise HTTPException(
+                status_code=502,
+                detail="YouTube blocked the download from our server (bot check). "
+                       "A residential proxy (YTDLP_PROXY) is required for this video.",
+            )
+        raise HTTPException(status_code=502, detail=f"YouTube download failed: {msg[:200]}")
+
+    # Locate the produced (merged) file.
+    produced = None
+    for name in os.listdir(tmpdir):
+        if name.startswith("src."):
+            produced = os.path.join(tmpdir, name)
+            break
+    if not produced or not os.path.exists(produced):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="Download produced no output file")
+
+    key = f"{user_id}/distill/youtube-{asset_id}.mp4"
+    try:
+        # Stream from disk to R2 — never loads the whole video into memory.
+        r2_client.upload_file(
+            produced, R2_BUCKET_NAME, key,
+            ExtraArgs={"ContentType": "video/mp4"},
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    r2_url = f"https://{CDN_DOMAIN}/{key}"
+    logger.info("YouTube ingest -> %s (%ds)", r2_url, duration)
+    return {
+        "r2_url": r2_url,
+        "r2_key": key,
+        "duration": duration,
+        "title": info.get("title") or "YouTube video",
+    }
 
 
 # ---------------------------------------------------------------------------

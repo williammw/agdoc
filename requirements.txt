@@ -241,4 +241,7 @@ wikipedia==1.4.0
 wrapt==1.16.0
 wsproto==1.2.0
 yarl==1.18.3
+# Unpinned on purpose: YouTube changes its player frequently and only the
+# latest yt-dlp keeps working. Each image rebuild pulls a fresh version.
+yt-dlp
 zipp==3.21.0
